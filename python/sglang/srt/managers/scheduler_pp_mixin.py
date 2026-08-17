@@ -1147,6 +1147,7 @@ class SchedulerPPMixin:
         pp_outputs: PPProxyTensors,
     ):
         from sglang.srt.managers.scheduler import GenerationBatchResult
+        from sglang.srt.speculative.dflash_info_v2 import DFlashPPVerifyInputRaw
         from sglang.srt.speculative.dspark_components.dspark_verify import (
             DSparkPPVerifyInputRaw,
         )
@@ -1157,6 +1158,8 @@ class SchedulerPPMixin:
             # ranks rebuild the correct spec_info type from pp_outputs.
             if self.spec_algorithm.is_dspark():
                 return DSparkPPVerifyInputRaw
+            if self.spec_algorithm.is_dflash():
+                return DFlashPPVerifyInputRaw
             return EaglePPVerifyInputRaw
 
         logits_output = None
@@ -1207,7 +1210,8 @@ class SchedulerPPMixin:
         )
 
         if isinstance(
-            batch.spec_info, (EaglePPVerifyInputRaw, DSparkPPVerifyInputRaw)
+            batch.spec_info,
+            (EaglePPVerifyInputRaw, DSparkPPVerifyInputRaw, DFlashPPVerifyInputRaw),
         ):
             output_result.accept_lens = batch.spec_info.accept_lens.to(torch.int64)
             output_result.speculative_num_draft_tokens = (

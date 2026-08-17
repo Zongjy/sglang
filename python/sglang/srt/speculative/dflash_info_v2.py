@@ -1,6 +1,7 @@
 """DFLASH spec-v2 overlap scheduling data structures."""
 
 import contextlib
+import dataclasses
 from dataclasses import dataclass
 from typing import List, Optional, Tuple
 
@@ -199,6 +200,115 @@ class DFlashDecodePrepareMixin:
         if track_top_k:
             self.max_top_k = max(max_top_k, 1)
             self.uniform_top_k_value = uniform_top_k_value if uniform_top_k else None
+
+
+@dataclass
+class DFlashPPVerifyInputRaw(DFlashDecodePrepareMixin, SpecInput):
+    """DFLASH PP relay data carrier.
+
+    Carries the draft block produced by the last PP rank each iter and relays
+    it to every verify rank via the PP ring, so that all ranks rebuild an
+    identical verify context for the next iter. DFLASH acceptance only reads
+    the target logits (greedy argmax against the chain), so unlike DSpark no
+    draft-side sampling distribution needs to travel or be cached per rank.
+    Linear (non-tree) verify reuses the formal ``req_to_token`` slots, so
+    ``accept_index`` is always ``None`` and ``batch_result_processor`` skips
+    the token-move step automatically.
+    """
+
+    # Draft info for rebuilding the next iter's verify candidates on every
+    # rank. GPU tensors so the PP ring relays them over the GPU channel.
+    bonus_tokens: torch.Tensor  # [bs]
+    draft_tokens: torch.Tensor  # [bs, block_size - 1]
+
+    # Result / accounting for batch_result_processor and stats. Required:
+    # always populated by the last rank (even build_dummy_for_decode sets
+    # [1]*bs).
+    accept_lens: torch.Tensor  # [bs]
+
+    # Optional placeholders mirroring DFlashDraftInputV2 so that the verify
+    # seq_lens planning bound (read when batch.seq_lens_cpu is None) never
+    # AttributeErrors under PP. Written by prepare_for_decode (the mixin).
+    reserved_seq_lens_cpu: Optional[List] = None
+    reserved_seq_lens_sum: Optional[int] = None
+
+    # Linear verify: always None so batch_result_processor skips the token move.
+    accept_index: Optional[List] = None
+
+    def __post_init__(self):
+        super().__init__(SpecInputType.DFLASH_PP_VERIFY_INPUT_RAW)
+        # Same token accounting as the draft input it mirrors.
+        self.num_tokens_per_req = 1
+        self.num_tokens_for_logprob_per_req = 1
+
+    def get_spec_adjust_token_coefficient(self) -> Tuple[int, int]:
+        return (1, 1)
+
+    def prepare_local_sampling_metadata(self, reqs) -> None:
+        """Build PP-last-only sampling hints without adding them to PP raw."""
+        top_ks = [int(req.sampling_params.top_k) for req in reqs]
+        self.max_top_k = max(max(top_ks, default=1), 1)
+        self.uniform_top_k_value = (
+            top_ks[0] if top_ks and all(top_k == top_ks[0] for top_k in top_ks) else None
+        )
+
+    def to_tensor_dict(self) -> dict:
+        # Nested tensors are flattened by _split_tensor_dict, so the whole
+        # dataclass dict still travels over the GPU channel.
+        return {"pp_spec_output": dataclasses.asdict(self)}
+
+    @classmethod
+    def from_pp_outputs(cls, pp_outputs):
+        return cls(**pp_outputs["pp_spec_output"])
+
+    @classmethod
+    def build_dummy_for_decode(cls, batch, num_draft: int) -> "DFlashPPVerifyInputRaw":
+        # First decode step: the last PP rank has not proposed real drafts yet.
+        bs = len(batch.reqs)
+        gamma = max(num_draft - 1, 0)
+        device = batch.input_ids.device
+        bonus = batch.input_ids.to(torch.int64)
+        return cls(
+            bonus_tokens=bonus,
+            draft_tokens=bonus.unsqueeze(1).repeat(1, gamma),
+            accept_lens=torch.ones(bs, dtype=torch.int64, device=device),
+            accept_index=None,
+        )
+
+    def filter_batch(
+        self,
+        new_indices: torch.Tensor,
+        new_indices_cpu: Optional[List[int]] = None,
+    ):
+        if self.reserved_seq_lens_cpu is not None:
+            if new_indices_cpu is not None:
+                self.reserved_seq_lens_cpu = self.reserved_seq_lens_cpu[new_indices_cpu]
+            else:
+                self.reserved_seq_lens_cpu = self.reserved_seq_lens_cpu[
+                    new_indices.cpu()
+                ]
+            self.reserved_seq_lens_sum = int(self.reserved_seq_lens_cpu.sum().item())
+
+        self.bonus_tokens = self.bonus_tokens[new_indices]
+        self.draft_tokens = self.draft_tokens[new_indices]
+        self.accept_lens = self.accept_lens[new_indices]
+
+    def merge_batch(self, spec_info: "DFlashPPVerifyInputRaw"):
+        if spec_info.bonus_tokens.numel() == 0:
+            return
+        if self.reserved_seq_lens_cpu is not None:
+            assert spec_info.reserved_seq_lens_cpu is not None
+            self.reserved_seq_lens_cpu = torch.cat(
+                [self.reserved_seq_lens_cpu, spec_info.reserved_seq_lens_cpu]
+            )
+            self.reserved_seq_lens_sum = int(self.reserved_seq_lens_cpu.sum().item())
+        elif spec_info.reserved_seq_lens_cpu is not None:
+            self.reserved_seq_lens_cpu = spec_info.reserved_seq_lens_cpu
+            self.reserved_seq_lens_sum = spec_info.reserved_seq_lens_sum
+
+        self.bonus_tokens = torch.cat([self.bonus_tokens, spec_info.bonus_tokens], dim=0)
+        self.draft_tokens = torch.cat([self.draft_tokens, spec_info.draft_tokens], dim=0)
+        self.accept_lens = torch.cat([self.accept_lens, spec_info.accept_lens], dim=0)
 
 
 @dataclass

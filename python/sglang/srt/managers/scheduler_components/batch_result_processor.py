@@ -809,6 +809,7 @@ class SchedulerBatchResultProcessor:
         batch: ScheduleBatch,
         result: GenerationBatchResult,
     ):
+        from sglang.srt.speculative.dflash_info_v2 import DFlashPPVerifyInputRaw
         from sglang.srt.speculative.dspark_components.dspark_verify import (
             DSparkPPVerifyInputRaw,
         )
@@ -850,9 +851,12 @@ class SchedulerBatchResultProcessor:
 
         accept_lens = None
         accept_lens_cpu = None
-        if isinstance(batch.spec_info, (EaglePPVerifyInputRaw, DSparkPPVerifyInputRaw)):
+        if isinstance(
+            batch.spec_info,
+            (EaglePPVerifyInputRaw, DSparkPPVerifyInputRaw, DFlashPPVerifyInputRaw),
+        ):
             pp_raw = batch.spec_info
-            if isinstance(pp_raw, DSparkPPVerifyInputRaw):
+            if isinstance(pp_raw, (DSparkPPVerifyInputRaw, DFlashPPVerifyInputRaw)):
                 # Linear verify relays tensors across PP ranks; accept_index
                 # stays None so no target KV token-move is needed.
                 accept_lens = pp_raw.accept_lens.to(torch.int64)
@@ -954,7 +958,8 @@ class SchedulerBatchResultProcessor:
         # per req). KV release above must finish first since it reads pre-iter
         # seq_lens; accept_lens covers both topk == 1 (bonus only) and topk > 1.
         if isinstance(
-            batch.spec_info, (EaglePPVerifyInputRaw, DSparkPPVerifyInputRaw)
+            batch.spec_info,
+            (EaglePPVerifyInputRaw, DSparkPPVerifyInputRaw, DFlashPPVerifyInputRaw),
         ):
             batch.seq_lens = batch.seq_lens + accept_lens
             if batch.seq_lens_cpu is not None:

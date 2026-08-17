@@ -102,7 +102,15 @@ def resolve_pp_proxy_dspark_num_layers(
     use_aux = bool(getattr(spec_aux_config, "dflash_use_aux_hidden_state", False))
     if not use_aux or not target_layer_ids:
         return None
-    # Only layers in upstream ranks ([0, start_layer)) are relayed in; this
-    # rank's own captures are produced locally and never arrive via the proxy.
+    if not model_runner.spec_algorithm.is_dspark():
+        # DFLASH family relays a fixed-width aux slot bank: every rank writes
+        # its own captures into their global slot positions and zeroes the
+        # rest, so the receiving buffer is sized by the total capture count
+        # (model-side +1 id shifts, e.g. the qwen3-VL pre-layer capture
+        # convention, cannot desync the width).
+        return len(target_layer_ids)
+    # DSpark: only layers in upstream ranks ([0, start_layer)) are relayed in;
+    # this rank's own captures are produced locally and never arrive via the
+    # proxy.
     upstream = [lid for lid in target_layer_ids if lid < start_layer]
     return len(upstream)
