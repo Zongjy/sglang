@@ -1510,15 +1510,20 @@ class DFlashWorkerV2(BaseSpecWorker):
         )
         bs = commit_lens.numel()
         seq_lens_pre_verify = batch.seq_lens[:bs]
-        # Commit with the backend's default index derivation (same as the
-        # non-PP in-forward commit): at this point batch.seq_lens is still the
-        # pre-verify snapshot, matching what update_mamba_state_after_mtp_verify
-        # expects.
+        # Derive the state slots from the pool instead of the attention
+        # backend's forward_metadata: with multiple microbatches in flight the
+        # rank-local metadata has already been overwritten by the NEXT
+        # microbatch's forward by the time the ring returns accept_lens here.
+        req_pool = self.model_runner.req_to_token_pool
+        state_indices_tensor = req_pool.translate_mamba_indices(
+            req_pool.get_mamba_indices(batch.req_pool_indices[:bs])
+        )
         self._update_target_mamba_state_after_verify(
             batch=batch,
             seq_lens_pre_verify=seq_lens_pre_verify,
             seq_lens_post_verify=seq_lens_pre_verify + commit_lens,
             commit_lens=commit_lens,
+            state_indices_tensor=state_indices_tensor,
         )
 
     def _ensure_accept_bonus_buffers(self, bs: int) -> None:
