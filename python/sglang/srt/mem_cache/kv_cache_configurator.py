@@ -2131,6 +2131,26 @@ class KVCacheConfigurator:
                 f"(4) use GPUs with more memory."
             )
 
+        # PP ranks profile rank-locally (the last PP rank additionally hosts
+        # the speculative draft), so the auto-fit mamba budget can differ per
+        # stage. Divergent mamba capacity diverges admission control across the
+        # mirrored schedulers and wedges the PP control ring -- clamp every
+        # rank down to the smallest, mirroring the token-capacity sync.
+        if get_world_group().world_size > 1:
+            synced = torch.tensor(
+                get_schedule().max_mamba_cache_size, dtype=torch.int64
+            )
+            torch.distributed.all_reduce(
+                synced,
+                op=torch.distributed.ReduceOp.MIN,
+                group=get_world_group().cpu_group,
+            )
+            if int(synced.item()) != get_schedule().max_mamba_cache_size:
+                get_context().override(
+                    "mamba_pool.pp_sync",
+                    max_mamba_cache_size=int(synced.item()),
+                )
+
         # +1: the pool's padding slot is allocated alongside the request slots.
         # ReplaySSM ring rides on every slot too (replayssm_ring_per_req is 0 when
         # the ring is not allocated).
