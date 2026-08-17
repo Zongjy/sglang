@@ -119,8 +119,9 @@ class Qwen3_5ForCausalLM(nn.Module):
         torch.cuda.synchronize()
 
     def set_dflash_layers_to_capture(self, layers_to_capture: list[int]):
-        if not self.pp_group.is_last_rank:
-            return
+        # Enable on every PP rank: non-last stages capture their own slice of
+        # the target layers and relay it downstream inside the PP proxy
+        # ("dflash_aux"), so the last rank reassembles the full list.
         if layers_to_capture is None:
             raise ValueError(
                 "DFLASH requires explicit layer ids for aux hidden capture."

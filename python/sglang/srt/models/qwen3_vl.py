@@ -1461,6 +1461,10 @@ class Qwen3VLForConditionalGeneration(nn.Module):
 
         aux_hidden_states = None
         if self.capture_aux_hidden_states:
+            if not self.pp_group.is_last_rank:
+                # Non-last PP stages return the PPProxyTensors as-is; the
+                # (hidden, aux) tuple only exists on the last rank.
+                return hidden_states
             hidden_states, aux_hidden_states = hidden_states
 
         if self.pp_group.is_last_rank:
@@ -1478,8 +1482,9 @@ class Qwen3VLForConditionalGeneration(nn.Module):
             return hidden_states
 
     def set_dflash_layers_to_capture(self, layer_ids: List[int]):
-        if not self.pp_group.is_last_rank:
-            return
+        # Enable on every PP rank: non-last stages capture their own slice of
+        # the target layers and relay it downstream inside the PP proxy
+        # ("dflash_aux"), so the last rank reassembles the full list.
         if layer_ids is None:
             raise ValueError(
                 "DFLASH requires explicit layer_ids for aux hidden capture."

@@ -16,7 +16,7 @@
 
 import logging
 from functools import lru_cache
-from typing import Iterable, Optional, Set, Tuple, Union
+from typing import Iterable, List, Optional, Set, Tuple, Union
 
 import torch
 import torch.nn as nn
@@ -1397,6 +1397,12 @@ class Qwen3_5ForCausalLM(nn.Module):
 
     def set_dflash_layers_to_capture(self, layers_to_capture: list[int]):
         self.layers_to_capture = layers_to_capture
+        # Global slot of each captured layer: DFLASH-family PP relays a
+        # fixed-width aux bank (keyed "dspark_aux" in the PP proxy), where
+        # every rank writes only its own captures and zeroes the rest.
+        self._dflash_capture_slots = {
+            layer_id: idx for idx, layer_id in enumerate(layers_to_capture)
+        }
         for layer_id in self.layers_to_capture:
             setattr(self.layers[layer_id], "_is_layer_to_capture", True)
 
@@ -1425,11 +1431,17 @@ class Qwen3_5ForCausalLM(nn.Module):
             else:
                 hidden_states = input_embeds
             residual = None
+            upstream_dflash_aux = None
         else:
             assert pp_proxy_tensors is not None
             hidden_states = pp_proxy_tensors["hidden_states"]
             residual = pp_proxy_tensors["residual"]
+            # DFlash aux hidden relayed by the upstream PP stage as the
+            # fixed-width bank [N, L_total, H] (PP proxy key "dspark_aux",
+            # shared by the DFlash-family decode-graph relay buffer).
+            upstream_dflash_aux = pp_proxy_tensors.tensors.get("dspark_aux")
 
+        capture_dflash = bool(self.layers_to_capture)
         aux_hidden_states = []
         # Pass through decoder layers
         for layer_idx in range(self.start_layer, self.end_layer):
@@ -1462,12 +1474,22 @@ class Qwen3_5ForCausalLM(nn.Module):
 
         # Return intermediate tensors for pipeline parallelism
         if not self.pp_group.is_last_rank:
-            return PPProxyTensors(
-                {
-                    "hidden_states": hidden_states,
-                    "residual": residual,
-                }
-            )
+            proxy = {
+                "hidden_states": hidden_states,
+                "residual": residual,
+            }
+            if capture_dflash:
+                # Fixed-width aux bank relay: write the local captures into
+                # their global slot positions over a zeroed (or upstream
+                # relayed) bank. The receiving decode-graph buffer is sized
+                # by the total capture count, so the width is stage-invariant.
+                aux_bank = self._fill_dflash_aux_bank(
+                    upstream_dflash_aux,
+                    aux_hidden_states,
+                    hidden_states,
+                )
+                proxy["dspark_aux"] = aux_bank
+            return PPProxyTensors(proxy)
 
         # Apply final normalization
         if hidden_states.shape[0] != 0:
@@ -1476,10 +1498,56 @@ class Qwen3_5ForCausalLM(nn.Module):
             else:
                 hidden_states, _ = self.norm(hidden_states, residual)
 
+        if capture_dflash and upstream_dflash_aux is not None:
+            # Overwrite this rank's own slots on the relayed bank, then slice
+            # dim=1 to recover the per-layer [N, H] tensors in global order.
+            aux_bank = self._fill_dflash_aux_bank(
+                upstream_dflash_aux,
+                aux_hidden_states,
+                hidden_states,
+            )
+            aux_hidden_states = [
+                aux_bank[:, i, :] for i in range(aux_bank.shape[1])
+            ]
+
         if len(aux_hidden_states) == 0:
             return hidden_states
 
         return hidden_states, aux_hidden_states
+
+    def _fill_dflash_aux_bank(
+        self,
+        upstream_aux: Optional[torch.Tensor],
+        local_aux: List[torch.Tensor],
+        hidden_states: torch.Tensor,
+    ) -> torch.Tensor:
+        """Assemble the fixed-width [N, num_captured_layers, H] aux bank.
+
+        The bank starts zeroed (first PP stage) or from the upstream relay
+        (its non-local slots are zero); each local capture then writes its
+        global slot. Writing into the upstream bank in place is safe: slots
+        are disjoint across stages and the bank is a per-iteration carrier.
+        """
+        width = len(self.layers_to_capture)
+        if upstream_aux is not None and int(upstream_aux.shape[1]) == width:
+            bank = upstream_aux
+        else:
+            bank = torch.zeros(
+                (hidden_states.shape[0], width, hidden_states.shape[-1]),
+                dtype=hidden_states.dtype,
+                device=hidden_states.device,
+            )
+        for layer_id, tensor in zip(self._local_capture_order(), local_aux):
+            slot = self._dflash_capture_slots[layer_id]
+            bank[:, slot].copy_(tensor)
+        return bank
+
+    def _local_capture_order(self) -> List[int]:
+        return [
+            layer_id
+            for layer_id in self.layers_to_capture
+            if self.start_layer <= layer_id < self.end_layer
+        ]
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         weights = QWEN3_5_KV_SCALE_MAPPER.apply(weights)
