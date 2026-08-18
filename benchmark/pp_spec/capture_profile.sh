@@ -20,7 +20,7 @@ LOG=logs/${LABEL}_profile.log
 
 PAR_FLAG=$([ "$TOPO" = pp ] && echo --pp-size || echo --tp-size)2
 
-mkdir -p "$OUT"
+mkdir -p "$OUT" logs results
 
 # 0) clean slate
 pkill -f "sglang.launch_server" 2>/dev/null || true
