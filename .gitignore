@@ -281,3 +281,9 @@ artifacts/
 
 # Internal, non-published docs
 internal-docs/
+
+# PP+spec research benchmarking: scripts tracked, local artifacts are not
+benchmark/pp_spec/data/
+benchmark/pp_spec/logs/
+benchmark/pp_spec/traces/
+benchmark/pp_spec/results/
