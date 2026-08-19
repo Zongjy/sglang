@@ -97,6 +97,7 @@ from sglang.srt.disaggregation.utils import (
 from sglang.srt.distributed import get_pp_group, get_world_group
 from sglang.srt.distributed.parallel_state import get_tp_group
 from sglang.srt.distributed.parallel_state_wrapper import ParallelState
+from sglang.srt.distributed.pp_comm_benchmark import maybe_run_pp_comm_benchmark
 from sglang.srt.dllm.mixin.scheduler import SchedulerDllmMixin
 from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
@@ -5081,6 +5082,13 @@ def run_scheduler_process(
         # Send initialization info back to the parent process
         pipe_writer.send(scheduler.get_init_info())
 
+        # Optional PP inter-stage comm micro-benchmark (opt-in via
+        # SGLANG_PP_COMM_BENCHMARK). It is a pp_group collective, so it must
+        # run after every PP rank's process groups are ready (end of
+        # Scheduler.__init__) and before any event loop starts serving;
+        # failures are swallowed inside and never block startup.
+        maybe_run_pp_comm_benchmark(scheduler)
+
         # Run the event loop (blocks until a ShutdownReq sets gracefully_exit)
         scheduler.run_event_loop()
 
@@ -5100,6 +5108,7 @@ def run_scheduler_process(
             # FPM has a background ZMQ publisher thread that needs explicit
             # teardown to flush queued metrics and close the socket cleanly.
             scheduler.metrics_reporter._shutdown_fpm()
+            scheduler.metrics_reporter._shutdown_ppm()
             # Graceful path only: on the exception path the GPU may be wedged
             # and the synchronize() in destroy() could itself hang.
             if scheduler.gracefully_exit:

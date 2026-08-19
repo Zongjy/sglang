@@ -39,6 +39,7 @@ logger = logging.getLogger(__name__)
 RECORD_STEP_TIME = envs.SGLANG_RECORD_STEP_TIME.get()
 LOG_FORWARD_ITERS = envs.SGLANG_LOG_FORWARD_ITERS.get()
 ENABLE_METRICS_DEVICE_TIMER = envs.SGLANG_ENABLE_METRICS_DEVICE_TIMER.get()
+ENABLE_PP_STAGE_METRICS = envs.SGLANG_ENABLE_PP_STAGE_METRICS.get()
 
 
 def _decode_total_seq_lens(batch: ScheduleBatch) -> int:
@@ -184,6 +185,7 @@ class SchedulerMetricsReporter:
             )
 
         self._init_fpm()
+        self._init_ppm()
 
         self.scheduler_status_logger = SchedulerStatusLogger.maybe_create(
             enable_metrics=self.enable_metrics
@@ -201,6 +203,140 @@ class SchedulerMetricsReporter:
                     dw.draft_runner.device_timer = timer
                 for r in getattr(dw, "draft_runner_list", []):
                     r.device_timer = timer
+        # DFlash-style workers hold `draft_model_runner` directly. Give it a
+        # dedicated timer (not the shared one): its forward re-uses the
+        # TARGET_VERIFY mode name, so category alone cannot tell draft from
+        # target — a separate timer instance can.
+        if self.draft_forward_device_timer is not None:
+            dmr = getattr(self.scheduler.draft_worker, "draft_model_runner", None)
+            if dmr is not None:
+                dmr.device_timer = self.draft_forward_device_timer
+
+    def _init_ppm(self):
+        """Initialize per-iteration per-PP-rank stage metrics (PPM).
+
+        Unlike FPM (last PP rank only, shared schema with Dynamo), PPM
+        publishes on every PP rank so the partition tuner can fit a cost
+        model per stage. GPU segments are accumulated from DeviceTimer
+        reporters and emitted as per-iteration deltas.
+        """
+        self.scheduler.enable_ppm = False
+        self.draft_forward_device_timer: Optional[DeviceTimer] = None
+        self._ppm_gpu_target_acc = 0.0
+        self._ppm_gpu_draft_acc = 0.0
+        self._ppm_last_accept_tokens = self.spec_num_accept_tokens
+        self._ppm_last_forward_ct = self.spec_num_forward_ct
+        if not ENABLE_PP_STAGE_METRICS or self.scheduler.ps.attn_tp_rank != 0:
+            return
+
+        from sglang.srt.observability.pp_stage_metrics import _PpmPublisherThread
+
+        ps = self.scheduler.ps
+        base_endpoint = get_observability().forward_pass_metrics_ipc_name
+        if base_endpoint is None:
+            ipc_path = tempfile.NamedTemporaryFile(delete=False).name
+            base_endpoint = f"ipc://{ipc_path}"
+            get_context().override(
+                "metrics_reporter.ipc_endpoint",
+                forward_pass_metrics_ipc_name=base_endpoint,
+            )
+        dp_rank = ps.dp_rank if ps.dp_rank is not None else 0
+        endpoint = f"{base_endpoint}.pp{ps.pp_rank}.dp{dp_rank}"
+        self.scheduler._ppm_publisher = _PpmPublisherThread(
+            endpoint,
+            worker_id=self.scheduler.server_args.forward_pass_metrics_worker_id,
+            pp_rank=ps.pp_rank,
+            dp_rank=dp_rank,
+        )
+        self.scheduler.enable_ppm = True
+
+        if self.forward_pass_device_timer is not None:
+
+            def _ppm_classifying_reporter(t, category="", **_kwargs):
+                if "draft" in category:
+                    self._ppm_gpu_draft_acc += t
+                else:
+                    self._ppm_gpu_target_acc += t
+
+            self.forward_pass_device_timer.add_reporter(_ppm_classifying_reporter)
+
+            def _ppm_draft_reporter(t, **_kwargs):
+                self._ppm_gpu_draft_acc += t
+
+            self.draft_forward_device_timer = DeviceTimer(
+                reporter=_ppm_draft_reporter
+            )
+        else:
+            logger.warning(
+                "PPM enabled but SGLANG_ENABLE_METRICS_DEVICE_TIMER is off; "
+                "gpu_target_ms/gpu_draft_ms will be 0."
+            )
+        logger.info(
+            "PPM: ZMQ PUB bound on %s (pp_rank=%d, dp_rank=%d)",
+            endpoint,
+            ps.pp_rank,
+            dp_rank,
+        )
+
+    def emit_pp_stage_metrics(
+        self,
+        wall_ms: float,
+        bs: int,
+        num_queued: int,
+        p2p_wait_ms: float,
+    ):
+        """Emit one PpStageMetrics message for a finished scheduler iteration."""
+        if not self.scheduler.enable_ppm:
+            return
+
+        from sglang.srt.observability.pp_stage_metrics import PpStageMetrics
+
+        # Harvest completed CUDA-event intervals without forcing a sync;
+        # intervals still in flight are picked up by a later iteration.
+        if self.forward_pass_device_timer is not None:
+            self.forward_pass_device_timer._report()
+        if self.draft_forward_device_timer is not None:
+            self.draft_forward_device_timer._report()
+
+        gpu_target_ms = self._ppm_gpu_target_acc * 1000.0
+        gpu_draft_ms = self._ppm_gpu_draft_acc * 1000.0
+        self._ppm_gpu_target_acc = 0.0
+        self._ppm_gpu_draft_acc = 0.0
+
+        accept_len = 0.0
+        d_accept = self.spec_num_accept_tokens - self._ppm_last_accept_tokens
+        d_ct = self.spec_num_forward_ct - self._ppm_last_forward_ct
+        if d_ct > 0:
+            accept_len = d_accept / d_ct
+        self._ppm_last_accept_tokens = self.spec_num_accept_tokens
+        self._ppm_last_forward_ct = self.spec_num_forward_ct
+
+        # Global running requests across all PP microbatch slots (``bs``
+        # stays the per-slot microbatch size).
+        running_mbs = getattr(self.scheduler, "running_mbs", None) or ()
+        running_bs = sum(len(mb.reqs) for mb in running_mbs if mb is not None)
+        pp_loop_size = getattr(self.scheduler, "pp_loop_size", 0)
+
+        self.scheduler._ppm_publisher.publish(
+            PpStageMetrics(
+                wall_ms=wall_ms,
+                bs=bs,
+                num_queued=num_queued,
+                gpu_target_ms=gpu_target_ms,
+                gpu_draft_ms=gpu_draft_ms,
+                p2p_wait_ms=p2p_wait_ms,
+                accept_len=accept_len,
+                running_bs=running_bs,
+                pp_loop_size=pp_loop_size,
+            )
+        )
+
+    def _shutdown_ppm(self):
+        publisher = getattr(self.scheduler, "_ppm_publisher", None)
+        if publisher is not None:
+            publisher.shutdown()
+            self.scheduler._ppm_publisher = None
+
 
     def _init_fpm(self):
         """Initialize Forward Pass Metrics (FPM) publisher if configured."""

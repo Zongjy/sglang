@@ -94,6 +94,9 @@ class SchedulerPPMixin:
         while True:
             server_is_idle = True
             for mb_id in range(self.pp_loop_size):
+                if self.enable_ppm:
+                    ppm_t0 = time.perf_counter()
+                    self._ppm_p2p_wait_ms = 0.0
                 self.running_batch = self.running_mbs[mb_id]
                 self.last_batch = self.last_mbs[mb_id]
                 next_first_rank_mb_id = (mb_id + self.ps.pp_size) % self.pp_loop_size
@@ -125,7 +128,9 @@ class SchedulerPPMixin:
                     with torch.profiler.record_function(
                         "scheduler.pp.recv_proxy_tensors"
                     ):
-                        pp_proxy_tensors = self._pp_recv_proxy_tensors()
+                        pp_proxy_tensors = self._ppm_time_recv(
+                            self._pp_recv_proxy_tensors
+                        )
                 next_pp_outputs = None
                 next_batch_result = None
                 d2h_event = None
@@ -185,6 +190,14 @@ class SchedulerPPMixin:
                             )
 
                 self.pp_outputs = next_pp_outputs
+
+                if self.enable_ppm:
+                    self.metrics_reporter.emit_pp_stage_metrics(
+                        wall_ms=(time.perf_counter() - ppm_t0) * 1000.0,
+                        bs=cur_batch.batch_size() if cur_batch else 0,
+                        num_queued=len(self.waiting_queue),
+                        p2p_wait_ms=self._ppm_p2p_wait_ms,
+                    )
 
             # When the server is idle, self-check and re-init some states
             if server_is_idle:
@@ -597,6 +610,21 @@ class SchedulerPPMixin:
         self._pp_tensor_dict_inbox: Dict[str, deque[Dict[str, torch.Tensor]]] = (
             defaultdict(deque)
         )
+        # Per-iteration accumulator for blocking PP recv time (PPM telemetry).
+        self._ppm_p2p_wait_ms = 0.0
+
+    def _ppm_time_recv(self: Scheduler, recv_fn):
+        """Time a blocking PP recv when per-stage metrics (PPM) are enabled.
+
+        The measured wait mixes pipeline imbalance (bubble) with transfer
+        time; consumers must never treat it as stage service cost.
+        """
+        if not self.enable_ppm:
+            return recv_fn()
+        t0 = time.perf_counter()
+        out = recv_fn()
+        self._ppm_p2p_wait_ms += (time.perf_counter() - t0) * 1000.0
+        return out
 
     def profile_and_init_predictor(self: Scheduler):
         """
@@ -1330,7 +1358,9 @@ class SchedulerPPMixin:
                 )
                 return
             with torch.profiler.record_function("recv_res_dict_from_prev_stage"):
-                next_pp_outputs = PPProxyTensors(self._pp_recv_dict_from_prev_stage())
+                next_pp_outputs = PPProxyTensors(
+                    self._ppm_time_recv(self._pp_recv_dict_from_prev_stage)
+                )
             with self.copy_stream_ctx:
                 self.copy_stream.wait_stream(self.schedule_stream)
                 batch_result = self._pp_prep_batch_result(

@@ -4,13 +4,16 @@
 Only ``--pp-size`` and ``--tp-size`` are required.  The default workflow:
 
 1. discovers a single-node GPU placement and the target model layer count;
-2. starts an evenly partitioned baseline and captures a steady-decode trace;
-3. infers stage costs and conservative memory limits from the trace and log;
-4. solves the contiguous min-max layer partition problem; and
-5. benchmarks the predicted candidates without profiler overhead.
+2. starts an evenly partitioned baseline and applies a steady decode load;
+3. collects per-iteration PP stage metrics (PPM) over ZMQ plus conservative
+   memory limits from the startup log;
+4. solves the unified partition objective (stage cost x capacity x mamba
+   ratio); and
+5. writes the recommended partition, ratio, and launch script -- optionally
+   followed by a measured PP-vs-TP topology comparison (--compare-tp).
 
-Every run is self-contained under ``tuning_runs/`` and includes raw traces,
-logs, measurements, a final JSON result, and a directly executable launch
+Every run is self-contained under ``tuning_runs/`` and includes logs,
+measurements, a final JSON result, and a directly executable launch
 script.  Child process groups are tracked explicitly; unrelated SGLang
 servers are never killed.
 """
@@ -18,8 +21,6 @@ servers are never killed.
 from __future__ import annotations
 
 import argparse
-import contextlib
-import io
 import itertools
 import json
 import math
@@ -46,10 +47,6 @@ REPO_ROOT = SCRIPT_DIR.parents[1]
 DEFAULT_MODEL = "Qwen/Qwen3.6-27B"
 DEFAULT_DRAFT_MODEL = "z-lab/Qwen3.6-27B-DFlash"
 DEFAULT_OUTPUT_ROOT = SCRIPT_DIR / "tuning_runs"
-TRACE_NAME = re.compile(
-    r"^(?P<run>.+)-TP-(?P<tp>\d+)(?:-DP-\d+)?-PP-(?P<pp>\d+)"
-    r"(?:-EP-\d+)?\.trace\.json(?:\.gz)?$"
-)
 MEMORY_VALUE = re.compile(r"avail mem=([0-9]+(?:\.[0-9]+)?) GB")
 TARGET_LOAD = re.compile(
     r"Load weight end\..*type=([^,]+),.*mem usage=([0-9]+(?:\.[0-9]+)?) GB"
@@ -61,6 +58,8 @@ MAMBA_RUNNING_LIMIT = re.compile(
     r"max_running_requests is capped to (\d+) by the mamba state cache "
     r"\(max_mamba_cache_size=(\d+), (\d+) state slots per request\)"
 )
+# Decode batch, #running-req: 4, ..., accept len: 3.46, accept rate: ...
+ACCEPT_LEN = re.compile(r"Decode batch.*accept len: ([0-9.]+)")
 
 
 class TuningError(RuntimeError):
@@ -134,6 +133,8 @@ class ValidationResult:
     benchmark_logs: list[str]
     error: str | None = None
     runtime_capacity: dict[str, int] | None = None
+    accept_len: float | None = None
+    mamba_ratio: float | None = None
 
 
 def _json_ready(value: Any) -> Any:
@@ -421,8 +422,12 @@ def find_server_executable(explicit: str | None) -> str:
 
 
 def build_server_command(
-    args: argparse.Namespace, executable: str, port: int
+    args: argparse.Namespace,
+    executable: str,
+    port: int,
+    mamba_ratio: float | None = None,
 ) -> list[str]:
+    ratio = mamba_ratio if mamba_ratio is not None else args.mamba_full_memory_ratio
     command = [
         executable,
         "serve",
@@ -449,7 +454,7 @@ def build_server_command(
         "--mamba-ssm-dtype",
         args.mamba_ssm_dtype,
         "--mamba-full-memory-ratio",
-        str(args.mamba_full_memory_ratio),
+        str(ratio),
         "--enable-metrics",
         "--host",
         args.host,
@@ -509,6 +514,42 @@ def wait_for_server(server: ManagedProcess, base_url: str, timeout_s: float) -> 
     )
 
 
+def parse_accept_len(log_path: Path) -> float | None:
+    """Median 'accept len' over the Decode batch lines of a server log."""
+    try:
+        text = log_path.read_text(errors="replace")
+    except OSError:
+        return None
+    values = [float(v) for v in ACCEPT_LEN.findall(text)]
+    return float(statistics.median(values)) if values else None
+
+
+def check_accept_len_consistency(
+    named_results: Sequence[tuple[str, ValidationResult]],
+    tolerance: float = 0.03,
+) -> list[str]:
+    """Warn when compared runs disagree on mean accepted length.
+
+    Any throughput comparison is invalid if the accept lengths differ; the
+    caller prints the returned warnings but does not block.
+    """
+    measured = [
+        (name, item)
+        for name, item in named_results
+        if item.status == "ok" and item.accept_len
+    ]
+    warnings: list[str] = []
+    for (name_a, a), (name_b, b) in itertools.combinations(measured, 2):
+        rel = abs(a.accept_len - b.accept_len) / max(a.accept_len, b.accept_len)
+        if rel > tolerance:
+            warnings.append(
+                f"throughput comparison INVALID: accept_len differs "
+                f"({name_a} {a.accept_len:.3f} vs {name_b} "
+                f"{b.accept_len:.3f}, {rel:.1%} > {tolerance:.0%})"
+            )
+    return warnings
+
+
 def parse_runtime_capacity(log_path: Path) -> dict[str, int]:
     """Read the resolved scheduler/Mamba capacity from a healthy server log."""
     try:
@@ -528,40 +569,22 @@ def parse_runtime_capacity(log_path: Path) -> dict[str, int]:
     return capacity
 
 
-def resolve_comparison_active_requests(
-    args: argparse.Namespace, baseline_capacity: dict[str, int]
-) -> int | None:
-    """Choose the common active batch used for partition validation.
-
-    The baseline profile is already saturated by ``--concurrency``.  By
-    default, candidate validation pins every server to that same effective
-    active request count so partition compute cost is compared at one load.
-    Capacity/service tuning remains available as an explicit opt-in.
-    """
-    if args.allow_variable_active_requests:
-        return None
-    if args.fixed_active_requests is not None:
-        return args.fixed_active_requests
-    baseline_limit = baseline_capacity.get("max_running_requests")
-    if baseline_limit is None:
-        raise TuningError(
-            "Cannot derive the baseline active request limit from the server log. "
-            "Use --fixed-active-requests explicitly, or opt into "
-            "--allow-variable-active-requests."
-        )
-    return min(args.concurrency, baseline_limit)
-
-
 def start_server(
     args: argparse.Namespace,
     executable: str,
     selected_gpus: Sequence[GPUInfo],
     partition: Sequence[int],
     phase_dir: Path,
+    enable_comm_benchmark: bool = False,
+    # PPM telemetry env vars; on only for the profile baseline (the sole
+    # consumer) so validation/comparison servers carry no instrumentation
+    # overhead.
+    enable_ppm: bool = False,
+    mamba_ratio: float | None = None,
 ) -> tuple[ManagedProcess, str, list[str]]:
     phase_dir.mkdir(parents=True, exist_ok=True)
     port = args.port or find_free_port(args.host)
-    command = build_server_command(args, executable, port)
+    command = build_server_command(args, executable, port, mamba_ratio=mamba_ratio)
     log_path = phase_dir / "server.log"
     log_handle = log_path.open("w")
     env = os.environ.copy()
@@ -570,6 +593,17 @@ def start_server(
     env.setdefault("SGLANG_FORCE_SHUTDOWN", "1")
     env.setdefault("SGLANG_PROFILE_WITH_STACK", "false")
     env.setdefault("SGLANG_PROFILE_RECORD_SHAPES", "false")
+    if enable_ppm:
+        # Per-iteration per-PP-rank stage metrics over ZMQ plus the CUDA-event
+        # device timer backing gpu_target_ms/gpu_draft_ms.
+        env["SGLANG_ENABLE_PP_STAGE_METRICS"] = "1"
+        env["SGLANG_ENABLE_METRICS_DEVICE_TIMER"] = "1"
+    if enable_comm_benchmark:
+        # Startup ping-pong over the real pp_group; fits t_hop = alpha +
+        # beta * num_tokens per hop into the server log.  Baseline only --
+        # candidate validation servers skip it to save startup time.
+        env["SGLANG_PP_COMM_BENCHMARK"] = "1"
+        env["SGLANG_PP_COMM_BENCHMARK_TOKENS"] = args.comm_benchmark_tokens
     if args.pp_size > 1:
         env["SGLANG_PP_LAYER_PARTITION"] = ",".join(map(str, partition))
     else:
@@ -633,6 +667,8 @@ def benchmark_command(
         str(max_tokens),
         "--prompt-max-tokens",
         str(args.prompt_tokens),
+        "--prompt-seed",
+        str(args.prompt_seed),
         "--request-timeout-s",
         str(args.request_timeout_s),
         "--cooldown-s",
@@ -640,6 +676,28 @@ def benchmark_command(
         "--output-dir",
         str(output_dir),
     ]
+
+
+def profile_load_requests(args: argparse.Namespace, concurrency: int) -> int:
+    """Total profile-load requests at the effective (possibly over-offered)
+    concurrency.
+
+    Collection runs for --ppm-collect-s seconds; the request pool must
+    outlast the window or the decode bs decays below the cap and the high-bs
+    buckets starve.
+    """
+    return max(8 * concurrency, 64)
+
+
+def profile_output_tokens(args: argparse.Namespace) -> int:
+    """Per-request decode length for the profile load.
+
+    Default 8192 so a single request outlasts the 30s+settle collection
+    window.
+    """
+    if args.profile_output_tokens is not None:
+        return args.profile_output_tokens
+    return 8192
 
 
 def start_profile_load(
@@ -652,8 +710,8 @@ def start_profile_load(
         "profile_load",
         output_dir,
         concurrency,
-        concurrency,
-        args.profile_output_tokens,
+        profile_load_requests(args, concurrency),
+        profile_output_tokens(args),
     )
     log_path = phase_dir / "profile_load.log"
     log_handle = log_path.open("w")
@@ -694,44 +752,6 @@ def wait_for_load(load: ManagedProcess, timeout_s: float, settle_s: float) -> No
     )
 
 
-def wait_for_traces(
-    trace_dir: Path, profile_id: str, expected: int, timeout_s: float
-) -> list[Path]:
-    deadline = time.monotonic() + timeout_s
-    previous: tuple[tuple[str, int], ...] | None = None
-    stable_polls = 0
-    while time.monotonic() < deadline:
-        paths = sorted(trace_dir.glob(f"{profile_id}-TP-*.trace.json.gz"))
-        snapshot = tuple((path.name, path.stat().st_size) for path in paths)
-        if len(paths) == expected and all(size > 1024 for _, size in snapshot):
-            if snapshot == previous:
-                stable_polls += 1
-                if stable_polls >= 2:
-                    return paths
-            else:
-                stable_polls = 0
-        previous = snapshot
-        time.sleep(2)
-    found = sorted(path.name for path in trace_dir.glob("*.trace.json.gz"))
-    raise TuningError(
-        f"Expected {expected} stable trace files for {profile_id}, found {len(found)} "
-        f"after {timeout_s:g}s: {found}"
-    )
-
-
-def representative_traces(paths: Sequence[Path], pp_size: int) -> list[Path]:
-    by_pp: dict[int, dict[int, Path]] = {}
-    for path in paths:
-        match = TRACE_NAME.match(path.name)
-        if match:
-            by_pp.setdefault(int(match.group("pp")), {})[int(match.group("tp"))] = path
-    if sorted(by_pp) != list(range(pp_size)):
-        raise TuningError(
-            f"Trace set has PP ranks {sorted(by_pp)}, expected {list(range(pp_size))}."
-        )
-    return [by_pp[rank][min(by_pp[rank])] for rank in range(pp_size)]
-
-
 def run_validation(
     args: argparse.Namespace,
     base_url: str,
@@ -740,9 +760,10 @@ def run_validation(
     concurrency: int,
     server_log: Path,
 ) -> ValidationResult:
+    phase_dir.mkdir(parents=True, exist_ok=True)
     repeats = []
     benchmark_logs = []
-    requests = args.validation_requests or max(16, 2 * concurrency)
+    requests = max(16, 2 * concurrency)
     label_base = "p" + "-".join(map(str, partition))
     for repeat in range(args.validation_repeats):
         label = f"{label_base}_r{repeat}"
@@ -824,6 +845,7 @@ def run_validation(
         str(server_log),
         benchmark_logs,
         runtime_capacity=parse_runtime_capacity(server_log),
+        accept_len=parse_accept_len(server_log),
     )
 
 
@@ -893,99 +915,566 @@ def parse_memory_limits(
     return tuple(limits), details
 
 
-def analyze_traces(
-    trace_inputs: Sequence[Path],
-    num_layers: int,
+def collect_ppm_snapshot(args: argparse.Namespace, baseline_dir: Path) -> dict[str, Any]:
+    """Collect a PPM snapshot from the live baseline server under load."""
+    sys.path.insert(0, str(SCRIPT_DIR))
+    import ppm_consumer
+
+    log_path = baseline_dir / "server.log"
+    text = log_path.read_text(errors="replace") if log_path.exists() else ""
+    endpoints = ppm_consumer.parse_ppm_endpoints(text)
+    if not endpoints:
+        raise TuningError(
+            "No 'PPM: ZMQ PUB bound on' lines in the baseline server log; "
+            "the server did not publish stage metrics."
+        )
+    saturation_bs = args.ppm_saturation_bs
+    if saturation_bs is None:
+        if args.fixed_active_requests is not None:
+            saturation_bs = args.fixed_active_requests
+        else:
+            saturation_bs = parse_runtime_capacity(log_path).get("max_running_requests")
+    print(
+        f"[ppm] collecting for {args.ppm_collect_s:g}s from {len(endpoints)} "
+        f"endpoint(s) (saturation bs: {saturation_bs or 'num_queued only'})",
+        flush=True,
+    )
+    snapshot = ppm_consumer.collect(
+        endpoints,
+        duration_s=args.ppm_collect_s,
+        max_messages=args.ppm_max_messages,
+        saturation_bs=saturation_bs,
+    )
+    write_json(baseline_dir / "ppm_snapshot.json", snapshot)
+    print(
+        f"[ok] PPM snapshot: {snapshot['messages_total']} messages, "
+        f"{snapshot['messages_kept']} kept after the work-conservation filter",
+        flush=True,
+    )
+    return snapshot
+
+
+def _build_capacity_context(
+    args: argparse.Namespace,
+    baseline_log_text: str,
+    baseline_partition: Sequence[int],
+) -> dict[str, Any] | None:
+    """Build the capacity model (static info + baseline calibration).
+
+    Returns None (with a printed warning) when the model files or the log
+    facts are unavailable; the analysis then falls back to the compute-only
+    objective.
+    """
+    sys.path.insert(0, str(SCRIPT_DIR))
+    import capacity_model
+
+    try:
+        static = capacity_model.load_static_info(
+            args.model_path, args.draft_model_path
+        )
+        calibration = capacity_model.calibrate(
+            baseline_log_text,
+            static,
+            baseline_partition,
+            args.mem_fraction_static,
+            args.mamba_full_memory_ratio,
+            args.block_size,
+            args.cuda_graph_max_bs,
+        )
+    except capacity_model.CapacityModelError as exc:
+        print(f"[warn] capacity model disabled: {exc}", flush=True)
+        return None
+
+    def capacity_of(partition: Sequence[int]):
+        return capacity_model.predict_capacity(
+            partition,
+            static,
+            calibration,
+            args.mamba_full_memory_ratio,
+            args.block_size,
+        )
+
+    def composition_of(partition: Sequence[int]) -> tuple[str, ...]:
+        start = 0
+        parts = []
+        for count in partition:
+            gdn = static.gdn_layers(start, start + count)
+            full = static.full_layers(start, start + count)
+            parts.append(f"{gdn}G+{full}F")
+            start += count
+        return tuple(parts)
+
+    def k_of(partition: Sequence[int]) -> tuple[int, ...]:
+        return capacity_of(partition).k_per_rank
+
+    return {
+        "static": static,
+        "calibration": calibration,
+        "capacity_of": capacity_of,
+        "composition_of": composition_of,
+        "k_of": k_of,
+        "weight_source": static.weight_source,
+    }
+
+
+def render_ppm_report(
+    args: argparse.Namespace,
+    result: Any,
+    capacity_ctx: dict[str, Any] | None,
+    output_dir: Path,
+    meas: dict[tuple[int, ...], Any] | None = None,
+    k_of: Any = None,
+) -> str:
+    """Render the optimizer report + decision table + sweep plot.
+
+    ``k_of`` (optional) overrides the per-rank K source; pass the swept
+    (ratio-optimized) capacity callable so the table's K0/K1 use the same
+    ratio as each row's recommendation.
+    """
+    sys.path.insert(0, str(SCRIPT_DIR))
+    import plot_partition_model as plot_mod
+
+    rows = plot_mod.build_rows(
+        result,
+        composition_of=(
+            capacity_ctx["composition_of"] if capacity_ctx else None
+        ),
+        k_of=k_of or (capacity_ctx["k_of"] if capacity_ctx else None),
+        meas=meas,
+    )
+    table = plot_mod.render_table(rows, with_meas=bool(meas))
+    text = result.to_report() + "\n\n" + table + "\n"
+    output_dir.mkdir(parents=True, exist_ok=True)
+    (output_dir / "analysis.txt").write_text(text)
+    png = plot_mod.render_plot(
+        rows,
+        output_dir / "partition_sweep.png",
+        title="PP partition sweep: compute vs capacity",
+    )
+    if png is None:
+        print("[warn] matplotlib unavailable; sweep plot skipped", flush=True)
+    return text
+
+
+def resolve_t_comm(
+    args: argparse.Namespace, baseline_log_text: str, work_tokens: float
+) -> tuple[float, str]:
+    """Resolve the per-boundary comm cost (ms).
+
+    Manual --t-comm-ms wins; otherwise parse the baseline's startup comm
+    micro-benchmark hops and take the worst hop at ``work_tokens`` (bs* x
+    block_size hidden states per hop); otherwise fall back to 0.
+    """
+    sys.path.insert(0, str(SCRIPT_DIR))
+    import ppm_consumer
+
+    if args.t_comm_ms is not None:
+        return args.t_comm_ms, "manual --t-comm-ms"
+    hops = ppm_consumer.parse_comm_benchmark_hops(baseline_log_text)
+    if hops:
+        details = ", ".join(
+            f"{hop}: alpha={alpha:.4f} ms, beta={beta:.3e} ms/token"
+            for hop, (alpha, beta) in sorted(hops.items())
+        )
+        value = max(alpha + beta * work_tokens for alpha, beta in hops.values())
+        return value, f"startup comm benchmark ({details})"
+    print(
+        "[warn] no [pp_comm_benchmark] lines in the baseline server log; "
+        "t_comm falls back to 0 (uncalibrated)",
+        flush=True,
+    )
+    return 0.0, "unavailable; fell back to 0"
+
+
+def bucket_sample_distribution(snapshot: dict[str, Any]) -> dict[int, int]:
+    """Kept (work-conserving) samples per bs bucket, summed over ranks."""
+    counts: dict[int, int] = {}
+    for rank_data in snapshot.get("ranks", {}).values():
+        for bucket, cell in rank_data.get("buckets", {}).items():
+            counts[int(bucket)] = counts.get(int(bucket), 0) + int(
+                cell.get("count", 0)
+            )
+    return dict(sorted(counts.items()))
+
+
+def analyze_ppm(
+    args: argparse.Namespace,
+    snapshot: dict[str, Any],
     current_partition: Sequence[int],
     max_layers: Sequence[int],
-    top_candidates: int,
     output_dir: Path,
+    baseline_log_text: str,
+    meas: dict[tuple[int, ...], Any] | None = None,
 ) -> dict[str, Any]:
+    """Fit stage + capacity models and solve the unified partition objective."""
     sys.path.insert(0, str(SCRIPT_DIR))
-    import auto_pp_partition
+    import partition_optimizer
+    import stage_model
 
-    namespace = argparse.Namespace(
-        traces=list(trace_inputs),
-        num_layers=num_layers,
-        current_partition=",".join(map(str, current_partition)),
-        fixed_overhead_ms=None,
-        min_layers_per_stage=1,
-        max_layers_per_stage=",".join(map(str, max_layers)),
-        target_min_ratio=0.60,
-        trim_samples=2,
-        top_candidates=top_candidates,
-        json_output=output_dir / "analysis.json",
-    )
-    report = io.StringIO()
     try:
-        with contextlib.redirect_stdout(report):
-            result = auto_pp_partition.run(namespace)
-    except auto_pp_partition.AnalysisError as exc:
+        model = stage_model.StageCostModel.fit(snapshot, current_partition)
+    except stage_model.StageModelError as exc:
         raise TuningError(str(exc)) from exc
-    output_dir.mkdir(parents=True, exist_ok=True)
-    (output_dir / "analysis.txt").write_text(report.getvalue())
-    print(report.getvalue(), end="", flush=True)
-    return result
 
-
-def try_slim_trace(paths: Sequence[Path], output_path: Path) -> str | None:
-    command = [
-        sys.executable,
-        str(SCRIPT_DIR / "slim_trace.py"),
-        *map(str, paths),
-        "-o",
-        str(output_path),
-    ]
-    completed = subprocess.run(
-        command,
-        cwd=REPO_ROOT,
-        text=True,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
+    bucket_counts = bucket_sample_distribution(snapshot)
+    print(f"[ppm] kept samples per bs bucket: {bucket_counts}", flush=True)
+    work_tokens = model.target_bucket().bs_mean * args.block_size
+    t_comm_ms, t_comm_source = resolve_t_comm(args, baseline_log_text, work_tokens)
+    print(
+        f"[t_comm] {t_comm_ms:.4f} ms at {work_tokens:g} tokens/hop "
+        f"({t_comm_source})",
+        flush=True,
     )
-    if completed.returncode != 0:
-        return completed.stdout.strip()
-    return None
 
-
-def candidate_partitions(
-    baseline: Sequence[int], analysis: dict[str, Any]
-) -> list[tuple[int, ...]]:
-    result = [tuple(baseline)]
-    for item in analysis["candidates"]:
-        partition = tuple(item["partition"])
-        if partition not in result:
-            result.append(partition)
-    return result
-
-
-def choose_best(
-    validations: Sequence[ValidationResult],
-    baseline: Sequence[int],
-    min_improvement_pct: float,
-) -> tuple[tuple[int, ...], str]:
-    valid = [
-        item for item in validations if item.status == "ok" and item.throughput_tok_s is not None
-    ]
-    if not valid:
-        raise TuningError("No partition completed the validation benchmark.")
-    best = max(valid, key=lambda item: item.throughput_tok_s or 0.0)
-    baseline_result = next(
-        (item for item in valid if item.partition == tuple(baseline)), None
+    capacity_ctx = _build_capacity_context(
+        args, baseline_log_text, current_partition
     )
-    if baseline_result is not None and best.partition != tuple(baseline):
-        improvement = (
-            (best.throughput_tok_s - baseline_result.throughput_tok_s)
-            / baseline_result.throughput_tok_s
-            * 100.0
+    capacity_callable = None
+    if capacity_ctx is not None:
+        import capacity_model
+
+        ratios = tuple(
+            float(item) for item in args.ratio_grid.split(",") if item.strip()
         )
-        if improvement < min_improvement_pct:
-            return tuple(baseline), (
-                f"best measured candidate improved throughput by only {improvement:.2f}%; "
-                f"kept baseline because the threshold is {min_improvement_pct:.2f}%"
+        kv_per_req = args.prompt_tokens + args.validation_output_tokens
+        static = capacity_ctx["static"]
+        calibration = capacity_ctx["calibration"]
+        accept_len = model.target_bucket().accept_len
+        loop_size = max(model.pp_loop_size, 1)
+
+        def capacity_callable(partition):  # noqa: F811
+            def score(est) -> float:
+                per_slot = est.bs_max / loop_size
+                c_b, fixed_b = model.cost_at_bs(per_slot)
+                cadence = max(
+                    fixed_b[r] + c_b * n + (t_comm_ms if r > 0 else 0.0)
+                    for r, n in enumerate(partition)
+                )
+                if cadence <= 0 or accept_len <= 0:
+                    return 0.0
+                return est.bs_max * accept_len / (loop_size * cadence / 1000.0)
+
+            _, est, _, _ = capacity_model.sweep_ratios(
+                partition,
+                static,
+                calibration,
+                ratios,
+                args.block_size,
+                kv_per_req,
+                score,
             )
-        return best.partition, f"highest validated throughput ({improvement:.2f}% over baseline)"
-    return best.partition, "highest validated throughput"
+            return est
+
+    try:
+        result = partition_optimizer.optimize(
+            model,
+            t_comm_ms=t_comm_ms,
+            max_layers=max_layers,
+            k_best=args.k_best,
+            allow_draft_relocation=args.allow_draft_relocation,
+            capacity=capacity_callable,
+        )
+    except partition_optimizer.OptimizerError as exc:
+        raise TuningError(str(exc)) from exc
+
+    text = render_ppm_report(
+        args,
+        result,
+        capacity_ctx,
+        output_dir,
+        meas,
+        k_of=(
+            (lambda partition: capacity_callable(partition).k_per_rank)
+            if capacity_callable is not None
+            else None
+        ),
+    )
+    print(text, flush=True)
+
+    capacity_summary = None
+    if capacity_ctx is not None:
+        capacity_summary = {
+            "weight_source": capacity_ctx["weight_source"],
+            "baseline_k": capacity_ctx["calibration"].baseline_k,
+            "baseline_kv_tokens": capacity_ctx["calibration"].baseline_kv_tokens,
+            "estimates": {
+                ",".join(map(str, item.partition)): capacity_ctx["capacity_of"](
+                    item.partition
+                ).to_dict()
+                for item in result.candidates
+            },
+        }
+    analysis = {
+        "mode": "ppm",
+        "num_layers": model.num_layers,
+        "current_partition": list(current_partition),
+        "recommended": {
+            "partition": list(result.best.partition),
+            "draft_rank": result.best.draft_rank,
+            "bottleneck_ms": result.best.bottleneck_ms,
+            "bs_max": result.best.bs_max,
+            "throughput_tok_s": result.best.throughput_tok_s,
+            "mamba_ratio": result.best.mamba_ratio,
+        },
+        "candidates": [
+            {
+                "partition": list(item.partition),
+                "draft_rank": item.draft_rank,
+                "bottleneck_ms": item.bottleneck_ms,
+                "bs_max": item.bs_max,
+                "throughput_tok_s": item.throughput_tok_s,
+                "mamba_ratio": item.mamba_ratio,
+            }
+            for item in result.candidates[: args.candidate_count]
+        ],
+        "keep_current": result.keep_current,
+        "recommendation": result.recommendation,
+        "t_comm": {
+            "value_ms": t_comm_ms,
+            "source": t_comm_source,
+            "work_tokens": work_tokens,
+        },
+        "ratio_grid": args.ratio_grid,
+        "bucket_samples": bucket_counts,
+        "compute_optimal": (
+            list(result.compute_optimal) if result.compute_optimal else None
+        ),
+        "capacity_optimal": (
+            list(result.capacity_optimal) if result.capacity_optimal else None
+        ),
+        "max_candidate_bs_max": max(
+            (item.bs_max or 0 for item in result.candidates), default=0
+        ),
+        "capacity_model": capacity_summary,
+        "stage_model": model.to_dict(),
+        "optimization": result.to_dict(),
+    }
+    write_json(output_dir / "analysis.json", analysis)
+    return analysis
+
+
+def parse_measured_capacity(log_path: Path) -> dict[str, int]:
+    """Read the measured mamba K and resolved running cap from a server log."""
+    try:
+        text = log_path.read_text(errors="replace")
+    except OSError:
+        return {}
+    measured: dict[str, int] = {}
+    k_values = [int(v) for v in re.findall(r"max_mamba_cache_size: (\d+)", text)]
+    if k_values:
+        measured["k"] = min(k_values)
+    measured.update(parse_runtime_capacity(log_path))
+    return measured
+
+
+TP_COMPARISON_SETTLE_S = 5.0
+
+
+def run_tp_comparison(
+    args: argparse.Namespace,
+    run_dir: Path,
+    executable: str,
+    selected: Sequence[GPUInfo],
+    best_partition: Sequence[int],
+    baseline_partition: Sequence[int] | None = None,
+    best_ratio: float | None = None,
+) -> dict[str, Any]:
+    """PP vs TP topology comparison, self-contained on fresh servers.
+
+    Measures BOTH sides at their native capacity first -- the PP server at
+    the recommended partition/ratio, the TP server (tp_size = pp_size *
+    tp_size, pp_size = 1, no layer partition, no comm benchmark, no PPM --
+    event_loop_pp does not run) at its swept ratio -- then re-measures each
+    side above the common cap at --max-running-requests = min(PP_BS, TP_BS)
+    with offered concurrency >= 2x that value (the side already below the
+    common cap keeps its native measurement).  The accept_len consistency
+    check applies to the comparison.  The TP ratio comes from a pp=1
+    capacity sweep (score = BS_max under the KV constraint); the PP side
+    uses the recommended partition's ratio.
+    """
+    tp_ratio = best_ratio
+    tp_capacity_est = None
+    baseline_log_path = run_dir / "baseline" / "server.log"
+    if baseline_partition is not None and baseline_log_path.is_file():
+        try:
+            import capacity_model
+
+            baseline_log_text = baseline_log_path.read_text(errors="replace")
+            ctx = _build_capacity_context(args, baseline_log_text, baseline_partition)
+            if ctx is not None:
+                ratios = tuple(
+                    float(item) for item in args.ratio_grid.split(",") if item.strip()
+                )
+                kv_per_req = args.prompt_tokens + args.validation_output_tokens
+                num_layers = sum(best_partition)
+                tp_ratio, tp_capacity_est, _, _ = capacity_model.sweep_ratios(
+                    (num_layers,),
+                    ctx["static"],
+                    ctx["calibration"],
+                    ratios,
+                    args.block_size,
+                    kv_per_req,
+                    lambda est: est.bs_max,
+                )
+        except Exception as exc:  # ratio sweep is best-effort
+            print(f"[warn] TP ratio sweep failed: {exc}; using default ratio", flush=True)
+            tp_ratio = best_ratio
+    tp_args = argparse.Namespace(**vars(args))
+    tp_args.tp_size = args.tp_size * args.pp_size
+    tp_args.pp_size = 1
+    tp_args.fixed_active_requests = None
+    pp_args = argparse.Namespace(**vars(args))
+    pp_args.fixed_active_requests = None
+
+    phase_dir = run_dir / "tp_comparison"
+    result: dict[str, Any] = {
+        "tp_size": tp_args.tp_size,
+        "pp_partition": list(best_partition),
+        "tp_mamba_ratio": tp_ratio,
+        "tp_capacity_est": (
+            tp_capacity_est.to_dict() if tp_capacity_est is not None else None
+        ),
+    }
+
+    def stop_and_settle(server: ManagedProcess | None) -> None:
+        """Stop a server and let the GPU fully drain before the next start.
+
+        ManagedProcess.stop already kills the whole process group and waits;
+        the extra settle covers driver-side memory release so the next
+        server never sees the previous one's allocation (the TP/PP
+        comparison runs three servers sequentially on the same GPUs).
+        """
+        if server is not None:
+            server.stop()
+        time.sleep(TP_COMPARISON_SETTLE_S)
+
+    server: ManagedProcess | None = None
+    try:
+        # PP side at its recommended partition/ratio, native capacity.
+        server, pp_url, _ = start_server(
+            pp_args, executable, selected, best_partition,
+            phase_dir / "pp_native", mamba_ratio=best_ratio,
+        )
+        pp_capacity = parse_measured_capacity(server.log_path)
+        pp_cap = pp_capacity.get("max_running_requests")
+        result["pp_capacity"] = pp_capacity
+        pp_native = run_validation(
+            pp_args, pp_url, best_partition, phase_dir / "pp_native",
+            max(2 * (pp_cap or args.concurrency), 16), server.log_path,
+        )
+        result["pp_native"] = asdict(pp_native)
+        # Exactly one server on the GPUs at any time from here on.
+        stop_and_settle(server)
+        server = None
+
+        # TP side at its swept ratio, native capacity.
+        server, tp_url, _ = start_server(
+            tp_args, executable, selected, (), phase_dir / "tp_native",
+            mamba_ratio=tp_ratio,
+        )
+        tp_capacity = parse_measured_capacity(server.log_path)
+        tp_cap = tp_capacity.get("max_running_requests")
+        result["tp_capacity"] = tp_capacity
+        tp_native = run_validation(
+            tp_args, tp_url, (), phase_dir / "tp_native",
+            max(2 * (tp_cap or args.concurrency), 16), server.log_path,
+        )
+        result["tp_native"] = asdict(tp_native)
+        stop_and_settle(server)
+        server = None
+
+        if (
+            pp_cap
+            and tp_cap
+            and pp_native.status == "ok"
+            and tp_native.status == "ok"
+        ):
+            common = min(pp_cap, tp_cap)
+            concurrency = max(2 * common, 16)
+            result["equal_concurrency"] = common
+
+            if pp_cap > common:
+                pp_capped_args = argparse.Namespace(**vars(pp_args))
+                pp_capped_args.fixed_active_requests = common
+                pp_dir = phase_dir / "pp_capped"
+                server, pp_url, _ = start_server(
+                    pp_capped_args, executable, selected, best_partition, pp_dir,
+                    mamba_ratio=best_ratio,
+                )
+                pp_equal = run_validation(
+                    pp_capped_args, pp_url, best_partition, pp_dir, concurrency,
+                    server.log_path,
+                )
+                stop_and_settle(server)
+                server = None
+            else:
+                pp_equal = pp_native
+            result["pp_equal"] = asdict(pp_equal)
+
+            if tp_cap > common:
+                tp_capped_args = argparse.Namespace(**vars(tp_args))
+                tp_capped_args.fixed_active_requests = common
+                tp_dir = phase_dir / "tp_capped"
+                server, tp_url, _ = start_server(
+                    tp_capped_args, executable, selected, (), tp_dir,
+                    mamba_ratio=tp_ratio,
+                )
+                tp_equal = run_validation(
+                    tp_capped_args, tp_url, (), tp_dir, concurrency,
+                    server.log_path,
+                )
+                stop_and_settle(server)
+                server = None
+            else:
+                tp_equal = tp_native
+            result["tp_equal"] = asdict(tp_equal)
+
+            warnings = check_accept_len_consistency(
+                [("pp", pp_equal), ("tp", tp_equal)]
+            )
+            result["accept_len_warnings"] = warnings
+            for warning in warnings:
+                print(f"[WARNING] {warning}", flush=True)
+    finally:
+        if server is not None:
+            server.stop()
+
+    def _tok(entry: dict[str, Any] | None) -> str:
+        if not entry or entry.get("throughput_tok_s") is None:
+            return "n/a"
+        return f"{entry['throughput_tok_s']:.1f} tok/s"
+
+    def _acc(entry: dict[str, Any] | None) -> str:
+        if not entry or entry.get("accept_len") is None:
+            return "n/a"
+        return f"{entry['accept_len']:.2f}"
+
+    lines = [
+        "PP vs TP comparison:",
+        f"  ratios: PP best at {best_ratio or args.mamba_full_memory_ratio:g}, "
+        f"TP at {tp_ratio or args.mamba_full_memory_ratio:g}",
+        f"  native capacity: PP {','.join(map(str, best_partition))} "
+        f"(cap {pp_cap}) {_tok(result['pp_native'])} vs "
+        f"TP{tp_args.tp_size} (cap {tp_cap}) {_tok(result['tp_native'])}",
+    ]
+    if "equal_concurrency" in result:
+        lines.append(
+            f"  equal concurrency (cap {result['equal_concurrency']}): "
+            f"PP {_tok(result.get('pp_equal'))} (accept {_acc(result.get('pp_equal'))}) vs "
+            f"TP {_tok(result.get('tp_equal'))} (accept {_acc(result.get('tp_equal'))})"
+        )
+        verdict = (
+            "accept_len consistent"
+            if not result.get("accept_len_warnings")
+            else "accept_len DIFFERS; comparison invalid"
+        )
+        lines.append(f"  accept_len consistency: {verdict}")
+    text = "\n".join(lines)
+    print(text, flush=True)
+    phase_dir.mkdir(parents=True, exist_ok=True)
+    (phase_dir / "tp_comparison.txt").write_text(text + "\n")
+    result["summary"] = text
+    return result
 
 
 def create_run_dir(root: Path, tp_size: int, pp_size: int) -> Path:
@@ -1007,13 +1496,19 @@ def write_best_artifacts(
     selected_gpus: Sequence[GPUInfo],
     partition: Sequence[int],
     reason: str,
+    mamba_ratio: float | None = None,
 ) -> None:
     visible = ",".join(str(gpu.index) for gpu in selected_gpus)
-    command = build_server_command(args, executable, args.final_port)
+    command = build_server_command(
+        args, executable, args.final_port, mamba_ratio=mamba_ratio
+    )
     config = {
         "tp_size": args.tp_size,
         "pp_size": args.pp_size,
         "partition": tuple(partition),
+        "mamba_full_memory_ratio": (
+            mamba_ratio if mamba_ratio is not None else args.mamba_full_memory_ratio
+        ),
         "cuda_visible_devices": visible,
         "selection_reason": reason,
         "command": command,
@@ -1095,38 +1590,77 @@ def run_tuner(args: argparse.Namespace) -> Path | None:
                 "Use --fixed-active-requests instead of passing "
                 "--max-running-requests through --server-args."
             )
-    if args.allow_variable_active_requests and args.fixed_active_requests is not None:
-        raise TuningError(
-            "--allow-variable-active-requests and --fixed-active-requests are "
-            "mutually exclusive."
+
+    if args.reanalyze:
+        run_dir = args.reanalyze
+        baseline_dir = run_dir / "baseline"
+        snapshot_path = baseline_dir / "ppm_snapshot.json"
+        log_path = baseline_dir / "server.log"
+        if not snapshot_path.is_file() or not log_path.is_file():
+            raise TuningError(
+                f"--reanalyze needs {snapshot_path} and {log_path} from a "
+                "previous ppm-mode run."
+            )
+        snapshot = json.loads(snapshot_path.read_text())
+        baseline_log_text = log_path.read_text(errors="replace")
+        saved: dict[str, Any] = {}
+        result_path = run_dir / "result.json"
+        if result_path.is_file():
+            saved = json.loads(result_path.read_text())
+        saved_settings = saved.get("settings", {})
+        for key in (
+            "mem_fraction_static",
+            "mamba_full_memory_ratio",
+            "block_size",
+            "cuda_graph_max_bs",
+            "model_path",
+            "draft_model_path",
+        ):
+            if key in saved_settings:
+                setattr(args, key, saved_settings[key])
+        baseline = (
+            tuple(saved["baseline_partition"])
+            if saved.get("baseline_partition")
+            else baseline
         )
-    if args.analyze_traces:
-        run_dir = create_run_dir(args.output_root, args.tp_size, args.pp_size)
-        analysis = analyze_traces(
-            [args.analyze_traces],
-            model.num_layers,
+        # Measured columns from the previous run's validations.
+        sys.path.insert(0, str(SCRIPT_DIR))
+        import plot_partition_model as plot_mod
+
+        meas: dict[tuple[int, ...], Any] = {}
+        for item in saved.get("validations", []):
+            if item.get("status") != "ok":
+                continue
+            capacity = parse_measured_capacity(Path(item["server_log"]))
+            capacity.update(item.get("runtime_capacity") or {})
+            meas[tuple(item["partition"])] = plot_mod.MeasPoint(
+                k=capacity.get("k"),
+                bs_max=capacity.get("max_running_requests"),
+                accept_len=item.get("accept_len"),
+                mamba_ratio=item.get("mamba_ratio"),
+            )
+        out_dir = run_dir / "reanalysis"
+        analysis = analyze_ppm(
+            args,
+            snapshot,
             baseline,
             (model.num_layers,) * args.pp_size,
-            args.candidate_count,
-            run_dir,
+            out_dir,
+            baseline_log_text,
+            meas=meas or None,
         )
-        best = tuple(analysis["recommended"]["partition"])
-        state = {
-            "status": "analysis_only",
-            "model": model,
-            "baseline_partition": baseline,
-            "analysis": analysis,
-            "best_partition": best,
-            "note": "Offline analysis only; candidates were not benchmarked.",
-        }
-        if args.pp_size > 1:
-            value = ",".join(map(str, best))
-            (run_dir / "best_config.env").write_text(
-                f"export SGLANG_PP_LAYER_PARTITION={shlex.quote(value)}\n"
-            )
-        write_json(run_dir / "result.json", state)
-        print(f"[done] offline analysis: {run_dir}")
-        return run_dir
+        write_json(
+            out_dir / "result.json",
+            {
+                "status": "reanalysis",
+                "source_run": str(run_dir),
+                "baseline_partition": baseline,
+                "analysis": analysis,
+            },
+        )
+        print(f"[done] reanalysis written to {out_dir}", flush=True)
+        print(f"[done] sweep plot: {out_dir / 'partition_sweep.png'}", flush=True)
+        return out_dir
 
     executable = find_server_executable(args.sglang_executable)
     selected, explicit_devices, topology = select_gpus(args)
@@ -1141,15 +1675,6 @@ def run_tuner(args: argparse.Namespace) -> Path | None:
         "load_control": {
             "offered_concurrency": concurrency,
             "requested_fixed_active_requests": args.fixed_active_requests,
-            "mode": (
-                "explicit_fixed_active"
-                if args.fixed_active_requests is not None
-                else (
-                    "variable_capacity"
-                    if args.allow_variable_active_requests
-                    else "baseline_fixed_active_auto"
-                )
-            ),
         },
         "explicit_device_order": explicit_devices,
         "gpu_plan": gpu_plan,
@@ -1161,6 +1686,52 @@ def run_tuner(args: argparse.Namespace) -> Path | None:
         print(json.dumps(_json_ready(dry_plan), indent=2))
         return None
 
+    if args.compare_tp_only:
+        # Convenience: skip PP baseline/profile/analysis and only (re-)run
+        # the TP comparison of an existing run, reading the best partition
+        # and ratio from its result.json.
+        run_dir = args.compare_tp_only
+        result_path = run_dir / "result.json"
+        if not result_path.is_file():
+            raise TuningError(f"--compare-tp-only needs {result_path}.")
+        saved = json.loads(result_path.read_text())
+        saved_settings = saved.get("settings", {})
+        for key in (
+            "mem_fraction_static",
+            "mamba_full_memory_ratio",
+            "block_size",
+            "cuda_graph_max_bs",
+            "model_path",
+            "draft_model_path",
+        ):
+            if key in saved_settings:
+                setattr(args, key, saved_settings[key])
+        if not saved.get("best_partition"):
+            raise TuningError(f"{result_path} has no best_partition yet.")
+        best = tuple(saved["best_partition"])
+        saved_baseline = tuple(saved.get("baseline_partition") or best)
+        best_ratio = None
+        analysis = saved.get("analysis") or {}
+        recommended = analysis.get("recommended") or {}
+        if tuple(recommended.get("partition") or ()) == best:
+            best_ratio = recommended.get("mamba_ratio")
+        comparison = run_tp_comparison(
+            args,
+            run_dir,
+            executable,
+            selected,
+            best,
+            baseline_partition=saved_baseline,
+            best_ratio=best_ratio,
+        )
+        saved["tp_comparison"] = comparison
+        write_json(result_path, saved)
+        print(
+            f"[done] TP comparison written to {run_dir / 'tp_comparison'}",
+            flush=True,
+        )
+        return run_dir
+
     run_dir = create_run_dir(args.output_root, args.tp_size, args.pp_size)
     state: dict[str, Any] = {
         "status": "running",
@@ -1169,7 +1740,6 @@ def run_tuner(args: argparse.Namespace) -> Path | None:
         "model": model,
         "hardware": dry_plan,
         "baseline_partition": baseline,
-        "validations": [],
     }
     write_json(run_dir / "result.json", state)
     print(f"[run] artifacts: {run_dir}", flush=True)
@@ -1184,37 +1754,51 @@ def run_tuner(args: argparse.Namespace) -> Path | None:
 
     baseline_dir = run_dir / "baseline"
     server, base_url, baseline_command = start_server(
-        args, executable, selected, baseline, baseline_dir
+        args,
+        executable,
+        selected,
+        baseline,
+        baseline_dir,
+        enable_comm_benchmark=True,
+        enable_ppm=True,
     )
-    raw_traces: list[Path] = []
+    ppm_snapshot: dict[str, Any] | None = None
     load: ManagedProcess | None = None
     try:
-        load = start_profile_load(args, base_url, baseline_dir, concurrency)
+        # With abundant memory (e.g. small models) the resolved active cap
+        # can exceed the offered concurrency: the queue stays empty and
+        # the work-conservation filter discards every PPM sample.
+        # Over-offer so the baseline is genuinely saturated during capture.
+        profile_concurrency = concurrency
+        baseline_cap = parse_runtime_capacity(baseline_dir / "server.log").get(
+            "max_running_requests"
+        )
+        if baseline_cap is None:
+            print(
+                "[warn] max_running_requests not found in the baseline log; "
+                "profile over-offer skipped and the PPM saturation fallback "
+                "disabled (work-conservation relies on num_queued only)",
+                flush=True,
+            )
+        else:
+            profile_concurrency = max(concurrency, min(2 * baseline_cap, 512))
+            if profile_concurrency < baseline_cap:
+                raise TuningError(
+                    f"Baseline max_running_requests={baseline_cap} exceeds the "
+                    f"client over-offer ceiling (512); pass a higher "
+                    f"--concurrency so the profile load can saturate the "
+                    f"server, or the work-conservation filter will discard "
+                    f"every PPM sample."
+                )
+            if profile_concurrency != concurrency:
+                print(
+                    f"[load] profile concurrency raised to "
+                    f"{profile_concurrency} (baseline cap {baseline_cap})",
+                    flush=True,
+                )
+        load = start_profile_load(args, base_url, baseline_dir, profile_concurrency)
         wait_for_load(load, args.profile_load_timeout_s, args.profile_settle_s)
-        trace_dir = baseline_dir / "traces"
-        trace_dir.mkdir(parents=True, exist_ok=True)
-        profile_id = f"adaptive_pp_{int(time.time())}"
-        response = http_request(
-            f"{base_url}/start_profile",
-            method="POST",
-            payload={
-                "output_dir": str(trace_dir.resolve()),
-                "profile_id": profile_id,
-                "num_steps": args.profile_steps,
-                "activities": ["CPU", "GPU"],
-                "with_stack": False,
-                "record_shapes": False,
-            },
-            timeout_s=30,
-        )
-        print(f"[profile] start response: {response}", flush=True)
-        raw_traces = wait_for_traces(
-            trace_dir,
-            profile_id,
-            args.pp_size * args.tp_size,
-            args.profile_timeout_s,
-        )
-        print(f"[ok] captured {len(raw_traces)} rank traces", flush=True)
+        ppm_snapshot = collect_ppm_snapshot(args, baseline_dir)
         load.stop(timeout_s=10)
         load = None
     finally:
@@ -1223,46 +1807,9 @@ def run_tuner(args: argparse.Namespace) -> Path | None:
         server.stop()
 
     state["baseline_command"] = baseline_command
-    state["raw_traces"] = [str(path) for path in raw_traces]
-    baseline_capacity = parse_runtime_capacity(
+    state["baseline_runtime_capacity"] = parse_runtime_capacity(
         baseline_dir / "server.log"
     )
-    state["baseline_runtime_capacity"] = baseline_capacity
-    comparison_active_requests = resolve_comparison_active_requests(
-        args, baseline_capacity
-    )
-    state["load_control"] = {
-        "offered_concurrency": concurrency,
-        "mode": (
-            "variable_capacity"
-            if comparison_active_requests is None
-            else "fixed_active"
-        ),
-        "comparison_active_requests": comparison_active_requests,
-        "source": (
-            "per-partition capacity"
-            if comparison_active_requests is None
-            else (
-                "explicit --fixed-active-requests"
-                if args.fixed_active_requests is not None
-                else "min(offered concurrency, uniform baseline capacity)"
-            )
-        ),
-    }
-    if comparison_active_requests is None:
-        print(
-            "[load] validation uses each partition's native active capacity",
-            flush=True,
-        )
-        validation_args = args
-    else:
-        print(
-            f"[load] validation fixed at {comparison_active_requests} active "
-            f"requests with offered C{concurrency}",
-            flush=True,
-        )
-        validation_args = argparse.Namespace(**vars(args))
-        validation_args.fixed_active_requests = comparison_active_requests
     max_layers, memory_details = parse_memory_limits(
         baseline_dir / "server.log", baseline, args.memory_reserve_gib
     )
@@ -1272,87 +1819,48 @@ def run_tuner(args: argparse.Namespace) -> Path | None:
     }
     write_json(run_dir / "result.json", state)
 
-    analysis = analyze_traces(
-        raw_traces,
-        model.num_layers,
-        baseline,
-        max_layers,
-        args.candidate_count,
-        baseline_dir,
+    assert ppm_snapshot is not None
+    baseline_log_text = (baseline_dir / "server.log").read_text(errors="replace")
+    analysis = analyze_ppm(
+        args, ppm_snapshot, baseline, max_layers, baseline_dir,
+        baseline_log_text,
     )
     state["analysis"] = analysis
-    slim_warning = try_slim_trace(raw_traces, baseline_dir / "traces" / "lean.json.gz")
-    if slim_warning:
-        state["slim_trace_warning"] = slim_warning
     write_json(run_dir / "result.json", state)
 
-    partitions = candidate_partitions(baseline, analysis)
-    validations: list[ValidationResult] = []
-    if not args.skip_validation:
-        for partition in partitions:
-            phase_name = (
-                "validation_baseline"
-                if partition == baseline
-                else "candidate_p" + "-".join(map(str, partition))
-            )
-            phase_dir = run_dir / phase_name
-            candidate_server: ManagedProcess | None = None
-            try:
-                candidate_server, candidate_url, _ = start_server(
-                    validation_args, executable, selected, partition, phase_dir
-                )
-                result = run_validation(
-                    validation_args,
-                    candidate_url,
-                    partition,
-                    phase_dir,
-                    concurrency,
-                    candidate_server.log_path,
-                )
-            except TuningError as exc:
-                result = ValidationResult(
-                    tuple(partition),
-                    "startup_failed",
-                    None,
-                    [],
-                    str(phase_dir / "server.log"),
-                    [],
-                    str(exc),
-                )
-            finally:
-                if candidate_server is not None:
-                    candidate_server.stop()
-            validations.append(result)
-            state["validations"] = [asdict(item) for item in validations]
-            write_json(run_dir / "result.json", state)
-            metric = (
-                f"{result.throughput_tok_s:.2f} tok/s"
-                if result.throughput_tok_s is not None
-                else result.status
-            )
-            if result.runtime_capacity:
-                metric += (
-                    ", active cap "
-                    f"{result.runtime_capacity.get('max_running_requests', 'unknown')}"
-                )
-            print(f"[candidate] {partition}: {metric}", flush=True)
-
-        best, reason = choose_best(
-            validations, baseline, args.min_improvement_pct
-        )
-    else:
-        best = tuple(analysis["recommended"]["partition"])
-        reason = "profiler prediction; candidate validation was skipped"
+    best = tuple(analysis["recommended"]["partition"])
+    reason = "ppm prediction"
 
     state.update(
         status="complete",
         completed_at=datetime.now(timezone.utc).isoformat(),
-        validations=[asdict(item) for item in validations],
         best_partition=best,
         selection_reason=reason,
     )
-    write_best_artifacts(args, run_dir, executable, selected, best, reason)
+    best_ratio: float | None = None
+    for item in analysis.get("candidates", []):
+        if tuple(item["partition"]) == tuple(best):
+            best_ratio = item.get("mamba_ratio")
+            break
+    if tuple(best) == tuple(baseline):
+        best_ratio = (
+            analysis.get("optimization", {}).get("current") or {}
+        ).get("mamba_ratio")
+    write_best_artifacts(
+        args, run_dir, executable, selected, best, reason, mamba_ratio=best_ratio
+    )
     write_json(run_dir / "result.json", state)
+    if args.compare_tp:
+        try:
+            state["tp_comparison"] = run_tp_comparison(
+                args, run_dir, executable, selected, best,
+                baseline_partition=baseline,
+                best_ratio=best_ratio,
+            )
+        except TuningError as exc:
+            print(f"[warn] TP comparison failed: {exc}", flush=True)
+            state["tp_comparison_error"] = str(exc)
+        write_json(run_dir / "result.json", state)
     print(f"[done] best partition: {','.join(map(str, best))} ({reason})", flush=True)
     print(f"[done] launch script: {run_dir / 'launch_best.sh'}", flush=True)
     return run_dir
@@ -1375,52 +1883,169 @@ def build_parser() -> argparse.ArgumentParser:
         "--concurrency",
         type=int,
         default=32,
-        help="offered profiling and validation concurrency (default: 32)",
+        help="offered profiling concurrency (default: 32)",
     )
     parser.add_argument(
         "--fixed-active-requests",
         type=int,
         help=(
-            "override the automatically derived common active request count; "
-            "the run fails if a candidate cannot provide this active batch size"
-        ),
-    )
-    parser.add_argument(
-        "--allow-variable-active-requests",
-        action="store_true",
-        help=(
-            "compare native service throughput, allowing each partition to use "
-            "its own memory-limited active request capacity"
+            "pin the baseline server's active request count via "
+            "--max-running-requests; the run fails if the server cannot "
+            "provide this active batch size"
         ),
     )
     parser.add_argument("--prompt-tokens", type=int, default=256)
-    parser.add_argument("--profile-steps", type=int, default=50)
-    parser.add_argument("--profile-output-tokens", type=int, default=4096)
+    parser.add_argument(
+        "--prompt-seed",
+        type=int,
+        default=1234,
+        help=(
+            "seed of the synthetic prompt set shared by every benchmark call "
+            "in one tuner run (default: 1234); keeps accept_len comparable "
+            "across candidates and runs"
+        ),
+    )
+    parser.add_argument(
+        "--profile-output-tokens",
+        type=int,
+        help=(
+            "decode length per profile-load request; default: 8192, must "
+            "outlast the PPM collection window"
+        ),
+    )
     parser.add_argument("--profile-settle-s", type=float, default=5.0)
     parser.add_argument("--profile-load-timeout-s", type=float, default=180.0)
-    parser.add_argument("--profile-timeout-s", type=float, default=300.0)
     parser.add_argument("--post-profile-cooldown-s", type=float, default=3.0)
     parser.add_argument("--candidate-count", type=int, default=3)
-    parser.add_argument("--validation-output-tokens", type=int, default=256)
-    parser.add_argument("--validation-requests", type=int)
-    parser.add_argument("--validation-repeats", type=int, default=2)
-    parser.add_argument("--validation-timeout-s", type=float, default=1800.0)
+    parser.add_argument(
+        "--validation-output-tokens",
+        type=int,
+        default=256,
+        help=(
+            "per-request decode length assumed by the capacity model's KV "
+            "feasibility check and used by --compare-tp measurements "
+            "(default: 256)"
+        ),
+    )
+    parser.add_argument(
+        "--validation-repeats",
+        type=int,
+        default=2,
+        help="measurement repeats per --compare-tp point (default: 2)",
+    )
+    parser.add_argument(
+        "--validation-timeout-s",
+        type=float,
+        default=1800.0,
+        help="per-benchmark timeout for --compare-tp measurements",
+    )
     parser.add_argument("--request-timeout-s", type=float, default=1800.0)
-    parser.add_argument("--min-improvement-pct", type=float, default=1.0)
     parser.add_argument("--memory-reserve-gib", type=float, default=2.0)
     parser.add_argument("--server-startup-timeout-s", type=float, default=600.0)
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, help="fixed tuning port; default: choose a free port")
     parser.add_argument("--final-port", type=int, default=30000)
     parser.add_argument("--visible-devices", help="override CUDA_VISIBLE_DEVICES")
-    parser.add_argument("--current-partition", help="partition used by --analyze-traces")
+    parser.add_argument(
+        "--current-partition",
+        help=(
+            "explicit baseline partition (default: the uniform split used by "
+            "a plain SGLang launch)"
+        ),
+    )
     parser.add_argument("--output-root", type=Path, default=DEFAULT_OUTPUT_ROOT)
     parser.add_argument(
-        "--analyze-traces",
-        type=Path,
-        help="offline analysis of an existing trace directory",
+        "--ppm-collect-s",
+        type=float,
+        default=30.0,
+        help="PPM collection window in seconds (default: 30)",
     )
-    parser.add_argument("--skip-validation", action="store_true")
+    parser.add_argument(
+        "--ppm-max-messages",
+        type=int,
+        help="optional PPM message count that ends collection early",
+    )
+    parser.add_argument(
+        "--ppm-saturation-bs",
+        type=int,
+        help=(
+            "saturation threshold for the PPM work-conservation filter, in "
+            "GLOBAL running requests (compared against the publisher's "
+            "running_bs; per-slot bs only for legacy producers); default: "
+            "--fixed-active-requests or the server's resolved "
+            "max_running_requests"
+        ),
+    )
+    parser.add_argument(
+        "--t-comm-ms",
+        type=float,
+        help=(
+            "fixed per-boundary PP communication cost in ms; default: parsed "
+            "from the baseline's startup comm micro-benchmark "
+            "(SGLANG_PP_COMM_BENCHMARK), falling back to 0 with a warning"
+        ),
+    )
+    parser.add_argument(
+        "--comm-benchmark-tokens",
+        default="32,64,128,256,512",
+        help=(
+            "token sweep points for the baseline startup comm benchmark; "
+            "should cover bs x block_size over the working range (default: "
+            "32,64,128,256,512 for bs 4-64 at block 8)"
+        ),
+    )
+    parser.add_argument(
+        "--ratio-grid",
+        default="0.25,0.5,1,2,4,8",
+        help=(
+            "log grid of --mamba-full-memory-ratio values swept per "
+            "candidate partition (default: 0.25,0.5,1,2,4,8); the feasible "
+            "point with the best unified throughput wins"
+        ),
+    )
+    parser.add_argument(
+        "--k-best",
+        type=int,
+        default=20,
+        help="candidates kept per state in the k-best partition DP (default: 20)",
+    )
+    parser.add_argument(
+        "--allow-draft-relocation",
+        action="store_true",
+        help=(
+            "analysis only: let the optimizer enumerate draft block placement "
+            "across ranks (default: draft locked to the last rank)"
+        ),
+    )
+    parser.add_argument(
+        "--reanalyze",
+        type=Path,
+        help=(
+            "offline re-analysis of an existing ppm-mode run directory: reads "
+            "baseline/ppm_snapshot.json + baseline/server.log (+ measured "
+            "columns from legacy runs that recorded validations), refits "
+            "stage/capacity models, and re-renders the report and sweep plot "
+            "into <run_dir>/reanalysis/ without starting a server"
+        ),
+    )
+    parser.add_argument(
+        "--compare-tp",
+        action="store_true",
+        help=(
+            "after PP tuning, also start a TP baseline (tp_size = pp_size x "
+            "tp_size, pp_size = 1) and compare throughput at equal "
+            "concurrency (min of both caps) and at each side's native capacity"
+        ),
+    )
+    parser.add_argument(
+        "--compare-tp-only",
+        type=Path,
+        help=(
+            "skip PP baseline/profile/analysis and only run the TP "
+            "comparison for an existing run directory, reading the best "
+            "partition / ratio from its result.json"
+        ),
+    )
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument(
         "--offline",
