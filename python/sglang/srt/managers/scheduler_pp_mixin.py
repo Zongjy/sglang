@@ -102,7 +102,10 @@ class SchedulerPPMixin:
                     recv_reqs = self.request_receiver.recv_requests()
                     self.process_input_requests(recv_reqs)
                 if not self.pp_group.is_last_rank:
-                    self._pp_commit_comm_work(self.send_req_work)
+                    with torch.profiler.record_function(
+                        "scheduler.pp.wait_send_requests"
+                    ):
+                        self._pp_commit_comm_work(self.send_req_work)
                     with torch.profiler.record_function("send_reqs_to_next_stage"):
                         self.send_req_work = self._pp_send_pyobj_to_next_stage(
                             recv_reqs,
@@ -119,18 +122,25 @@ class SchedulerPPMixin:
                 self.cur_batch_for_debug = cur_batch
                 if cur_batch:
                     server_is_idle = False
-                    pp_proxy_tensors = self._pp_recv_proxy_tensors()
+                    with torch.profiler.record_function(
+                        "scheduler.pp.recv_proxy_tensors"
+                    ):
+                        pp_proxy_tensors = self._pp_recv_proxy_tensors()
                 next_pp_outputs = None
                 next_batch_result = None
                 d2h_event = None
                 if get_parallel().pp_async_batch_depth > 0:
-                    next_pp_outputs, next_batch_result, d2h_event = (
-                        self._pp_commit_send_output_work_and_preprocess_output_tensors(
-                            next_first_rank_mb_id,
-                            next_mb_id,
+                    with torch.profiler.record_function(
+                        "scheduler.pp.exchange_previous_output"
+                    ):
+                        next_pp_outputs, next_batch_result, d2h_event = (
+                            self._pp_commit_send_output_work_and_preprocess_output_tensors(
+                                next_first_rank_mb_id,
+                                next_mb_id,
+                            )
                         )
-                    )
-                self._pp_commit_comm_work(self.send_proxy_work)
+                with torch.profiler.record_function("scheduler.pp.wait_send_proxy"):
+                    self._pp_commit_comm_work(self.send_proxy_work)
                 if cur_batch:
                     result, self.launch_event = self._pp_launch_batch(
                         mb_id,
@@ -140,14 +150,20 @@ class SchedulerPPMixin:
                         self.last_rank_comm_queue,
                     )
                 if get_parallel().pp_async_batch_depth == 0:
-                    next_pp_outputs, next_batch_result, d2h_event = (
-                        self._pp_commit_send_output_work_and_preprocess_output_tensors(
-                            next_first_rank_mb_id,
-                            next_mb_id,
+                    with torch.profiler.record_function(
+                        "scheduler.pp.exchange_previous_output"
+                    ):
+                        next_pp_outputs, next_batch_result, d2h_event = (
+                            self._pp_commit_send_output_work_and_preprocess_output_tensors(
+                                next_first_rank_mb_id,
+                                next_mb_id,
+                            )
                         )
-                    )
                 if self.mbs[next_mb_id] is not None:
-                    d2h_event.synchronize()
+                    with torch.profiler.record_function(
+                        "scheduler.pp.wait_result_d2h"
+                    ):
+                        d2h_event.synchronize()
                     with torch.profiler.record_function("process_batch_result"):
                         self._pp_process_batch_result(
                             self.mbs[next_mb_id],
