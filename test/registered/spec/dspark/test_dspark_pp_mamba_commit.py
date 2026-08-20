@@ -32,13 +32,20 @@ def _batch():
     )
 
 
-def _worker(*, pp_is_last_rank=False, need_commit=True):
+def _worker(*, pp_is_last_rank=False, need_commit=True, request_indexed=True):
     worker = object.__new__(DSparkWorkerV2)
     worker._pp_enabled = True
     worker._pp_is_last_rank = pp_is_last_rank
     worker._need_mamba_verify_commit = need_commit
     pool = _ReqToTokenPool()
-    worker.model_runner = SimpleNamespace(req_to_token_pool=pool)
+    worker.model_runner = SimpleNamespace(
+        req_to_token_pool=pool,
+        attn_backend=SimpleNamespace(
+            linear_attn_backend=SimpleNamespace(
+                req_indexed_verify_scratch=request_indexed
+            )
+        ),
+    )
     worker._commit_target_mamba_states_after_verify = Mock()
     return worker, pool
 
@@ -70,6 +77,17 @@ class TestDSparkPPMambaCommit(CustomTestCase):
             kwargs["conv_source_indices_tensor"],
             torch.tensor([3, 7], dtype=torch.int64),
         )
+
+    def test_positional_scratch_does_not_pass_request_indices(self):
+        worker, _ = _worker(request_indexed=False)
+
+        worker.commit_pp_mamba_states_after_verify(
+            batch=_batch(),
+            commit_lens=torch.tensor([3, 5], dtype=torch.int64),
+        )
+
+        kwargs = worker._commit_target_mamba_states_after_verify.call_args.kwargs
+        self.assertIsNone(kwargs["conv_source_indices_tensor"])
 
     def test_last_rank_skips_deferred_commit(self):
         worker, pool = _worker(pp_is_last_rank=True)

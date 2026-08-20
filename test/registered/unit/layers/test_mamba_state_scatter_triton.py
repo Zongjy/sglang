@@ -227,6 +227,30 @@ class TestMambaStateScatterCorrectness(unittest.TestCase):
         torch.testing.assert_close(ssm_fused, ssm_ref)
         torch.testing.assert_close(conv_fused, conv_ref)
 
+    @unittest.skipUnless(torch.cuda.is_available(), "CUDA is required for this test.")
+    def test_fused_scatter_reads_explicit_request_rows(self):
+        if fused_mamba_state_scatter_with_mask is None:
+            self.skipTest(
+                f"fused_mamba_state_scatter_with_mask import failed: "
+                f"{_FUSED_IMPORT_ERROR}"
+            )
+
+        src = torch.zeros((2, 12, 3, 64), device="cuda", dtype=torch.bfloat16)
+        src[:, 3, 2] = 13
+        src[:, 7, 1] = 17
+        dst = torch.zeros((2, 6, 64), device="cuda", dtype=torch.bfloat16)
+
+        fused_mamba_state_scatter_with_mask(
+            dst,
+            src,
+            dst_indices_raw=torch.tensor([1, 4], device="cuda", dtype=torch.int32),
+            step_indices_raw=torch.tensor([2, 1], device="cuda", dtype=torch.int64),
+            src_indices_raw=torch.tensor([3, 7], device="cuda", dtype=torch.int64),
+        )
+
+        torch.testing.assert_close(dst[:, 1], torch.full_like(dst[:, 1], 13))
+        torch.testing.assert_close(dst[:, 4], torch.full_like(dst[:, 4], 17))
+
 
 def _make_envelope_views(device="cpu"):
     """Envelope-strided conv/temporal views, exactly as UnifiedMambaPool /

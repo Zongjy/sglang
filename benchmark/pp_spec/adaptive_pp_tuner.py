@@ -47,6 +47,7 @@ REPO_ROOT = SCRIPT_DIR.parents[1]
 DEFAULT_MODEL = "Qwen/Qwen3.6-27B"
 DEFAULT_DRAFT_MODEL = "z-lab/Qwen3.6-27B-DFlash"
 DEFAULT_OUTPUT_ROOT = SCRIPT_DIR / "tuning_runs"
+DEFAULT_DATASET = SCRIPT_DIR / "data" / "sharegpt.json"
 MEMORY_VALUE = re.compile(r"avail mem=([0-9]+(?:\.[0-9]+)?) GB")
 TARGET_LOAD = re.compile(
     r"Load weight end\..*type=([^,]+),.*mem usage=([0-9]+(?:\.[0-9]+)?) GB"
@@ -658,7 +659,8 @@ def benchmark_command(
         base_url,
         "--label",
         label,
-        "--synthetic",
+        "--dataset",
+        str(args.dataset),
         "--tokenizer",
         args.model_path,
         "--load-points",
@@ -667,8 +669,6 @@ def benchmark_command(
         str(max_tokens),
         "--prompt-max-tokens",
         str(args.prompt_tokens),
-        "--prompt-seed",
-        str(args.prompt_seed),
         "--request-timeout-s",
         str(args.request_timeout_s),
         "--cooldown-s",
@@ -1896,14 +1896,10 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--prompt-tokens", type=int, default=256)
     parser.add_argument(
-        "--prompt-seed",
-        type=int,
-        default=1234,
-        help=(
-            "seed of the synthetic prompt set shared by every benchmark call "
-            "in one tuner run (default: 1234); keeps accept_len comparable "
-            "across candidates and runs"
-        ),
+        "--dataset",
+        type=Path,
+        default=DEFAULT_DATASET,
+        help="ShareGPT JSON dataset used by profiling and validation",
     )
     parser.add_argument(
         "--profile-output-tokens",

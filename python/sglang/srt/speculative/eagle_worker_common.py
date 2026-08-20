@@ -27,6 +27,7 @@ from sglang.srt.speculative.spec_utils import (
     GrammarTree,
     build_grammar_vocab_mask,
     commit_mamba_states_after_verify,
+    get_mamba_verify_scratch_source_indices,
     move_accept_tokens_to_target_kvcache,
     record_stream_each,
     record_stream_for_v2_verify,
@@ -621,18 +622,9 @@ def run_eagle_verify(
         accept_lens,
         accept_index,
         num_draft_tokens,
-        scratch_source_indices_tensor=(
-            batch.req_pool_indices
-            if getattr(
-                getattr(
-                    target_worker.model_runner.attn_backend,
-                    "linear_attn_backend",
-                    None,
-                ),
-                "req_indexed_verify_scratch",
-                False,
-            )
-            else None
+        scratch_source_indices_tensor=get_mamba_verify_scratch_source_indices(
+            target_worker.model_runner.attn_backend,
+            batch.req_pool_indices,
         ),
     )
 

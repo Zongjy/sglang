@@ -75,9 +75,6 @@ class FlashInferKDAKernel(LinearAttnKernelBase):
         # keyed by tensor identity. Layer params are persistent weights so id() is
         # stable; this removes the per-call reshape/float/contiguous work.
         self._gate_cache: dict = {}
-        # Cache the constant per-(row-map, batch, T) verify scatter indices
-        # (ssm_state_indices), which never change across verify calls.
-        self._verify_idx_cache: dict = {}
         # State pools whose stride layout has been validated against the
         # recurrent_kda contract (per-layer views are pool-stable, so id() is
         # a stable key — same lifetime argument as _gate_cache).
@@ -273,35 +270,17 @@ class FlashInferKDAKernel(LinearAttnKernelBase):
             )
 
         base_rows = intermediate_state_indices[:batch_size]
-        cache_key = (
-            id(intermediate_state_indices),
-            batch_size,
-            draft_token_num,
-            scratch_steps,
-        )
-        ssm_state_indices = self._verify_idx_cache.get(cache_key)
-        if ssm_state_indices is None:
-            # The fast seed copy below assumes row n in scratch belongs to request n.
-            expected = torch.arange(
-                batch_size, device=base_rows.device, dtype=base_rows.dtype
-            )
-            if not torch.equal(base_rows, expected):
-                raise RuntimeError(
-                    "FlashInfer KDA verify requires an identity intermediate row-map "
-                    "(verify_intermediate_state_indices must be arange)."
-                )
-            step = torch.arange(draft_token_num, device=q.device, dtype=torch.int32)
-            ssm_state_indices = (
-                base_rows.to(torch.int32)[:, None] * scratch_steps + step[None, :]
-            ).contiguous()  # [N, T]
-            self._verify_idx_cache[cache_key] = ssm_state_indices
+        step = torch.arange(draft_token_num, device=q.device, dtype=torch.int32)
+        ssm_state_indices = (
+            base_rows.to(torch.int32)[:, None] * scratch_steps + step[None, :]
+        ).contiguous()  # [N, T]
 
-        # Seed step 0 from committed state, then recurrent_kda overwrites it with
-        # token-0 post-state. Padded graph rows clamp to slot 0; their output is ignored.
+        # Seed each request-owned row from committed state; recurrent_kda then
+        # overwrites step 0 with the token-0 post-state.
         base_state = ssm_states.index_select(
             0, cache_indices[:batch_size].clamp(min=0).to(torch.int64)
         )
-        scratch[:batch_size, 0].copy_(base_state)
+        scratch[:, 0].index_copy_(0, base_rows.to(torch.int64), base_state)
 
         # Same storage as scratch, flattened over the allocated step stride.
         state_pool = scratch.view(

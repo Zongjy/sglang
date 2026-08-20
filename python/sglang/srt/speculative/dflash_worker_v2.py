@@ -60,6 +60,7 @@ from sglang.srt.speculative.spec_utils import (
     GrammarTree,
     assign_req_to_token_pool_func,
     build_grammar_vocab_mask,
+    get_mamba_verify_scratch_source_indices,
 )
 from sglang.srt.utils import get_available_gpu_memory, is_cuda, is_hip, is_npu
 
@@ -1524,6 +1525,11 @@ class DFlashWorkerV2(BaseSpecWorker):
             seq_lens_post_verify=seq_lens_pre_verify + commit_lens,
             commit_lens=commit_lens,
             state_indices_tensor=state_indices_tensor,
+            conv_source_indices_tensor=get_mamba_verify_scratch_source_indices(
+                self.model_runner.attn_backend,
+                batch.req_pool_indices,
+                bs,
+            ),
         )
 
     def _ensure_accept_bonus_buffers(self, bs: int) -> None:
@@ -2271,6 +2277,11 @@ class DFlashWorkerV2(BaseSpecWorker):
                 seq_lens_pre_verify=seq_lens_pre_verify,
                 seq_lens_post_verify=new_seq_lens,
                 commit_lens=commit_lens,
+                conv_source_indices_tensor=get_mamba_verify_scratch_source_indices(
+                    self.model_runner.attn_backend,
+                    batch.req_pool_indices,
+                    commit_lens.shape[0],
+                ),
             )
 
         # --- 3) Materialize committed verify-input tokens into draft KV cache.

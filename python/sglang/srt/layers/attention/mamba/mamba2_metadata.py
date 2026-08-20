@@ -29,6 +29,9 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 class ForwardMetadata:
     query_start_loc: torch.Tensor
     mamba_cache_indices: torch.Tensor
+    # Request-owned speculative scratch rows. CUDA graph replay refreshes a
+    # static buffer and maps padded rows to the pool's extra discard row.
+    verify_scratch_indices: Optional[torch.Tensor] = None
     mamba_cache_indices_gdn: Optional[torch.Tensor] = None
     # Mamba track DESTINATION slots (PHYSICAL, length == batch). Like
     # mamba_cache_indices: a backend-owned static buffer under cuda-graph (translated

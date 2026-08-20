@@ -835,6 +835,20 @@ def _verify_commit_step_indices(
     return last_correct_step_indices, mamba_steps_to_track
 
 
+def get_mamba_verify_scratch_source_indices(
+    attn_backend,
+    req_pool_indices: torch.Tensor,
+    request_count: Optional[int] = None,
+) -> Optional[torch.Tensor]:
+    """Return the durable scratch rows used by the linear-attention verify."""
+    linear_attn_backend = getattr(attn_backend, "linear_attn_backend", attn_backend)
+    if not getattr(linear_attn_backend, "req_indexed_verify_scratch", False):
+        return None
+    if request_count is None:
+        return req_pool_indices
+    return req_pool_indices[:request_count]
+
+
 def commit_mamba_states_after_verify(
     target_worker: TpModelWorker,
     batch: ScheduleBatch,
@@ -858,6 +872,9 @@ def commit_mamba_states_after_verify(
     model_runner = target_worker.model_runner
     if mambaish_config(model_runner.model_config) is None:
         return
+    bs = accept_lens.shape[0]
+    if scratch_source_indices_tensor is not None:
+        scratch_source_indices_tensor = scratch_source_indices_tensor[:bs]
 
     # ReplaySSM spec-verify path (Part B of #28511): the accepted drafts already
     # live in the per-slot circular ring (written during verify). Instead of
@@ -899,6 +916,7 @@ def commit_mamba_states_after_verify(
             last_correct_step_indices=last_correct_step_indices,
             mamba_track_indices=batch.mamba_track_indices,
             mamba_steps_to_track=mamba_steps_to_track,
+            conv_source_indices=scratch_source_indices_tensor,
             null_block_id=-1,
         )
         return
@@ -945,6 +963,7 @@ def commit_mamba_states_after_verify(
             spec_state.intermediate_conv_window[0],
             state_batch_indices,
             last_correct_step_indices,
+            src_indices_raw=scratch_source_indices_tensor,
         )
         # NOTE: radix mamba prefix-caching (mamba_track / extra_buffer) would need
         # a device-side force-flush so `temporal` reflects the ring before a
@@ -1011,13 +1030,13 @@ def commit_mamba_states_after_verify(
             last_correct_step_indices=last_correct_step_indices,
             mamba_track_indices=mamba_track_indices,
             mamba_steps_to_track=mamba_steps_to_track,
+            conv_source_indices=scratch_source_indices_tensor,
             null_block_id=-1,  # SGLang: valid slots >= 0, padding == -1
         )
         return
 
     attn_backend = model_runner.attn_backend
 
-    bs = accept_lens.shape[0]
     # `accept_lens` already includes the bonus token (drafts + 1 per req).
     if not batch.forward_mode.is_idle() and accept_lens.numel() > 0:
         last_correct_step_indices, mamba_steps_to_track = _verify_commit_step_indices(
@@ -1028,8 +1047,6 @@ def commit_mamba_states_after_verify(
         )
 
         if hasattr(attn_backend, "update_mamba_state_after_mtp_verify"):
-            if scratch_source_indices_tensor is not None:
-                scratch_source_indices_tensor = scratch_source_indices_tensor[:bs]
             commit_kwargs = dict(
                 last_correct_step_indices=last_correct_step_indices,
                 mamba_track_indices=batch.mamba_track_indices,

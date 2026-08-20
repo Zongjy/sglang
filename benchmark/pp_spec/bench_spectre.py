@@ -204,30 +204,6 @@ def load_sharegpt_prompts(
     return prompts
 
 
-def build_synthetic_prompts(
-    limit: int, max_prompt_tokens: int, tokenizer, seed: int = 1
-) -> list[str]:
-    """Build deterministic, unique prompts without an external dataset.
-
-    The prompt set is fully determined by ``seed``: the same seed always
-    yields the same token sequence, a different seed a different set, so
-    benchmark comparisons can pin the exact prompt substrate.
-    """
-    rng = random.Random(seed)
-    seed_text = (
-        f"Analyze the system behavior carefully (scenario {seed}) and continue "
-        "the technical report with concrete observations about latency, "
-        "throughput, and reliability. "
-    )
-    prompts = []
-    for index in range(limit):
-        text = f"Synthetic request {index}. " + seed_text * (max_prompt_tokens // 12 + 2)
-        ids = tokenizer.encode(text)[:max_prompt_tokens]
-        prompts.append(tokenizer.decode(ids))
-    rng.shuffle(prompts)
-    return prompts
-
-
 def _optional_nonnegative_int(value, field_name: str) -> int | None:
     if value is None:
         return None
@@ -508,15 +484,9 @@ async def main_async(config: argparse.Namespace) -> None:
         config.tokenizer, trust_remote_code=True
     )
     total_requests = max(p.num_requests for p in config.points)
-    if config.synthetic:
-        prompts = build_synthetic_prompts(
-            total_requests, config.prompt_max_tokens, tokenizer,
-            seed=config.prompt_seed,
-        )
-    else:
-        prompts = load_sharegpt_prompts(
-            Path(config.dataset), total_requests, config.prompt_max_tokens, tokenizer
-        )
+    prompts = load_sharegpt_prompts(
+        Path(config.dataset), total_requests, config.prompt_max_tokens, tokenizer
+    )
 
     out_dir = Path(config.output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -547,11 +517,10 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--url", required=True, help="sglang server base url")
     parser.add_argument("--label", required=True, help="run label, e.g. pp2_dflash")
-    parser.add_argument("--dataset", default=str(DEFAULT_DATASET))
     parser.add_argument(
-        "--synthetic",
-        action="store_true",
-        help="use deterministic generated prompts instead of a dataset",
+        "--dataset",
+        default=str(DEFAULT_DATASET),
+        help="ShareGPT JSON dataset path",
     )
     parser.add_argument(
         "--tokenizer", default="Qwen/Qwen3.6-27B"
@@ -561,15 +530,6 @@ def main() -> None:
     parser.add_argument("--prompt-max-tokens", type=int, default=700)
     parser.add_argument("--temperature", type=float, default=0.0)
     parser.add_argument("--seed", type=int, default=1)
-    parser.add_argument(
-        "--prompt-seed",
-        type=int,
-        default=1,
-        help=(
-            "seed of the synthetic prompt set; the same value reproduces the "
-            "exact same prompts (default: 1)"
-        ),
-    )
     parser.add_argument("--request-timeout-s", type=float, default=1800.0)
     parser.add_argument("--cooldown-s", type=float, default=10.0)
     parser.add_argument("--output-dir", default=str(REPO_ROOT / "results"))

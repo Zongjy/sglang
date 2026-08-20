@@ -69,6 +69,33 @@ class LinearAttnBackends(msgspec.Struct, frozen=True):
     verify: LinearAttnKernelBackend
 
 
+_PP_DEFERRED_MAMBA_COMMIT_ALGORITHMS = frozenset(
+    {
+        "DFLASH",
+        "DSPARK",
+        "EAGLE",
+        "EAGLE3",
+        "FROZEN_KV_MTP",
+        "STANDALONE",
+    }
+)
+
+
+def should_use_request_indexed_verify_scratch(server_args: ServerArgs) -> bool:
+    """Whether target-verify scratch must survive a deferred PP commit.
+
+    PP lanes own disjoint request slots, and a lane is not relaunched until its
+    previous commit is ordered on the schedule stream. The persistent state is
+    therefore protected, but positional scratch rows are shared by concurrently
+    executing lanes. Keying scratch by request slot removes that cross-lane race.
+    """
+    algorithm = (server_args.speculative_algorithm or "").upper()
+    return (
+        server_args.pp_size > 1
+        and algorithm in _PP_DEFERRED_MAMBA_COMMIT_ALGORITHMS
+    )
+
+
 def resolve_linear_attn_backends(
     prefill_default: Optional[str] = None,
 ) -> LinearAttnBackends:

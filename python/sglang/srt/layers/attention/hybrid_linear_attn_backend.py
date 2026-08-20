@@ -64,6 +64,7 @@ class MambaAttnBackendBase(AttentionBackend):
         )
         self.forward_metadata: ForwardMetadata = None
         self.state_indices_list = []
+        self.verify_scratch_indices_list = []
         # Static (max_bs,) track-dest buffer captured by pointer, refreshed in-place
         # each replay; the captured track-save reads this, not the InputBuffer slot.
         self.mamba_track_indices_buf = None
@@ -116,6 +117,15 @@ class MambaAttnBackendBase(AttentionBackend):
         if _real_bs is not None and _real_bs < mamba_cache_indices.shape[0]:
             mamba_cache_indices = mamba_cache_indices.clone()
             mamba_cache_indices[_real_bs:] = -1
+        verify_scratch_indices = None
+        if (
+            getattr(self, "req_indexed_verify_scratch", False)
+            and forward_batch.forward_mode.is_target_verify()
+        ):
+            verify_scratch_indices = forward_batch.req_pool_indices
+            if _real_bs is not None and _real_bs < verify_scratch_indices.shape[0]:
+                verify_scratch_indices = verify_scratch_indices.clone()
+                verify_scratch_indices[_real_bs:] = self.req_to_token_pool.size
 
         replayssm_write_pos = None
         replayssm_force_flush = None
@@ -233,6 +243,7 @@ class MambaAttnBackendBase(AttentionBackend):
         return ForwardMetadata(
             query_start_loc=query_start_loc,
             mamba_cache_indices=mamba_cache_indices,
+            verify_scratch_indices=verify_scratch_indices,
             # Physical track destinations (None when tracking off); cuda-graph
             # supplies this via the static backend buffer in _replay_metadata.
             mamba_track_indices=getattr(forward_batch, "mamba_track_indices", None),
@@ -432,6 +443,15 @@ class MambaAttnBackendBase(AttentionBackend):
                     (i + 1,), self.pad_slot_id, dtype=torch.int32, device=self.device
                 )
             )
+            if getattr(self, "req_indexed_verify_scratch", False):
+                self.verify_scratch_indices_list.append(
+                    torch.full(
+                        (i + 1,),
+                        self.req_to_token_pool.size,
+                        dtype=torch.int64,
+                        device=self.device,
+                    )
+                )
             if self.replayssm_write_pos_list is not None:
                 self.replayssm_write_pos_list.append(
                     torch.zeros((i + 1,), dtype=torch.int32, device=self.device)
@@ -479,6 +499,15 @@ class MambaAttnBackendBase(AttentionBackend):
                     (i + 1,), self.pad_slot_id, dtype=torch.int32, device=self.device
                 )
             )
+            if getattr(self, "req_indexed_verify_scratch", False):
+                self.verify_scratch_indices_list.append(
+                    torch.full(
+                        (i + 1,),
+                        self.req_to_token_pool.size,
+                        dtype=torch.int64,
+                        device=self.device,
+                    )
+                )
             self.query_start_loc_list.append(
                 torch.empty((i + 2,), dtype=torch.int32, device=self.device)
             )
@@ -515,6 +544,13 @@ class MambaAttnBackendBase(AttentionBackend):
         # before copying (no-op for non-unified pool).
         mamba_indices = self._translate_mamba_indices(mamba_indices)
         self.state_indices_list[bs - 1][: len(mamba_indices)].copy_(mamba_indices)
+        verify_scratch_indices = None
+        if (
+            getattr(self, "req_indexed_verify_scratch", False)
+            and forward_mode.is_target_verify()
+        ):
+            verify_scratch_indices = self.verify_scratch_indices_list[bs - 1]
+            verify_scratch_indices.copy_(req_pool_indices)
 
         # Capture records the pointer to the static per-bs buffers; their zeros are
         # overwritten in-place by _replay_metadata before each replay. None when off.
@@ -534,6 +570,7 @@ class MambaAttnBackendBase(AttentionBackend):
             return ForwardMetadata(
                 query_start_loc=self.query_start_loc_list[bs - 1],
                 mamba_cache_indices=self.state_indices_list[bs - 1],
+                verify_scratch_indices=verify_scratch_indices,
                 retrieve_next_token=self.retrieve_next_token_list[bs - 1],
                 retrieve_next_sibling=self.retrieve_next_sibling_list[bs - 1],
                 retrieve_parent_token=self.retrieve_parent_token_list[bs - 1],
@@ -544,6 +581,7 @@ class MambaAttnBackendBase(AttentionBackend):
             return ForwardMetadata(
                 query_start_loc=self.query_start_loc_list[bs - 1],
                 mamba_cache_indices=self.state_indices_list[bs - 1],
+                verify_scratch_indices=verify_scratch_indices,
                 replayssm_write_pos=replayssm_write_pos,
                 replayssm_force_flush=replayssm_force_flush,
             )
@@ -566,6 +604,15 @@ class MambaAttnBackendBase(AttentionBackend):
                 num_padding = torch.count_nonzero(
                     seq_lens_cpu == self.get_cuda_graph_seq_len_fill_value()
                 )
+        valid_bs = bs - int(num_padding)
+        verify_scratch_indices = None
+        if (
+            getattr(self, "req_indexed_verify_scratch", False)
+            and forward_mode.is_target_verify()
+        ):
+            verify_scratch_indices = self.verify_scratch_indices_list[bs - 1]
+            verify_scratch_indices[:valid_bs].copy_(req_pool_indices[:valid_bs])
+            verify_scratch_indices[valid_bs:].fill_(self.req_to_token_pool.size)
         if self._fused_state_indices_ok and self.replayssm_write_pos_list is None:
             # Single-launch fast path: mapping gather + padding sentinel + store
             # into the static buffer, plus zeroing padded req_pool_indices rows —
@@ -574,7 +621,7 @@ class MambaAttnBackendBase(AttentionBackend):
                 req_pool_indices=req_pool_indices,
                 mamba_index_mapping=self.req_to_token_pool.req_index_to_mamba_index_mapping,
                 out_state_indices=self.state_indices_list[bs - 1],
-                valid_bs=bs - int(num_padding),
+                valid_bs=valid_bs,
                 total_bs=bs,
             )
         else:
@@ -715,6 +762,7 @@ class MambaAttnBackendBase(AttentionBackend):
             return ForwardMetadata(
                 query_start_loc=self.query_start_loc_list[bs - 1],
                 mamba_cache_indices=self.state_indices_list[bs - 1],
+                verify_scratch_indices=verify_scratch_indices,
                 mamba_track_indices=track_buf,
                 retrieve_next_token=self.retrieve_next_token_list[bs - 1],
                 retrieve_next_sibling=self.retrieve_next_sibling_list[bs - 1],
@@ -726,6 +774,7 @@ class MambaAttnBackendBase(AttentionBackend):
             return ForwardMetadata(
                 query_start_loc=self.query_start_loc_list[bs - 1],
                 mamba_cache_indices=self.state_indices_list[bs - 1],
+                verify_scratch_indices=verify_scratch_indices,
                 mamba_track_indices=track_buf,
                 replayssm_write_pos=replayssm_write_pos,
                 replayssm_force_flush=replayssm_force_flush,

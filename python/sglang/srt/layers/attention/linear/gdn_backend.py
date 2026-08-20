@@ -13,6 +13,7 @@ from sglang.srt.layers.attention.linear.kernels.gdn_triton import TritonGDNKerne
 from sglang.srt.layers.attention.linear.utils import (
     LinearAttnKernelBackend,
     build_verify_intermediate_state_indices,
+    should_use_request_indexed_verify_scratch,
 )
 from sglang.srt.layers.radix_linear_attention import RadixLinearAttention
 from sglang.srt.mem_cache.memory_pool import MambaPool
@@ -350,6 +351,9 @@ class GDNAttnBackend(MambaAttnBackendBase):
 
     def __init__(self, model_runner: ModelRunner):
         super().__init__(model_runner)
+        self.req_indexed_verify_scratch = should_use_request_indexed_verify_scratch(
+            model_runner.server_args
+        )
         self.conv_states_shape = (
             model_runner.req_to_token_pool.mamba_pool.mamba_cache.conv[0].shape
         )
@@ -359,8 +363,15 @@ class GDNAttnBackend(MambaAttnBackendBase):
             ), f"{self.conv_states_shape[-1]=} should be less than {FLA_CHUNK_SIZE}"
 
         backends = model_runner.linear_attn_backends
+        verify_backend = backends.verify
+        if self.req_indexed_verify_scratch and verify_backend.is_flashinfer():
+            rank0_log(
+                "PP speculative GDN verify requires request-indexed scratch; "
+                "falling back from FlashInfer to Triton verify."
+            )
+            verify_backend = LinearAttnKernelBackend.TRITON
         self.kernel_dispatcher = GDNKernelDispatcher(
-            backends.decode, backends.prefill, backends.verify
+            backends.decode, backends.prefill, verify_backend
         )
         # Sized past the pool for attn_tp-padded warmup/MLP-sync batches (see helper).
         self.verify_intermediate_state_indices = (
@@ -518,7 +529,12 @@ class GDNAttnBackend(MambaAttnBackendBase):
             intermediate_conv_window_cache = (
                 mamba_cache_params.intermediate_conv_window[0]
             )
-            intermediate_state_indices = self.verify_intermediate_state_indices
+            intermediate_state_indices = (
+                forward_metadata.verify_scratch_indices
+                if self.req_indexed_verify_scratch
+                else self.verify_intermediate_state_indices
+            )
+            assert intermediate_state_indices is not None
         else:
             has_initial_states = forward_batch.extend_prefix_lens > 0
 

@@ -97,6 +97,7 @@ from sglang.srt.speculative.spec_utils import (
     commit_mamba_states_after_verify,
     draft_tp_context,
     fast_sample,
+    get_mamba_verify_scratch_source_indices,
     get_plan_stream,
     load_token_map,
     renorm_draft_probs,
@@ -1778,11 +1779,6 @@ class EAGLEWorkerV2(BaseSpecWorker):
         state_indices_tensor = req_pool.translate_mamba_indices(
             req_pool.get_mamba_indices(batch.req_pool_indices[:bs])
         )
-        linear_attn_backend = getattr(
-            self.target_worker.model_runner.attn_backend,
-            "linear_attn_backend",
-            None,
-        )
         commit_mamba_states_after_verify(
             self.target_worker,
             batch,
@@ -1790,10 +1786,10 @@ class EAGLEWorkerV2(BaseSpecWorker):
             accept_index,
             draft_token_num,
             state_indices_tensor=state_indices_tensor,
-            scratch_source_indices_tensor=(
-                batch.req_pool_indices[:bs]
-                if getattr(linear_attn_backend, "req_indexed_verify_scratch", False)
-                else None
+            scratch_source_indices_tensor=get_mamba_verify_scratch_source_indices(
+                self.target_worker.model_runner.attn_backend,
+                batch.req_pool_indices,
+                bs,
             ),
         )
 

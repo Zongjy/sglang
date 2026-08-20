@@ -38,10 +38,10 @@ from sglang.srt.speculative.dspark_components.dspark_draft import (
     DraftBlockProposer,
     DraftBlockResult,
     make_next_draft_input,
+    resolve_greedy_mask,
 )
 from sglang.srt.speculative.dspark_components.dspark_draft_sampler import (
     maybe_build_draft_sampler,
-    resolve_greedy_mask,
 )
 from sglang.srt.speculative.dspark_components.dspark_kv_inject import (
     TargetHiddenKvInjector,
@@ -63,13 +63,13 @@ from sglang.srt.speculative.dspark_components.dspark_verify import (
     DSparkPPVerifyInputRaw,
     DsparkVerifyEpilogue,
     TargetVerifyExecutor,
-    TargetVerifyResult,
     verify_logits_adjustments_are_noop,
 )
 from sglang.srt.speculative.spec_utils import (
     GrammarTree,
     build_grammar_vocab_mask,
     draft_tp_context,
+    get_mamba_verify_scratch_source_indices,
     prepare_mamba_track_for_verify,
 )
 from sglang.srt.utils import get_available_gpu_memory, is_cuda
@@ -867,8 +867,10 @@ class DSparkWorkerV2(BaseSpecWorker):
                 seq_lens_pre_verify=prefix_lens,
                 seq_lens_post_verify=accept.new_seq_lens,
                 commit_lens=accept.commit_lens,
-                conv_source_indices_tensor=(
-                    batch.req_pool_indices if self._pp_enabled else None
+                conv_source_indices_tensor=get_mamba_verify_scratch_source_indices(
+                    self.model_runner.attn_backend,
+                    batch.req_pool_indices,
+                    accept.commit_lens.shape[0],
                 ),
             )
 
@@ -1077,7 +1079,11 @@ class DSparkWorkerV2(BaseSpecWorker):
             seq_lens_post_verify=seq_lens_pre_verify + commit_lens,
             commit_lens=commit_lens,
             state_indices_tensor=state_indices_tensor,
-            conv_source_indices_tensor=batch.req_pool_indices[:bs],
+            conv_source_indices_tensor=get_mamba_verify_scratch_source_indices(
+                self.model_runner.attn_backend,
+                batch.req_pool_indices,
+                bs,
+            ),
         )
 
     def get_confidence_budget_prepare(self):
