@@ -5,20 +5,32 @@ def resolve_min_free_slots(
     user_value: Optional[int],
     max_running_requests: int,
     is_dflash_family: bool = False,
+    *,
+    microbatch_capacity: Optional[int] = None,
 ) -> Optional[int]:
     """Resolve the min-free-slots threshold (None = disabled).
 
-    An explicit user value always wins, capped by max_running_requests
+    ``microbatch_capacity`` is the number of requests that this scheduler can
+    admit in one batch.  Pipeline-parallel schedulers pass their per-stage
+    micro-batch capacity here; non-PP callers can leave it unset and use
+    ``max_running_requests`` as the capacity.
+
+    An explicit user value always wins, capped by the effective capacity
     (<= 1 disables). When unset, DFlash workloads fall back to the legacy
-    formula (preserving the always-on behavior, disabled when
-    max_running_requests < 8); other workloads stay disabled.
+    formula (preserving the always-on behavior, disabled when the effective
+    capacity is < 8); other workloads stay disabled.
     """
     max_running_requests = max(0, int(max_running_requests))
+    if microbatch_capacity is None:
+        effective_capacity = max_running_requests
+    else:
+        effective_capacity = max(0, int(microbatch_capacity))
+
     if user_value is not None:
-        threshold = min(user_value, max_running_requests)
+        threshold = min(user_value, effective_capacity)
         return threshold if threshold > 1 else None
-    if is_dflash_family and max_running_requests >= 8:
-        return min(4, max(2, (max_running_requests + 5) // 6))
+    if is_dflash_family and effective_capacity >= 8:
+        return min(4, max(2, (effective_capacity + 5) // 6))
     return None
 
 

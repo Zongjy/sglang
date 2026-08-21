@@ -1038,6 +1038,17 @@ class Scheduler(
             _,
             _,
         ) = self.tp_worker.get_worker_info()
+        # The delayer threshold must be based on the admission capacity of one
+        # scheduler batch. In PP this is the per-stage micro-batch capacity,
+        # rather than the global max-running-requests value.
+        pp_micro_batch_size = get_parallel().pp_max_micro_batch_size
+        if not pp_micro_batch_size:
+            pp_micro_batch_size = max(self.max_running_requests // self.ps.pp_size, 1)
+            get_context().override(
+                "scheduler.pp_max_micro_batch_size_default",
+                pp_max_micro_batch_size=pp_micro_batch_size,
+            )
+
         # DFlash auto-enables the legacy formula; other workloads opt in via
         # --min-free-slots-delay. Built independently of the prefill delayer.
         self.min_free_slots_delayer: Optional[MinFreeSlotsDelayer] = None
@@ -1045,17 +1056,11 @@ class Scheduler(
             get_schedule().min_free_slots_delay,
             self.max_running_requests,
             is_dflash_family=self.spec_algorithm.is_dflash_family(),
+            microbatch_capacity=pp_micro_batch_size,
         )
         if min_free_slots is not None:
             self.min_free_slots_delayer = MinFreeSlotsDelayer(
                 min_free_slots=min_free_slots
-            )
-        if not get_parallel().pp_max_micro_batch_size:
-            get_context().override(
-                "scheduler.pp_max_micro_batch_size_default",
-                pp_max_micro_batch_size=max(
-                    self.max_running_requests // self.ps.pp_size, 1
-                ),
             )
 
         self.tp_group = get_tp_group()
