@@ -1,15 +1,15 @@
 #!/usr/bin/env python3
-"""Profile, analyze, and validate an adaptive SGLang PP layer partition.
+"""Profile and analyze an adaptive SGLang PP layer partition.
 
 Only ``--pp-size`` and ``--tp-size`` are required.  The default workflow:
 
 1. discovers a single-node GPU placement and the target model layer count;
 2. starts an evenly partitioned baseline and applies a steady decode load;
-3. collects per-iteration PP stage metrics (PPM) over ZMQ plus conservative
-   memory limits from the startup log;
-4. solves the unified partition objective (stage cost x capacity x mamba
-   ratio); and
-5. writes the recommended partition, ratio, and launch script -- optionally
+3. collects per-iteration PP stage metrics (PPM) over ZMQ plus a simple
+   memory calibration from the startup log;
+4. finds the latency-equivalent prefix partitions, then refines that small set
+   with raw Mamba/KV memory capacity; and
+5. writes the recommended partition and launch script -- optionally
    followed by a measured PP-vs-TP topology comparison (--compare-tp).
 
 Every run is self-contained under ``tuning_runs/`` and includes logs,
@@ -38,20 +38,17 @@ import urllib.error
 import urllib.request
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
+from functools import lru_cache
 from pathlib import Path
 from typing import IO, Any, Sequence
 
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 REPO_ROOT = SCRIPT_DIR.parents[1]
-DEFAULT_MODEL = "Qwen/Qwen3.6-27B"
-DEFAULT_DRAFT_MODEL = "z-lab/Qwen3.6-27B-DFlash"
+DEFAULT_MODEL = "Qwen/Qwen3.5-9B"
+DEFAULT_DRAFT_MODEL = "z-lab/Qwen3.5-9B-DFlash"
 DEFAULT_OUTPUT_ROOT = SCRIPT_DIR / "tuning_runs"
 DEFAULT_DATASET = SCRIPT_DIR / "data" / "sharegpt.json"
-MEMORY_VALUE = re.compile(r"avail mem=([0-9]+(?:\.[0-9]+)?) GB")
-TARGET_LOAD = re.compile(
-    r"Load weight end\..*type=([^,]+),.*mem usage=([0-9]+(?:\.[0-9]+)?) GB"
-)
 FINAL_RUNNING_LIMIT = re.compile(
     r"max_total_num_tokens=\d+.*max_running_requests=(\d+)"
 )
@@ -65,6 +62,31 @@ ACCEPT_LEN = re.compile(r"Decode batch.*accept len: ([0-9.]+)")
 
 class TuningError(RuntimeError):
     pass
+
+
+def parse_capture_buckets(value: str | Sequence[int] | None) -> tuple[int, ...]:
+    """Normalize an explicit CUDA-graph decode bucket list."""
+    if value is None:
+        return ()
+    raw_values = value.split(",") if isinstance(value, str) else value
+    try:
+        parsed = []
+        for item in raw_values:
+            text = str(item).strip()
+            if not text:
+                continue
+            number = int(text)
+            if number <= 0:
+                raise ValueError(text)
+            parsed.append(number)
+        buckets = tuple(sorted(set(parsed)))
+    except (TypeError, ValueError) as exc:
+        raise TuningError(
+            f"invalid --capture-buckets value {value!r}; expected positive integers"
+        ) from exc
+    if not buckets:
+        raise TuningError("--capture-buckets must contain at least one positive integer")
+    return buckets
 
 
 @dataclass(frozen=True)
@@ -125,7 +147,7 @@ class ManagedProcess:
 
 
 @dataclass
-class ValidationResult:
+class ComparisonResult:
     partition: tuple[int, ...]
     status: str
     throughput_tok_s: float | None
@@ -135,7 +157,6 @@ class ValidationResult:
     error: str | None = None
     runtime_capacity: dict[str, int] | None = None
     accept_len: float | None = None
-    mamba_ratio: float | None = None
 
 
 def _json_ready(value: Any) -> Any:
@@ -446,8 +467,6 @@ def build_server_command(
         str(args.block_size),
         "--mem-fraction-static",
         str(args.mem_fraction_static),
-        "--cuda-graph-max-bs-decode",
-        str(args.cuda_graph_max_bs),
         "--page-size",
         str(args.page_size),
         "--random-seed",
@@ -462,6 +481,14 @@ def build_server_command(
         "--port",
         str(port),
     ]
+    explicit_capture = parse_capture_buckets(getattr(args, "capture_buckets", None))
+    if explicit_capture:
+        # Keep the collector and the server on exactly the same graph shape
+        # keys.  With no explicit list the runtime's own max-bs generator is
+        # mirrored by ppm_consumer.default_capture_buckets().
+        command.extend(["--cuda-graph-bs-decode", *map(str, explicit_capture)])
+    else:
+        command.extend(["--cuda-graph-max-bs-decode", str(args.cuda_graph_max_bs)])
     if args.trust_remote_code:
         command.append("--trust-remote-code")
     if args.fixed_active_requests is not None:
@@ -526,7 +553,7 @@ def parse_accept_len(log_path: Path) -> float | None:
 
 
 def check_accept_len_consistency(
-    named_results: Sequence[tuple[str, ValidationResult]],
+    named_results: Sequence[tuple[str, ComparisonResult]],
     tolerance: float = 0.03,
 ) -> list[str]:
     """Warn when compared runs disagree on mean accepted length.
@@ -565,9 +592,18 @@ def parse_runtime_capacity(log_path: Path) -> dict[str, int]:
     elif mamba_limits:
         capacity["max_running_requests"] = min(item[0] for item in mamba_limits)
     if mamba_limits:
-        capacity["max_mamba_cache_size"] = min(item[1] for item in mamba_limits)
+        capacity["mamba_slots"] = min(item[1] for item in mamba_limits)
         capacity["mamba_slots_per_request"] = max(item[2] for item in mamba_limits)
     return capacity
+
+
+def parse_runtime_capacity_from_text(text: str) -> int | None:
+    """Return the resolved global request cap from already-read log text."""
+    final_limits = [int(value) for value in FINAL_RUNNING_LIMIT.findall(text)]
+    if final_limits:
+        return min(final_limits)
+    mamba_limits = [int(match[0]) for match in MAMBA_RUNNING_LIMIT.findall(text)]
+    return min(mamba_limits) if mamba_limits else None
 
 
 def start_server(
@@ -578,8 +614,7 @@ def start_server(
     phase_dir: Path,
     enable_comm_benchmark: bool = False,
     # PPM telemetry env vars; on only for the profile baseline (the sole
-    # consumer) so validation/comparison servers carry no instrumentation
-    # overhead.
+    # consumer) so comparison servers carry no instrumentation overhead.
     enable_ppm: bool = False,
     mamba_ratio: float | None = None,
 ) -> tuple[ManagedProcess, str, list[str]]:
@@ -601,8 +636,8 @@ def start_server(
         env["SGLANG_ENABLE_METRICS_DEVICE_TIMER"] = "1"
     if enable_comm_benchmark:
         # Startup ping-pong over the real pp_group; fits t_hop = alpha +
-        # beta * num_tokens per hop into the server log.  Baseline only --
-        # candidate validation servers skip it to save startup time.
+        # beta * num_tokens per hop into the server log. Baseline only;
+        # optional PP/TP comparison servers do not need it.
         env["SGLANG_PP_COMM_BENCHMARK"] = "1"
         env["SGLANG_PP_COMM_BENCHMARK_TOKENS"] = args.comm_benchmark_tokens
     if args.pp_size > 1:
@@ -752,20 +787,20 @@ def wait_for_load(load: ManagedProcess, timeout_s: float, settle_s: float) -> No
     )
 
 
-def run_validation(
+def run_comparison_benchmark(
     args: argparse.Namespace,
     base_url: str,
     partition: Sequence[int],
     phase_dir: Path,
     concurrency: int,
     server_log: Path,
-) -> ValidationResult:
+) -> ComparisonResult:
     phase_dir.mkdir(parents=True, exist_ok=True)
     repeats = []
     benchmark_logs = []
     requests = max(16, 2 * concurrency)
     label_base = "p" + "-".join(map(str, partition))
-    for repeat in range(args.validation_repeats):
+    for repeat in range(args.compare_repeats):
         label = f"{label_base}_r{repeat}"
         output_dir = phase_dir / "benchmark"
         command = benchmark_command(
@@ -775,7 +810,7 @@ def run_validation(
             output_dir,
             concurrency,
             requests,
-            args.validation_output_tokens,
+            args.decode_tokens_per_request,
         )
         log_path = phase_dir / f"benchmark_r{repeat}.log"
         benchmark_logs.append(str(log_path))
@@ -787,20 +822,20 @@ def run_validation(
                     text=True,
                     stdout=handle,
                     stderr=subprocess.STDOUT,
-                    timeout=args.validation_timeout_s,
+                    timeout=args.compare_timeout_s,
                 )
             except subprocess.TimeoutExpired:
-                return ValidationResult(
+                return ComparisonResult(
                     tuple(partition),
                     "benchmark_failed",
                     None,
                     repeats,
                     str(server_log),
                     benchmark_logs,
-                    f"benchmark timed out after {args.validation_timeout_s:g}s",
+                    f"benchmark timed out after {args.compare_timeout_s:g}s",
                 )
         if completed.returncode != 0:
-            return ValidationResult(
+            return ComparisonResult(
                 tuple(partition),
                 "benchmark_failed",
                 None,
@@ -814,7 +849,7 @@ def run_validation(
             summaries = json.loads(summary_path.read_text())
             summary = summaries[0]
         except (OSError, json.JSONDecodeError, IndexError) as exc:
-            return ValidationResult(
+            return ComparisonResult(
                 tuple(partition),
                 "benchmark_failed",
                 None,
@@ -825,7 +860,7 @@ def run_validation(
             )
         repeats.append(summary)
         if summary.get("completed") != summary.get("num_requests"):
-            return ValidationResult(
+            return ComparisonResult(
                 tuple(partition),
                 "benchmark_failed",
                 None,
@@ -837,7 +872,7 @@ def run_validation(
     throughput = float(
         statistics.median(item["output_throughput_tok_s"] for item in repeats)
     )
-    return ValidationResult(
+    return ComparisonResult(
         tuple(partition),
         "ok",
         throughput,
@@ -847,72 +882,6 @@ def run_validation(
         runtime_capacity=parse_runtime_capacity(server_log),
         accept_len=parse_accept_len(server_log),
     )
-
-
-def parse_memory_limits(
-    log_path: Path,
-    current_partition: Sequence[int],
-    reserve_gib: float,
-) -> tuple[tuple[int, ...], dict[str, Any]]:
-    target_mem: dict[int, list[float]] = {rank: [] for rank in range(len(current_partition))}
-    post_load_avail: dict[int, list[float]] = {
-        rank: [] for rank in range(len(current_partition))
-    }
-    loaded: set[tuple[int, int]] = set()
-    try:
-        lines = log_path.read_text(errors="replace").splitlines()
-    except OSError:
-        lines = []
-    for line in lines:
-        pp_matches = re.findall(r"\bPP(\d+)\b", line)
-        if not pp_matches:
-            continue
-        pp_rank = int(pp_matches[-1])
-        if pp_rank not in target_mem:
-            continue
-        tp_matches = re.findall(r"\bTP(\d+)\b", line)
-        tp_rank = int(tp_matches[-1]) if tp_matches else 0
-        key = (pp_rank, tp_rank)
-        load_match = TARGET_LOAD.search(line)
-        if load_match and "DFlash" not in load_match.group(1):
-            target_mem[pp_rank].append(float(load_match.group(2)))
-            loaded.add(key)
-        avail_match = MEMORY_VALUE.search(line)
-        if avail_match and key in loaded:
-            post_load_avail[pp_rank].append(float(avail_match.group(1)))
-
-    limits = []
-    details: dict[str, Any] = {"reserve_gib": reserve_gib, "stages": []}
-    num_layers = sum(current_partition)
-    for rank, current_layers in enumerate(current_partition):
-        memories = target_mem[rank]
-        available = post_load_avail[rank]
-        if not memories or not available:
-            maximum = num_layers
-            stage_detail = {
-                "rank": rank,
-                "current_layers": current_layers,
-                "max_layers": maximum,
-                "source": "unbounded; startup memory was not found in the log",
-            }
-        else:
-            target_gib = float(statistics.median(memories))
-            free_gib = min(available)
-            gib_per_layer = target_gib / current_layers
-            extra = max(0, math.floor((free_gib - reserve_gib) / gib_per_layer))
-            maximum = min(num_layers, current_layers + extra)
-            stage_detail = {
-                "rank": rank,
-                "current_layers": current_layers,
-                "target_weight_gib": target_gib,
-                "minimum_startup_free_gib": free_gib,
-                "estimated_gib_per_layer": gib_per_layer,
-                "max_layers": maximum,
-                "source": "server startup log",
-            }
-        limits.append(max(current_layers, maximum))
-        details["stages"].append(stage_detail)
-    return tuple(limits), details
 
 
 def collect_ppm_snapshot(args: argparse.Namespace, baseline_dir: Path) -> dict[str, Any]:
@@ -939,11 +908,19 @@ def collect_ppm_snapshot(args: argparse.Namespace, baseline_dir: Path) -> dict[s
         f"endpoint(s) (saturation bs: {saturation_bs or 'num_queued only'})",
         flush=True,
     )
+    capture_buckets = None
+    if getattr(args, "capture_buckets", None):
+        capture_buckets = parse_capture_buckets(args.capture_buckets)
+    else:
+        capture_buckets = ppm_consumer.default_capture_buckets(
+            getattr(args, "cuda_graph_max_bs", 32), speculative=True
+        )
     snapshot = ppm_consumer.collect(
         endpoints,
         duration_s=args.ppm_collect_s,
         max_messages=args.ppm_max_messages,
         saturation_bs=saturation_bs,
+        capture_buckets=capture_buckets,
     )
     write_json(baseline_dir / "ppm_snapshot.json", snapshot)
     print(
@@ -965,12 +942,31 @@ def _build_capacity_context(
     facts are unavailable; the analysis then falls back to the compute-only
     objective.
     """
+    if args.tp_size != 1:
+        print(
+            "[warn] capacity model disabled for TP>1: its static weight, "
+            "mamba-state, and KV byte counts are not TP-shard aware",
+            flush=True,
+        )
+        return None
     sys.path.insert(0, str(SCRIPT_DIR))
     import capacity_model
 
     try:
         static = capacity_model.load_static_info(
-            args.model_path, args.draft_model_path
+            args.model_path,
+            args.draft_model_path,
+            state_dtype=getattr(args, "mamba_ssm_dtype", None),
+        )
+        target_requests = (
+            getattr(args, "fixed_active_requests", None)
+            or parse_runtime_capacity_from_text(baseline_log_text)
+            or getattr(args, "concurrency", None)
+            or 1
+        )
+        tokens_per_request = (
+            getattr(args, "prompt_tokens", 0)
+            + getattr(args, "decode_tokens_per_request", 0)
         )
         calibration = capacity_model.calibrate(
             baseline_log_text,
@@ -979,20 +975,23 @@ def _build_capacity_context(
             args.mem_fraction_static,
             args.mamba_full_memory_ratio,
             args.block_size,
-            args.cuda_graph_max_bs,
+            safety_gib=getattr(args, "memory_reserve_gib", 1.0),
+            tokens_per_request=tokens_per_request,
+            page_size=args.page_size,
         )
+        if (
+            calibration.pre_avail_gib <= 0
+            and not any(value > 0 for value in calibration.baseline_post_avail_gib)
+        ):
+            print(
+                "[warn] capacity model disabled: baseline log has no usable "
+                "GPU memory calibration lines",
+                flush=True,
+            )
+            return None
     except capacity_model.CapacityModelError as exc:
         print(f"[warn] capacity model disabled: {exc}", flush=True)
         return None
-
-    def capacity_of(partition: Sequence[int]):
-        return capacity_model.predict_capacity(
-            partition,
-            static,
-            calibration,
-            args.mamba_full_memory_ratio,
-            args.block_size,
-        )
 
     def composition_of(partition: Sequence[int]) -> tuple[str, ...]:
         start = 0
@@ -1004,33 +1003,22 @@ def _build_capacity_context(
             start += count
         return tuple(parts)
 
-    def k_of(partition: Sequence[int]) -> tuple[int, ...]:
-        return capacity_of(partition).k_per_rank
-
     return {
         "static": static,
         "calibration": calibration,
-        "capacity_of": capacity_of,
         "composition_of": composition_of,
-        "k_of": k_of,
+        "target_requests": int(target_requests),
+        "tokens_per_request": int(tokens_per_request),
         "weight_source": static.weight_source,
     }
 
 
 def render_ppm_report(
-    args: argparse.Namespace,
     result: Any,
     capacity_ctx: dict[str, Any] | None,
     output_dir: Path,
-    meas: dict[tuple[int, ...], Any] | None = None,
-    k_of: Any = None,
 ) -> str:
-    """Render the optimizer report + decision table + sweep plot.
-
-    ``k_of`` (optional) overrides the per-rank K source; pass the swept
-    (ratio-optimized) capacity callable so the table's K0/K1 use the same
-    ratio as each row's recommendation.
-    """
+    """Render the cycle-time report, decision table, and boundary plot."""
     sys.path.insert(0, str(SCRIPT_DIR))
     import plot_partition_model as plot_mod
 
@@ -1039,17 +1027,15 @@ def render_ppm_report(
         composition_of=(
             capacity_ctx["composition_of"] if capacity_ctx else None
         ),
-        k_of=k_of or (capacity_ctx["k_of"] if capacity_ctx else None),
-        meas=meas,
     )
-    table = plot_mod.render_table(rows, with_meas=bool(meas))
+    table = plot_mod.render_table(rows)
     text = result.to_report() + "\n\n" + table + "\n"
     output_dir.mkdir(parents=True, exist_ok=True)
     (output_dir / "analysis.txt").write_text(text)
     png = plot_mod.render_plot(
         rows,
         output_dir / "partition_sweep.png",
-        title="PP partition sweep: compute vs capacity",
+        title="PP prefix-boundary sweep: cycle time",
     )
     if png is None:
         print("[warn] matplotlib unavailable; sweep plot skipped", flush=True)
@@ -1101,24 +1087,75 @@ def analyze_ppm(
     args: argparse.Namespace,
     snapshot: dict[str, Any],
     current_partition: Sequence[int],
-    max_layers: Sequence[int],
     output_dir: Path,
     baseline_log_text: str,
-    meas: dict[tuple[int, ...], Any] | None = None,
 ) -> dict[str, Any]:
-    """Fit stage + capacity models and solve the unified partition objective."""
+    """Fit the bucketed cycle model and select a feasible prefix partition."""
     sys.path.insert(0, str(SCRIPT_DIR))
     import partition_optimizer
     import stage_model
+    from model_layout import LayerLayout
 
+    layout_warning: str | None = None
     try:
-        model = stage_model.StageCostModel.fit(snapshot, current_partition)
+        layout = LayerLayout.from_model_path(
+            args.model_path, local_files_only=getattr(args, "offline", True)
+        )
+    except Exception as exc:
+        # A dense fallback is safe for latency-only analysis when a custom
+        # model config is unavailable; capacity construction will still fail
+        # loudly if it needs model-specific bytes.
+        layout = LayerLayout.from_kinds(
+            ("full",) * sum(int(value) for value in current_partition),
+            model_type="fallback",
+            source=f"fallback ({exc})",
+        )
+        layout_warning = f"layer layout unavailable; latency model assumes all-full layers ({exc})"
+    capture_buckets = snapshot.get("capture_buckets")
+    if not capture_buckets and getattr(args, "capture_buckets", None):
+        capture_buckets = parse_capture_buckets(args.capture_buckets)
+    if not capture_buckets:
+        import ppm_consumer
+
+        capture_buckets = ppm_consumer.default_capture_buckets(
+            getattr(args, "cuda_graph_max_bs", 32), speculative=True
+        )
+    try:
+        model = stage_model.StageCostModel.fit(
+            snapshot,
+            current_partition,
+            layout=layout,
+            capture_buckets=capture_buckets,
+        )
     except stage_model.StageModelError as exc:
         raise TuningError(str(exc)) from exc
+    if layout_warning:
+        model.warnings.append(layout_warning)
 
     bucket_counts = bucket_sample_distribution(snapshot)
     print(f"[ppm] kept samples per bs bucket: {bucket_counts}", flush=True)
-    work_tokens = model.target_bucket().bs_mean * args.block_size
+    runtime_cap = parse_runtime_capacity_from_text(baseline_log_text)
+    target_global = (
+        getattr(args, "fixed_active_requests", None)
+        or runtime_cap
+        or getattr(args, "concurrency", None)
+        or model.target_bucket().bucket * max(model.pp_loop_size, 1)
+    )
+    target_per_slot = max(1, math.ceil(target_global / max(model.pp_loop_size, 1)))
+    estimate = model.estimate_for_bs(target_per_slot)
+    measured_max_bucket = max(model.buckets)
+    if target_per_slot > measured_max_bucket:
+        model.warnings.append(
+            f"target per-slot bs {target_per_slot} exceeds the largest measured "
+            f"bucket {measured_max_bucket}; using that measured bucket without "
+            "interpolation"
+        )
+    elif target_per_slot != estimate.bucket:
+        model.warnings.append(
+            f"target per-slot bs {target_per_slot} is evaluated at execution "
+            f"bucket {estimate.bucket}"
+        )
+    work_tokens = estimate.bucket * args.block_size
     t_comm_ms, t_comm_source = resolve_t_comm(args, baseline_log_text, work_tokens)
     print(
         f"[t_comm] {t_comm_ms:.4f} ms at {work_tokens:g} tokens/hop "
@@ -1129,103 +1166,128 @@ def analyze_ppm(
     capacity_ctx = _build_capacity_context(
         args, baseline_log_text, current_partition
     )
-    capacity_callable = None
+    capacity_of = None
     if capacity_ctx is not None:
         import capacity_model
 
-        ratios = tuple(
-            float(item) for item in args.ratio_grid.split(",") if item.strip()
-        )
-        kv_per_req = args.prompt_tokens + args.validation_output_tokens
         static = capacity_ctx["static"]
         calibration = capacity_ctx["calibration"]
-        accept_len = model.target_bucket().accept_len
-        loop_size = max(model.pp_loop_size, 1)
+        tokens_per_request = capacity_ctx["tokens_per_request"]
 
-        def capacity_callable(partition):  # noqa: F811
-            def score(est) -> float:
-                per_slot = est.bs_max / loop_size
-                c_b, fixed_b = model.cost_at_bs(per_slot)
-                cadence = max(
-                    fixed_b[r] + c_b * n + (t_comm_ms if r > 0 else 0.0)
-                    for r, n in enumerate(partition)
+        @lru_cache(maxsize=None)
+        def fixed_capacity(partition: tuple[int, ...]):
+            try:
+                return capacity_model.predict_capacity(
+                    partition,
+                    static,
+                    calibration,
+                    target_requests=int(target_global),
+                    tokens_per_request=int(tokens_per_request),
+                    draft_tokens=args.block_size,
+                    safety_gib=getattr(args, "memory_reserve_gib", None),
                 )
-                if cadence <= 0 or accept_len <= 0:
-                    return 0.0
-                return est.bs_max * accept_len / (loop_size * cadence / 1000.0)
+            except capacity_model.CapacityModelError:
+                return None
 
-            _, est, _, _ = capacity_model.sweep_ratios(
-                partition,
-                static,
-                calibration,
-                ratios,
-                args.block_size,
-                kv_per_req,
-                score,
-            )
-            return est
+        capacity_of = fixed_capacity
 
     try:
         result = partition_optimizer.optimize(
             model,
+            estimate=estimate,
             t_comm_ms=t_comm_ms,
-            max_layers=max_layers,
             k_best=args.k_best,
-            allow_draft_relocation=args.allow_draft_relocation,
-            capacity=capacity_callable,
+            capacity=capacity_of,
+            target_bs=estimate.bucket,
+            layout=layout,
         )
     except partition_optimizer.OptimizerError as exc:
-        raise TuningError(str(exc)) from exc
+        if capacity_of is None:
+            raise TuningError(str(exc)) from exc
+        raise TuningError(
+            "no prefix-uniform partition satisfies the fixed memory working "
+            f"point ({exc}); lower target requests/tokens or increase the "
+            "memory reserve only after checking the calibration"
+        ) from exc
 
-    text = render_ppm_report(
-        args,
-        result,
-        capacity_ctx,
-        output_dir,
-        meas,
-        k_of=(
-            (lambda partition: capacity_callable(partition).k_per_rank)
-            if capacity_callable is not None
-            else None
-        ),
-    )
+    # Keep fit-quality warnings next to the decision.  In particular, a
+    # short profiling run may only populate one execution bucket; silently
+    # presenting that bucket as a full curve makes the recommendation look
+    # more certain than it is.
+    result.warnings.extend(model.warnings)
+
+    text = render_ppm_report(result, capacity_ctx, output_dir)
     print(text, flush=True)
 
     capacity_summary = None
     if capacity_ctx is not None:
+        summary_partitions = {
+            item.partition for item in result.indifference_set
+        } | {result.selected.partition, result.current.partition}
         capacity_summary = {
+            "enabled": capacity_of is not None,
             "weight_source": capacity_ctx["weight_source"],
-            "baseline_k": capacity_ctx["calibration"].baseline_k,
+            "baseline_mamba_slots": (
+                capacity_ctx["calibration"].baseline_mamba_slots
+            ),
             "baseline_kv_tokens": capacity_ctx["calibration"].baseline_kv_tokens,
+            "mamba_slots_per_request": (
+                capacity_ctx["calibration"].slots_per_request
+            ),
+            "mamba_full_memory_ratio": (
+                capacity_ctx["calibration"].mamba_full_memory_ratio
+            ),
+            "tokens_per_request": capacity_ctx["tokens_per_request"],
+            "page_size": capacity_ctx["calibration"].page_size,
+            "runtime_slack_gib": capacity_ctx["calibration"].slack_gib,
+            "safety_gib": capacity_ctx["calibration"].safety_gib,
             "estimates": {
-                ",".join(map(str, item.partition)): capacity_ctx["capacity_of"](
-                    item.partition
-                ).to_dict()
-                for item in result.candidates
+                ",".join(map(str, partition)): (
+                    capacity_of(partition).to_dict()
+                    if capacity_of is not None and capacity_of(partition) is not None
+                    else None
+                )
+                for partition in sorted(summary_partitions)
             },
         }
+    selected = result.selected
     analysis = {
         "mode": "ppm",
         "num_layers": model.num_layers,
         "current_partition": list(current_partition),
         "recommended": {
-            "partition": list(result.best.partition),
-            "draft_rank": result.best.draft_rank,
-            "bottleneck_ms": result.best.bottleneck_ms,
-            "bs_max": result.best.bs_max,
-            "throughput_tok_s": result.best.throughput_tok_s,
-            "mamba_ratio": result.best.mamba_ratio,
+            "partition": list(selected.partition),
+            "draft_rank": selected.draft_rank,
+            "l": selected.partition[0] if len(selected.partition) > 1 else 0,
+            "cycle_time_ms": selected.cycle_time_ms,
+            "bottleneck_ms": selected.bottleneck_ms,
+            "memory_capacity": selected.memory_capacity,
+            "mamba_capacity": selected.mamba_capacity,
+            "kv_capacity": selected.kv_capacity,
+            "scheduler_limit": selected.scheduler_limit,
+            "effective_limit": selected.effective_limit,
+            "mamba_ratio": selected.mamba_ratio,
+            "binding_resource": selected.binding_resource,
+            "binding_rank": selected.binding_rank,
         },
+        "l_range": list(result.l_range),
         "candidates": [
             {
                 "partition": list(item.partition),
                 "draft_rank": item.draft_rank,
+                "l": item.partition[0] if len(item.partition) > 1 else 0,
+                "cycle_time_ms": item.cycle_time_ms,
                 "bottleneck_ms": item.bottleneck_ms,
-                "bs_max": item.bs_max,
-                "throughput_tok_s": item.throughput_tok_s,
+                "memory_capacity": item.memory_capacity,
+                "mamba_capacity": item.mamba_capacity,
+                "kv_capacity": item.kv_capacity,
+                "scheduler_limit": item.scheduler_limit,
+                "effective_limit": item.effective_limit,
                 "mamba_ratio": item.mamba_ratio,
+                "binding_resource": item.binding_resource,
+                "binding_rank": item.binding_rank,
             }
-            for item in result.candidates[: args.candidate_count]
+            for item in result.candidates
         ],
         "keep_current": result.keep_current,
         "recommendation": result.recommendation,
@@ -1234,16 +1296,25 @@ def analyze_ppm(
             "source": t_comm_source,
             "work_tokens": work_tokens,
         },
-        "ratio_grid": args.ratio_grid,
+        "target_global_requests": int(target_global),
+        "target_per_slot_bs": int(target_per_slot),
+        "stage_latency_terms": {
+            "t_v_ms_per_layer": estimate.layer_cost_ms,
+            "t_d_ms": estimate.draft_ms,
+            "t_other_ms": estimate.other_ms,
+            "last_fixed_residual_ms": estimate.draft_plus_other_ms,
+        },
+        "tokens_per_request": (
+            capacity_ctx["tokens_per_request"] if capacity_ctx else None
+        ),
+        "layout": layout.to_dict(),
+        "capture_buckets": list(capture_buckets),
         "bucket_samples": bucket_counts,
         "compute_optimal": (
             list(result.compute_optimal) if result.compute_optimal else None
         ),
         "capacity_optimal": (
             list(result.capacity_optimal) if result.capacity_optimal else None
-        ),
-        "max_candidate_bs_max": max(
-            (item.bs_max or 0 for item in result.candidates), default=0
         ),
         "capacity_model": capacity_summary,
         "stage_model": model.to_dict(),
@@ -1254,15 +1325,18 @@ def analyze_ppm(
 
 
 def parse_measured_capacity(log_path: Path) -> dict[str, int]:
-    """Read the measured mamba K and resolved running cap from a server log."""
+    """Read measured Mamba slots and the resolved request cap from a log."""
     try:
         text = log_path.read_text(errors="replace")
     except OSError:
         return {}
     measured: dict[str, int] = {}
-    k_values = [int(v) for v in re.findall(r"max_mamba_cache_size: (\d+)", text)]
-    if k_values:
-        measured["k"] = min(k_values)
+    slot_values = [
+        int(value)
+        for value in re.findall(r"max_mamba_cache_size: (\d+)", text)
+    ]
+    if slot_values:
+        measured["mamba_slots"] = min(slot_values)
     measured.update(parse_runtime_capacity(log_path))
     return measured
 
@@ -1276,49 +1350,23 @@ def run_tp_comparison(
     executable: str,
     selected: Sequence[GPUInfo],
     best_partition: Sequence[int],
-    baseline_partition: Sequence[int] | None = None,
     best_ratio: float | None = None,
 ) -> dict[str, Any]:
     """PP vs TP topology comparison, self-contained on fresh servers.
 
     Measures BOTH sides at their native capacity first -- the PP server at
-    the recommended partition/ratio, the TP server (tp_size = pp_size *
-    tp_size, pp_size = 1, no layer partition, no comm benchmark, no PPM --
-    event_loop_pp does not run) at its swept ratio -- then re-measures each
+    the recommended partition (the runtime ratio is fixed, not optimized), the
+    TP server (tp_size = pp_size * tp_size, pp_size = 1, no layer partition,
+    no comm benchmark, no PPM -- event_loop_pp does not run) at the configured
+    ratio -- then re-measures each
     side above the common cap at --max-running-requests = min(PP_BS, TP_BS)
     with offered concurrency >= 2x that value (the side already below the
     common cap keeps its native measurement).  The accept_len consistency
-    check applies to the comparison.  The TP ratio comes from a pp=1
-    capacity sweep (score = BS_max under the KV constraint); the PP side
-    uses the recommended partition's ratio.
+    check applies to the comparison.  The PP side uses the recommended
+    partition's ratio; the TP side uses the configured default because the
+    current capacity model is not TP-shard aware.
     """
-    tp_ratio = best_ratio
-    tp_capacity_est = None
-    baseline_log_path = run_dir / "baseline" / "server.log"
-    if baseline_partition is not None and baseline_log_path.is_file():
-        try:
-            import capacity_model
-
-            baseline_log_text = baseline_log_path.read_text(errors="replace")
-            ctx = _build_capacity_context(args, baseline_log_text, baseline_partition)
-            if ctx is not None:
-                ratios = tuple(
-                    float(item) for item in args.ratio_grid.split(",") if item.strip()
-                )
-                kv_per_req = args.prompt_tokens + args.validation_output_tokens
-                num_layers = sum(best_partition)
-                tp_ratio, tp_capacity_est, _, _ = capacity_model.sweep_ratios(
-                    (num_layers,),
-                    ctx["static"],
-                    ctx["calibration"],
-                    ratios,
-                    args.block_size,
-                    kv_per_req,
-                    lambda est: est.bs_max,
-                )
-        except Exception as exc:  # ratio sweep is best-effort
-            print(f"[warn] TP ratio sweep failed: {exc}; using default ratio", flush=True)
-            tp_ratio = best_ratio
+    tp_ratio = args.mamba_full_memory_ratio
     tp_args = argparse.Namespace(**vars(args))
     tp_args.tp_size = args.tp_size * args.pp_size
     tp_args.pp_size = 1
@@ -1331,9 +1379,7 @@ def run_tp_comparison(
         "tp_size": tp_args.tp_size,
         "pp_partition": list(best_partition),
         "tp_mamba_ratio": tp_ratio,
-        "tp_capacity_est": (
-            tp_capacity_est.to_dict() if tp_capacity_est is not None else None
-        ),
+        "tp_capacity_est": None,
     }
 
     def stop_and_settle(server: ManagedProcess | None) -> None:
@@ -1358,7 +1404,7 @@ def run_tp_comparison(
         pp_capacity = parse_measured_capacity(server.log_path)
         pp_cap = pp_capacity.get("max_running_requests")
         result["pp_capacity"] = pp_capacity
-        pp_native = run_validation(
+        pp_native = run_comparison_benchmark(
             pp_args, pp_url, best_partition, phase_dir / "pp_native",
             max(2 * (pp_cap or args.concurrency), 16), server.log_path,
         )
@@ -1375,7 +1421,7 @@ def run_tp_comparison(
         tp_capacity = parse_measured_capacity(server.log_path)
         tp_cap = tp_capacity.get("max_running_requests")
         result["tp_capacity"] = tp_capacity
-        tp_native = run_validation(
+        tp_native = run_comparison_benchmark(
             tp_args, tp_url, (), phase_dir / "tp_native",
             max(2 * (tp_cap or args.concurrency), 16), server.log_path,
         )
@@ -1401,7 +1447,7 @@ def run_tp_comparison(
                     pp_capped_args, executable, selected, best_partition, pp_dir,
                     mamba_ratio=best_ratio,
                 )
-                pp_equal = run_validation(
+                pp_equal = run_comparison_benchmark(
                     pp_capped_args, pp_url, best_partition, pp_dir, concurrency,
                     server.log_path,
                 )
@@ -1419,7 +1465,7 @@ def run_tp_comparison(
                     tp_capped_args, executable, selected, (), tp_dir,
                     mamba_ratio=tp_ratio,
                 )
-                tp_equal = run_validation(
+                tp_equal = run_comparison_benchmark(
                     tp_capped_args, tp_url, (), tp_dir, concurrency,
                     server.log_path,
                 )
@@ -1451,8 +1497,9 @@ def run_tp_comparison(
 
     lines = [
         "PP vs TP comparison:",
-        f"  ratios: PP best at {best_ratio or args.mamba_full_memory_ratio:g}, "
-        f"TP at {tp_ratio or args.mamba_full_memory_ratio:g}",
+        f"  runtime mamba ratio (not optimized): PP "
+        f"{best_ratio or args.mamba_full_memory_ratio:g}, "
+        f"TP {tp_ratio or args.mamba_full_memory_ratio:g}",
         f"  native capacity: PP {','.join(map(str, best_partition))} "
         f"(cap {pp_cap}) {_tok(result['pp_native'])} vs "
         f"TP{tp_args.tp_size} (cap {tp_cap}) {_tok(result['tp_native'])}",
@@ -1559,8 +1606,33 @@ def format_gpu_plan(
 def run_tuner(args: argparse.Namespace) -> Path | None:
     if args.pp_size <= 0 or args.tp_size <= 0:
         raise TuningError("--pp-size and --tp-size must be positive.")
-    if args.validation_repeats <= 0 or args.candidate_count <= 0:
-        raise TuningError("Validation repeats and candidate count must be positive.")
+    if args.block_size <= 0 or args.page_size <= 0 or args.cuda_graph_max_bs <= 0:
+        raise TuningError(
+            "--block-size, --page-size, and --cuda-graph-max-bs must be positive."
+        )
+    if args.decode_tokens_per_request <= 0:
+        raise TuningError("--decode-tokens-per-request must be positive.")
+    if args.compare_repeats <= 0 or args.compare_timeout_s <= 0:
+        raise TuningError("--compare-repeats and --compare-timeout-s must be positive.")
+    replay_state: dict[str, Any] = {}
+    replay_dir = args.reanalyze or args.compare_tp_only
+    if replay_dir:
+        replay_result = replay_dir / "result.json"
+        if replay_result.is_file():
+            replay_state = json.loads(replay_result.read_text())
+            saved_settings = replay_state.get("settings", {})
+            for key in (
+                "mem_fraction_static",
+                "mamba_full_memory_ratio",
+                "block_size",
+                "page_size",
+                "mamba_ssm_dtype",
+                "cuda_graph_max_bs",
+                "model_path",
+                "draft_model_path",
+            ):
+                if key in saved_settings:
+                    setattr(args, key, saved_settings[key])
     model = inspect_model(args.model_path, args.trust_remote_code, args.offline)
     if args.pp_size > model.num_layers:
         raise TuningError(
@@ -1603,51 +1675,18 @@ def run_tuner(args: argparse.Namespace) -> Path | None:
             )
         snapshot = json.loads(snapshot_path.read_text())
         baseline_log_text = log_path.read_text(errors="replace")
-        saved: dict[str, Any] = {}
-        result_path = run_dir / "result.json"
-        if result_path.is_file():
-            saved = json.loads(result_path.read_text())
-        saved_settings = saved.get("settings", {})
-        for key in (
-            "mem_fraction_static",
-            "mamba_full_memory_ratio",
-            "block_size",
-            "cuda_graph_max_bs",
-            "model_path",
-            "draft_model_path",
-        ):
-            if key in saved_settings:
-                setattr(args, key, saved_settings[key])
         baseline = (
-            tuple(saved["baseline_partition"])
-            if saved.get("baseline_partition")
+            tuple(replay_state["baseline_partition"])
+            if replay_state.get("baseline_partition")
             else baseline
         )
-        # Measured columns from the previous run's validations.
-        sys.path.insert(0, str(SCRIPT_DIR))
-        import plot_partition_model as plot_mod
-
-        meas: dict[tuple[int, ...], Any] = {}
-        for item in saved.get("validations", []):
-            if item.get("status") != "ok":
-                continue
-            capacity = parse_measured_capacity(Path(item["server_log"]))
-            capacity.update(item.get("runtime_capacity") or {})
-            meas[tuple(item["partition"])] = plot_mod.MeasPoint(
-                k=capacity.get("k"),
-                bs_max=capacity.get("max_running_requests"),
-                accept_len=item.get("accept_len"),
-                mamba_ratio=item.get("mamba_ratio"),
-            )
         out_dir = run_dir / "reanalysis"
         analysis = analyze_ppm(
             args,
             snapshot,
             baseline,
-            (model.num_layers,) * args.pp_size,
             out_dir,
             baseline_log_text,
-            meas=meas or None,
         )
         write_json(
             out_dir / "result.json",
@@ -1694,22 +1733,10 @@ def run_tuner(args: argparse.Namespace) -> Path | None:
         result_path = run_dir / "result.json"
         if not result_path.is_file():
             raise TuningError(f"--compare-tp-only needs {result_path}.")
-        saved = json.loads(result_path.read_text())
-        saved_settings = saved.get("settings", {})
-        for key in (
-            "mem_fraction_static",
-            "mamba_full_memory_ratio",
-            "block_size",
-            "cuda_graph_max_bs",
-            "model_path",
-            "draft_model_path",
-        ):
-            if key in saved_settings:
-                setattr(args, key, saved_settings[key])
+        saved = replay_state
         if not saved.get("best_partition"):
             raise TuningError(f"{result_path} has no best_partition yet.")
         best = tuple(saved["best_partition"])
-        saved_baseline = tuple(saved.get("baseline_partition") or best)
         best_ratio = None
         analysis = saved.get("analysis") or {}
         recommended = analysis.get("recommended") or {}
@@ -1721,7 +1748,6 @@ def run_tuner(args: argparse.Namespace) -> Path | None:
             executable,
             selected,
             best,
-            baseline_partition=saved_baseline,
             best_ratio=best_ratio,
         )
         saved["tp_comparison"] = comparison
@@ -1810,26 +1836,26 @@ def run_tuner(args: argparse.Namespace) -> Path | None:
     state["baseline_runtime_capacity"] = parse_runtime_capacity(
         baseline_dir / "server.log"
     )
-    max_layers, memory_details = parse_memory_limits(
-        baseline_dir / "server.log", baseline, args.memory_reserve_gib
-    )
-    state["memory_limits"] = {
-        "max_layers_per_stage": max_layers,
-        "details": memory_details,
-    }
     write_json(run_dir / "result.json", state)
 
     assert ppm_snapshot is not None
     baseline_log_text = (baseline_dir / "server.log").read_text(errors="replace")
     analysis = analyze_ppm(
-        args, ppm_snapshot, baseline, max_layers, baseline_dir,
+        args,
+        ppm_snapshot,
+        baseline,
+        baseline_dir,
         baseline_log_text,
     )
     state["analysis"] = analysis
     write_json(run_dir / "result.json", state)
 
     best = tuple(analysis["recommended"]["partition"])
-    reason = "ppm prediction"
+    reason = (
+        "ppm prediction: kept current within significance band"
+        if analysis.get("keep_current")
+        else "ppm prediction: model optimum"
+    )
 
     state.update(
         status="complete",
@@ -1837,15 +1863,7 @@ def run_tuner(args: argparse.Namespace) -> Path | None:
         best_partition=best,
         selection_reason=reason,
     )
-    best_ratio: float | None = None
-    for item in analysis.get("candidates", []):
-        if tuple(item["partition"]) == tuple(best):
-            best_ratio = item.get("mamba_ratio")
-            break
-    if tuple(best) == tuple(baseline):
-        best_ratio = (
-            analysis.get("optimization", {}).get("current") or {}
-        ).get("mamba_ratio")
+    best_ratio = analysis["recommended"].get("mamba_ratio")
     write_best_artifacts(
         args, run_dir, executable, selected, best, reason, mamba_ratio=best_ratio
     )
@@ -1854,7 +1872,6 @@ def run_tuner(args: argparse.Namespace) -> Path | None:
         try:
             state["tp_comparison"] = run_tp_comparison(
                 args, run_dir, executable, selected, best,
-                baseline_partition=baseline,
                 best_ratio=best_ratio,
             )
         except TuningError as exc:
@@ -1869,7 +1886,12 @@ def run_tuner(args: argparse.Namespace) -> Path | None:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--pp-size", type=int, required=True)
-    parser.add_argument("--tp-size", type=int, required=True)
+    parser.add_argument(
+        "--tp-size",
+        type=int,
+        default=1,
+        help="tensor parallel size (default: 1)",
+    )
     parser.add_argument("--model-path", default=DEFAULT_MODEL)
     parser.add_argument("--draft-model-path", default=DEFAULT_DRAFT_MODEL)
     parser.add_argument("--block-size", type=int, default=8)
@@ -1878,7 +1900,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--page-size", type=int, default=1)
     parser.add_argument("--random-seed", type=int, default=1)
     parser.add_argument("--mamba-ssm-dtype", default="bfloat16")
-    parser.add_argument("--mamba-full-memory-ratio", type=float, default=2.0)
+    parser.add_argument(
+        "--mamba-full-memory-ratio",
+        type=float,
+        default=2.0,
+        help="fixed runtime Mamba/KV memory ratio used by the capacity model",
+    )
     parser.add_argument(
         "--concurrency",
         type=int,
@@ -1899,7 +1926,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--dataset",
         type=Path,
         default=DEFAULT_DATASET,
-        help="ShareGPT JSON dataset used by profiling and validation",
+        help="ShareGPT JSON dataset used by profiling and --compare-tp",
     )
     parser.add_argument(
         "--profile-output-tokens",
@@ -1911,26 +1938,24 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--profile-settle-s", type=float, default=5.0)
     parser.add_argument("--profile-load-timeout-s", type=float, default=180.0)
-    parser.add_argument("--post-profile-cooldown-s", type=float, default=3.0)
-    parser.add_argument("--candidate-count", type=int, default=3)
     parser.add_argument(
-        "--validation-output-tokens",
+        "--decode-tokens-per-request",
         type=int,
         default=256,
         help=(
-            "per-request decode length assumed by the capacity model's KV "
-            "feasibility check and used by --compare-tp measurements "
+            "decode length per request assumed by the capacity model's KV "
+            "working set and used by --compare-tp measurements "
             "(default: 256)"
         ),
     )
     parser.add_argument(
-        "--validation-repeats",
+        "--compare-repeats",
         type=int,
         default=2,
         help="measurement repeats per --compare-tp point (default: 2)",
     )
     parser.add_argument(
-        "--validation-timeout-s",
+        "--compare-timeout-s",
         type=float,
         default=1800.0,
         help="per-benchmark timeout for --compare-tp measurements",
@@ -1967,9 +1992,15 @@ def build_parser() -> argparse.ArgumentParser:
         help=(
             "saturation threshold for the PPM work-conservation filter, in "
             "GLOBAL running requests (compared against the publisher's "
-            "running_bs; per-slot bs only for legacy producers); default: "
-            "--fixed-active-requests or the server's resolved "
+            "running_bs); default: --fixed-active-requests or the server's resolved "
             "max_running_requests"
+        ),
+    )
+    parser.add_argument(
+        "--capture-buckets",
+        help=(
+            "comma-separated decode CUDA-graph execution buckets; default: "
+            "SGLang's speculative decode capture list up to --cuda-graph-max-bs"
         ),
     )
     parser.add_argument(
@@ -1991,26 +2022,12 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
-        "--ratio-grid",
-        default="0.25,0.5,1,2,4,8",
-        help=(
-            "log grid of --mamba-full-memory-ratio values swept per "
-            "candidate partition (default: 0.25,0.5,1,2,4,8); the feasible "
-            "point with the best unified throughput wins"
-        ),
-    )
-    parser.add_argument(
         "--k-best",
         type=int,
         default=20,
-        help="candidates kept per state in the k-best partition DP (default: 20)",
-    )
-    parser.add_argument(
-        "--allow-draft-relocation",
-        action="store_true",
         help=(
-            "analysis only: let the optimizer enumerate draft block placement "
-            "across ranks (default: draft locked to the last rank)"
+            "number of prefix-boundary candidates retained in reports "
+            "(default: 20)"
         ),
     )
     parser.add_argument(
@@ -2018,8 +2035,7 @@ def build_parser() -> argparse.ArgumentParser:
         type=Path,
         help=(
             "offline re-analysis of an existing ppm-mode run directory: reads "
-            "baseline/ppm_snapshot.json + baseline/server.log (+ measured "
-            "columns from legacy runs that recorded validations), refits "
+            "baseline/ppm_snapshot.json + baseline/server.log, refits the "
             "stage/capacity models, and re-renders the report and sweep plot "
             "into <run_dir>/reanalysis/ without starting a server"
         ),

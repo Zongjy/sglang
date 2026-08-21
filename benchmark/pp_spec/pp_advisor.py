@@ -3,8 +3,8 @@
 
 Each cycle the advisor collects a PPM snapshot from the live server's ZMQ
 endpoints, refits the stage cost model, recalibrates the capacity model from
-the server log, and re-solves the unified objective
-``throughput(p) = BS_max(p) x accept_len / cadence(p, BS_max(p))``.  When the
+the server log, and re-solves the one-dimensional cycle-time objective.  Raw
+Mamba/KV capacity refines only the latency-equivalent candidates.  When the
 recommended partition beats the current one by more than --min-gain-pct AND
 the gain is outside the noise band, it prints an actionable
 ``export SGLANG_PP_LAYER_PARTITION=...`` suggestion with the full reasoning;
@@ -18,6 +18,7 @@ runs a single evaluation, suitable for cron or smoke tests.
 from __future__ import annotations
 
 import argparse
+import math
 import sys
 import time
 from dataclasses import dataclass
@@ -26,8 +27,8 @@ from typing import Any, Callable, Sequence
 
 
 SCRIPT_DIR = Path(__file__).resolve().parent
-DEFAULT_MODEL = "Qwen/Qwen3.6-27B"
-DEFAULT_DRAFT_MODEL = "z-lab/Qwen3.6-27B-DFlash"
+DEFAULT_MODEL = "Qwen/Qwen3.5-9B"
+DEFAULT_DRAFT_MODEL = "z-lab/Qwen3.5-9B-DFlash"
 
 
 class AdvisorError(RuntimeError):
@@ -101,11 +102,20 @@ class Advisor:
                 flush=True,
             )
             return None
+        if getattr(self.args, "tp_size", 1) != 1:
+            print(
+                "[advisor] capacity model disabled for TP>1: its static byte "
+                "counts are not TP-shard aware",
+                flush=True,
+            )
+            return None
         import capacity_model
 
         try:
             static = capacity_model.load_static_info(
-                self.args.model_path, self.args.draft_model_path
+                self.args.model_path,
+                self.args.draft_model_path,
+                state_dtype=getattr(self.args, "mamba_ssm_dtype", None),
             )
             calibration = capacity_model.calibrate(
                 self._server_log_text(),
@@ -114,22 +124,48 @@ class Advisor:
                 self.args.mem_fraction_static,
                 self.args.mamba_full_memory_ratio,
                 self.args.block_size,
-                self.args.cuda_graph_max_bs,
+                safety_gib=getattr(self.args, "memory_reserve_gib", 1.0),
+                tokens_per_request=getattr(self.args, "tokens_per_request", 512),
+                page_size=getattr(self.args, "page_size", 1),
             )
+            if (
+                calibration.pre_avail_gib <= 0
+                and not any(value > 0 for value in calibration.baseline_post_avail_gib)
+            ):
+                print(
+                    "[advisor] capacity model disabled: server log has no "
+                    "usable memory calibration lines",
+                    flush=True,
+                )
+                return None
         except capacity_model.CapacityModelError as exc:
             print(f"[advisor] capacity model disabled: {exc}", flush=True)
             return None
+
+        target_requests = (
+            getattr(self.args, "target_global_requests", None)
+            or calibration.resolved_max_running
+            or 1
+        )
+        tokens_per_request = getattr(self.args, "tokens_per_request", 512)
 
         def capacity_of(partition: Sequence[int]):
             return capacity_model.predict_capacity(
                 partition,
                 static,
                 calibration,
-                self.args.mamba_full_memory_ratio,
-                self.args.block_size,
+                target_requests=target_requests,
+                tokens_per_request=tokens_per_request,
+                draft_tokens=self.args.block_size,
+                safety_gib=getattr(self.args, "memory_reserve_gib", None),
             )
 
-        self._capacity_ctx = {"static": static, "capacity_of": capacity_of}
+        self._capacity_ctx = {
+            "static": static,
+            "capacity_of": capacity_of,
+            "target_requests": target_requests,
+            "tokens_per_request": tokens_per_request,
+        }
         return self._capacity_ctx
 
     def evaluate(
@@ -140,20 +176,70 @@ class Advisor:
         import ppm_consumer
         import partition_optimizer
         import stage_model
+        from model_layout import LayerLayout
 
         endpoints = self.endpoints()
         if collect_fn is None:
+            capture_buckets = None
+            if getattr(self.args, "capture_buckets", None):
+                capture_buckets = tuple(
+                    int(value.strip())
+                    for value in self.args.capture_buckets.split(",")
+                    if value.strip()
+                )
+            elif getattr(self.args, "cuda_graph_max_bs", None):
+                capture_buckets = ppm_consumer.default_capture_buckets(
+                    self.args.cuda_graph_max_bs, speculative=True
+                )
             collect_fn = lambda eps: ppm_consumer.collect(  # noqa: E731
-                eps, duration_s=self.args.collect_s
+                eps,
+                duration_s=self.args.collect_s,
+                capture_buckets=capture_buckets,
             )
         snapshot = collect_fn(endpoints)
 
+        layout_warning: str | None = None
+        try:
+            layout = LayerLayout.from_model_path(
+                self.args.model_path, local_files_only=True
+            )
+        except Exception as exc:
+            layout = LayerLayout.from_kinds(("full",) * self.num_layers)
+            layout_warning = (
+                "layer layout unavailable; latency model assumes all-full layers "
+                f"({exc})"
+            )
         model = stage_model.StageCostModel.fit(
-            snapshot, self.current_partition, min_samples=self.args.min_samples
+            snapshot,
+            self.current_partition,
+            min_samples=self.args.min_samples,
+            layout=layout,
+            capture_buckets=snapshot.get("capture_buckets"),
         )
+        if layout_warning:
+            model.warnings.append(layout_warning)
         capacity_ctx = self.capacity_ctx()
 
-        work_tokens = model.target_bucket().bs_mean * self.args.block_size
+        target_global = (
+            getattr(self.args, "target_global_requests", None)
+            or (self._capacity_ctx or {}).get("target_requests")
+            or model.target_bucket().bucket * max(model.pp_loop_size, 1)
+        )
+        target_bs = max(1, math.ceil(target_global / max(model.pp_loop_size, 1)))
+        estimate = model.estimate_for_bs(target_bs)
+        measured_max_bucket = max(model.buckets)
+        if target_bs > measured_max_bucket:
+            model.warnings.append(
+                f"target per-slot bs {target_bs} exceeds the largest measured "
+                f"bucket {measured_max_bucket}; using that bucket without "
+                "interpolation"
+            )
+        elif target_bs != estimate.bucket:
+            model.warnings.append(
+                f"target per-slot bs {target_bs} is evaluated at execution "
+                f"bucket {estimate.bucket}"
+            )
+        work_tokens = estimate.bucket * self.args.block_size
         if self.args.t_comm_ms is not None:
             t_comm_ms = self.args.t_comm_ms
             t_comm_source = "manual --t-comm-ms"
@@ -168,54 +254,80 @@ class Advisor:
                 t_comm_ms = parsed
                 t_comm_source = "startup comm benchmark"
 
-        result = partition_optimizer.optimize(
-            model,
-            t_comm_ms=t_comm_ms,
-            k_best=self.args.k_best,
-            capacity=capacity_ctx["capacity_of"] if capacity_ctx else None,
-        )
+        try:
+            result = partition_optimizer.optimize(
+                model,
+                estimate=estimate,
+                t_comm_ms=t_comm_ms,
+                k_best=self.args.k_best,
+                capacity=capacity_ctx["capacity_of"] if capacity_ctx else None,
+                target_bs=estimate.bucket,
+                layout=layout,
+            )
+        except partition_optimizer.OptimizerError as exc:
+            if capacity_ctx is None:
+                raise
+            raise AdvisorError(
+                "no prefix-uniform partition satisfies the fixed memory "
+                f"working point ({exc}); cycle skipped"
+            ) from exc
+
+        result.warnings.extend(model.warnings)
 
         best, current = result.best, result.current
-        if best.throughput_tok_s is not None and current.throughput_tok_s:
-            gain = (
-                (best.throughput_tok_s - current.throughput_tok_s)
-                / current.throughput_tok_s
-            )
-            metric = (
-                f"current BS_max={current.bs_max}, cadence "
-                f"{current.cadence_at_capacity_ms:.2f} ms, "
-                f"{current.throughput_tok_s:.1f} tok/s (predicted); "
-                f"best {','.join(map(str, best.partition))}: "
-                f"BS_max={best.bs_max}, cadence "
-                f"{best.cadence_at_capacity_ms:.2f} ms, "
-                f"{best.throughput_tok_s:.1f} tok/s"
-            )
-        else:
-            gain = (
-                (current.bottleneck_ms - best.bottleneck_ms)
-                / current.bottleneck_ms
-                if current.bottleneck_ms > 0
-                else 0.0
-            )
-            metric = (
-                f"current bottleneck {current.bottleneck_ms:.2f} ms; "
-                f"best {','.join(map(str, best.partition))}: "
-                f"{best.bottleneck_ms:.2f} ms (compute-only objective)"
+        gain = (
+            (current.cycle_time_ms - best.cycle_time_ms) / current.cycle_time_ms
+            if current.cycle_time_ms > 0
+            else 0.0
+        )
+        metric = (
+            f"current cycle {current.cycle_time_ms:.2f} ms; best "
+            f"{','.join(map(str, best.partition))}: "
+            f"{best.cycle_time_ms:.2f} ms"
+        )
+        if best.memory_capacity is not None and current.memory_capacity is not None:
+            metric += (
+                f"; raw memory capacity {current.memory_capacity} -> "
+                f"{best.memory_capacity}"
             )
 
         current_text = ",".join(map(str, self.current_partition))
         best_text = ",".join(map(str, best.partition))
+        latency_band = {item.partition for item in result.indifference_set}
+        capacity_refinement = (
+            current.partition in latency_band
+            and best.partition in latency_band
+            and current.memory_capacity is not None
+            and best.memory_capacity is not None
+            and best.memory_capacity > current.memory_capacity
+        )
+        current_memory_infeasible = current.target_feasible is False
         if (
-            gain * 100.0 > self.args.min_gain_pct
-            and not result.keep_current
+            not result.keep_current
             and best.partition != self.current_partition
+            and (
+                gain * 100.0 > self.args.min_gain_pct
+                or capacity_refinement
+                or current_memory_infeasible
+            )
         ):
+            if capacity_refinement:
+                reason = (
+                    "both partitions are inside the latency-equivalent range; "
+                    "the candidate has more raw memory capacity"
+                )
+            elif current_memory_infeasible:
+                reason = "the current partition fails memory feasibility"
+            else:
+                reason = (
+                    f"predicted latency gain {gain:.1%} > --min-gain-pct "
+                    f"{self.args.min_gain_pct}% and outside the "
+                    f"{result.noise_sigma:g}-sigma noise band"
+                )
             detail = (
                 f"[advisor] RECOMMEND repartition {current_text} -> {best_text}\n"
                 f"  {metric}\n"
-                f"  predicted gain {gain:.1%} > --min-gain-pct "
-                f"{self.args.min_gain_pct}% and outside the "
-                f"{result.noise_sigma:g}-sigma noise band "
+                f"  {reason} "
                 f"(t_comm={t_comm_ms:.4f} ms, {t_comm_source})\n"
                 f"  apply: export SGLANG_PP_LAYER_PARTITION={best_text}"
             )
@@ -274,14 +386,35 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         help="default: inferred from --current-partition length",
     )
+    parser.add_argument("--tp-size", type=int, default=1)
     parser.add_argument("--interval-s", type=float, default=300.0)
     parser.add_argument("--collect-s", type=float, default=60.0)
     parser.add_argument("--min-gain-pct", type=float, default=8.0)
     parser.add_argument("--t-comm-ms", type=float)
     parser.add_argument("--block-size", type=int, default=8)
-    parser.add_argument("--mem-fraction-static", type=float, default=0.82)
-    parser.add_argument("--mamba-full-memory-ratio", type=float, default=2.0)
+    parser.add_argument("--page-size", type=int, default=1)
+    parser.add_argument("--mamba-ssm-dtype", default="bfloat16")
     parser.add_argument("--cuda-graph-max-bs", type=int, default=32)
+    parser.add_argument("--capture-buckets")
+    parser.add_argument("--mem-fraction-static", type=float, default=0.82)
+    parser.add_argument(
+        "--mamba-full-memory-ratio",
+        type=float,
+        default=2.0,
+        help="fixed runtime Mamba/KV memory ratio used by the capacity model",
+    )
+    parser.add_argument("--memory-reserve-gib", type=float, default=1.0)
+    parser.add_argument(
+        "--target-global-requests",
+        type=int,
+        help="fixed global request working point for memory feasibility",
+    )
+    parser.add_argument(
+        "--tokens-per-request",
+        type=int,
+        default=512,
+        help="fixed KV tokens per request used by the memory filter",
+    )
     parser.add_argument("--k-best", type=int, default=20)
     parser.add_argument(
         "--min-samples",

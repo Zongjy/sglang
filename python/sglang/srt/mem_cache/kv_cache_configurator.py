@@ -45,6 +45,10 @@ from sglang.srt.mem_cache.allocator.swa import (
     SWATokenToKVPoolAllocator,
 )
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
+from sglang.srt.mem_cache.hybrid_capacity_planner import (
+    calculate_mamba_slots_per_request,
+    solve_auto_mamba_slots,
+)
 from sglang.srt.mem_cache.hisparse_memory_pool import HiSparseDSATokenToKVPool
 from sglang.srt.mem_cache.memory_pool import (
     DSATokenToKVPool,
@@ -133,18 +137,6 @@ def mm_runtime_reservation_gb(
         )
     return reserved_mb / 1024
 
-
-# base ratio of mamba pool size to max_running_requests. Under
-# SGLANG_OPT_MAMBA_SKIP_DECODE_LOCK the decode-time skip frees one resident slot
-# per running request, so the base drops by 1 (overlap 5->4, lazy 4->3). no_buffer
-# stays at effective 3 either way: its binding limit is the prefill->decode peak,
-# which the decode-time drop does not shrink.
-MAMBA_CACHE_SIZE_MAX_RUNNING_REQUESTS_RATIO = 3
-MAMBA_CACHE_BASE_RATIO_DROP_ON_SKIP = 1
-MAMBA_CACHE_V2_ADDITIONAL_RATIO_OVERLAP = 2
-MAMBA_CACHE_V2_ADDITIONAL_RATIO_OVERLAP_LAZY = 1
-MAMBA_CACHE_V2_ADDITIONAL_RATIO_NO_OVERLAP = 1
-MAMBA_CACHE_V2_ADDITIONAL_RATIO_NO_BUFFER = 1
 
 if TYPE_CHECKING:
     from sglang.srt.distributed.parallel_state_wrapper import ParallelState
@@ -1815,35 +1807,16 @@ class KVCacheConfigurator:
         return int(rest_memory * (1 << 30))  # return in bytes
 
     def _calculate_mamba_ratio(self) -> int:
-        if get_memory().disable_radix_cache:
-            return 1
-
-        skip_decode_lock = envs.SGLANG_OPT_MAMBA_SKIP_DECODE_LOCK.get()
-        base = MAMBA_CACHE_SIZE_MAX_RUNNING_REQUESTS_RATIO - (
-            MAMBA_CACHE_BASE_RATIO_DROP_ON_SKIP if skip_decode_lock else 0
-        )
-
-        additional_ratio = 0
-        if mamba_extra_buffer_enabled():
-            # ping-pong buffer size is 2 when overlap schedule is on, 1 otherwise.
-            # Lazy mode saves 1 slot (2 → 1) for overlap; non-overlap already uses 1.
-            if not get_schedule().disable_overlap_schedule:
-                if mamba_extra_buffer_lazy_enabled():
-                    additional_ratio = MAMBA_CACHE_V2_ADDITIONAL_RATIO_OVERLAP_LAZY
-                else:
-                    additional_ratio = MAMBA_CACHE_V2_ADDITIONAL_RATIO_OVERLAP
-            else:
-                assert (
-                    not mamba_extra_buffer_lazy_enabled()
-                ), "Lazy extra buffer requires overlap schedule (--disable-overlap-schedule is incompatible)"
-                additional_ratio = MAMBA_CACHE_V2_ADDITIONAL_RATIO_NO_OVERLAP
-        elif skip_decode_lock:
-            # no_buffer under skip: add the base drop back so effective stays 3,
-            # the prefill->decode peak needs ~3 slots/req and this leaf-only mode
-            # has no ping-pong to absorb it.
-            additional_ratio = MAMBA_CACHE_V2_ADDITIONAL_RATIO_NO_BUFFER
-
-        return base + additional_ratio
+        try:
+            return calculate_mamba_slots_per_request(
+                disable_radix_cache=get_memory().disable_radix_cache,
+                skip_decode_lock=envs.SGLANG_OPT_MAMBA_SKIP_DECODE_LOCK.get(),
+                extra_buffer=mamba_extra_buffer_enabled(),
+                extra_buffer_lazy=mamba_extra_buffer_lazy_enabled(),
+                disable_overlap_schedule=get_schedule().disable_overlap_schedule,
+            )
+        except ValueError as exc:
+            raise AssertionError(str(exc)) from exc
 
     def _apply_token_constraints(self, token_capacity: int) -> int:
         """Apply external constraints to token capacity: user cap, PP sync.
@@ -2080,22 +2053,18 @@ class KVCacheConfigurator:
             # Solve jointly for max_mamba_cache_size (K), including the pool's
             # +1 padding slot on both buffers (see memory_pool.py):
             #   (K + 1) * per_req + (K / ratio + 1) * D * per_req = mamba_budget_bytes
-            mamba_budget = (
-                total_rest_memory
-                * get_schedule().mamba_full_memory_ratio
-                / (1 + get_schedule().mamba_full_memory_ratio)
-            )
-            mamba_budget_bytes = mamba_budget * (1 << 30)
-
             if has_spec_dec and not replayssm_active:
                 ratio = self._calculate_mamba_ratio()
                 D = get_spec().speculative_num_draft_tokens
                 # Joint solve: main_state + intermediate = mamba_budget
                 get_context().override(
                     "mamba_pool.memory_budget_spec",
-                    max_mamba_cache_size=int(
-                        (mamba_budget_bytes - per_req * (1 + D))
-                        // (per_req * (1 + D / ratio))
+                    max_mamba_cache_size=solve_auto_mamba_slots(
+                        total_available_bytes=int(total_rest_memory * (1 << 30)),
+                        mamba_full_memory_ratio=get_schedule().mamba_full_memory_ratio,
+                        state_bytes_per_slot=per_req,
+                        slots_per_request=ratio,
+                        speculative_draft_tokens=D,
                     ),
                 )
                 # Intermediate memory is included in mamba_budget, subtract it
@@ -2107,11 +2076,15 @@ class KVCacheConfigurator:
                 intermediate_size = per_req * (capped_reqs + 1) * D
                 total_rest_memory = total_rest_memory - (intermediate_size / (1 << 30))
             else:
-                per_slot = per_req + replayssm_ring_per_req
                 get_context().override(
                     "mamba_pool.memory_budget",
-                    max_mamba_cache_size=int(
-                        (mamba_budget_bytes - per_slot) // per_slot
+                    max_mamba_cache_size=solve_auto_mamba_slots(
+                        total_available_bytes=int(total_rest_memory * (1 << 30)),
+                        mamba_full_memory_ratio=get_schedule().mamba_full_memory_ratio,
+                        state_bytes_per_slot=per_req,
+                        slots_per_request=1,
+                        replay_ring_bytes_per_slot=replayssm_ring_per_req,
+                        replayssm_active=replayssm_active,
                     ),
                 )
 

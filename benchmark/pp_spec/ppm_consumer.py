@@ -6,7 +6,7 @@ Every PP rank of an SGLang server started with
 per scheduler iteration on a ``<base_ipc>.pp{r}.dp{d}`` ZMQ PUB endpoint.
 This tool subscribes to those endpoints (given directly, or discovered from
 the "PPM: ZMQ PUB bound on ..." server log lines), applies the
-work-conservation filter, and aggregates per-(rank, log2 batch-size bucket)
+work-conservation filter, and aggregates per-(rank, execution batch bucket)
 Welford statistics.  The resulting snapshot JSON is the input of
 ``stage_model.StageCostModel.fit``.
 
@@ -57,11 +57,61 @@ def _load_ppm_codec():
     return pp_stage_metrics
 
 
-def bucket_of(bs: int) -> int:
-    """Log2 bucket floor: 1, 2, 4, 8, ... for bs >= 1."""
+def default_capture_buckets(
+    max_bs: int, *, speculative: bool = True
+) -> tuple[int, ...]:
+    """Return SGLang's decode CUDA-graph capture buckets.
+
+    This mirrors ``ServerArgs._generate_decode_cuda_graph_batch_sizes`` so an
+    offline consumer and the runtime use the same shape key.  Custom graph
+    lists can still be supplied explicitly.
+    """
+    max_bs = int(max_bs)
+    if max_bs <= 0:
+        return ()
+    if speculative:
+        values = (
+            list(range(1, 9))
+            + list(range(10, 33, 2))
+            + list(range(40, 65, 4))
+            + list(range(72, 257, 8))
+            + list(range(272, max_bs + 1, 16))
+        )
+    else:
+        values = (
+            [1, 2, 4, 8, 12]
+            + list(range(16, 257, 8))
+            + list(range(272, min(max_bs, 512) + 1, 16))
+            + list(range(512, max_bs + 1, 32))
+        )
+    if max_bs not in values:
+        values.append(max_bs)
+    return tuple(sorted({value for value in values if 0 < value <= max_bs}))
+
+
+def bucket_of(bs: int, capture_buckets: Sequence[int] | None = None) -> int:
+    """Map a raw batch to an upper execution bucket.
+
+    With ``capture_buckets`` this is the same rule as CUDA graph dispatch.
+    Without CUDA graphs, the exact eager batch size is its own bucket.
+    """
     if bs <= 0:
         raise ValueError(f"bucket_of expects bs >= 1, got {bs}")
-    return 1 << (bs.bit_length() - 1)
+    if capture_buckets:
+        if isinstance(capture_buckets, str):
+            capture_values: Sequence[Any] = capture_buckets.split(",")
+        else:
+            capture_values = capture_buckets
+        choices = tuple(
+            sorted({int(value) for value in capture_values if int(value) > 0})
+        )
+        if not choices:
+            raise ValueError("capture_buckets must contain a positive value")
+        for value in choices:
+            if bs <= value:
+                return value
+        return choices[-1]
+    return bs
 
 
 class Welford:
@@ -162,8 +212,25 @@ class PpmAggregator:
     buckets; they only feed the idle-cadence statistics.
     """
 
-    def __init__(self, saturation_bs: int | None = None) -> None:
+    def __init__(
+        self,
+        saturation_bs: int | None = None,
+        capture_buckets: Sequence[int] | None = None,
+    ) -> None:
         self.saturation_bs = saturation_bs
+        if isinstance(capture_buckets, str):
+            capture_values: Sequence[Any] = capture_buckets.split(",")
+        else:
+            capture_values = capture_buckets or ()
+        self.capture_buckets = tuple(
+            sorted(
+                {
+                    int(value)
+                    for value in capture_values
+                    if int(value) > 0
+                }
+            )
+        )
         self.ranks: dict[int, RankStats] = {}
         self.messages_total = 0
         self.version_mismatches = 0
@@ -177,21 +244,16 @@ class PpmAggregator:
             return True
         if self.saturation_bs is None:
             return False
-        # saturation_bs counts GLOBAL running requests, but metrics.bs is the
-        # per-slot micro-batch size (running / pp_loop_size); compare against
-        # running_bs when the publisher provides it, and fall back to the
-        # per-slot comparison only for pre-running_bs snapshot producers.
-        running_bs = int(getattr(metrics, "running_bs", 0) or 0)
-        if running_bs > 0:
-            return running_bs >= self.saturation_bs
-        return metrics.bs >= self.saturation_bs
+        # saturation_bs counts global running requests; PPM v2 publishes the
+        # exact value rather than requiring a per-slot approximation.
+        return int(metrics.running_bs) >= self.saturation_bs
 
     def observe(self, metrics: Any) -> bool:
         """Record one decoded PpStageMetrics; returns True if it was kept."""
         self.messages_total += 1
-        version = int(getattr(metrics, "version", 1))
+        version = int(metrics.version)
         self.schema_version = max(self.schema_version, version)
-        loop_size = int(getattr(metrics, "pp_loop_size", 0) or 0)
+        loop_size = int(metrics.pp_loop_size)
         if loop_size > 0:
             self.pp_loop_size = max(self.pp_loop_size, loop_size)
         rank = self.ranks.setdefault(metrics.pp_rank, RankStats())
@@ -210,7 +272,7 @@ class PpmAggregator:
             rank.filtered_messages += 1
             return False
 
-        bucket = bucket_of(metrics.bs)
+        bucket = bucket_of(metrics.bs, self.capture_buckets)
         stats = rank.buckets.setdefault(bucket, BucketStats())
         stats.bs.add(float(metrics.bs))
         stats.wall_ms.add(metrics.wall_ms)
@@ -227,18 +289,19 @@ class PpmAggregator:
                 metrics.wall_ms - metrics.p2p_wait_ms,
             )
         )
-        stats.running_bs.add(float(getattr(metrics, "running_bs", 0) or 0))
+        stats.running_bs.add(float(metrics.running_bs))
         rank.messages_kept += 1
         return True
 
     def snapshot(self, endpoints: Sequence[str], duration_s: float) -> dict[str, Any]:
         return {
-            "version": 1,
+            "version": self.schema_version,
             "schema_version": self.schema_version,
             "pp_loop_size": self.pp_loop_size,
             "duration_s": duration_s,
             "endpoints": list(endpoints),
             "saturation_bs": self.saturation_bs,
+            "capture_buckets": list(self.capture_buckets),
             "messages_total": self.messages_total,
             "messages_kept": sum(rank.messages_kept for rank in self.ranks.values()),
             "version_mismatches": self.version_mismatches,
@@ -292,6 +355,7 @@ def collect(
     duration_s: float | None = None,
     max_messages: int | None = None,
     saturation_bs: int | None = None,
+    capture_buckets: Sequence[int] | None = None,
     context: Any = None,
 ) -> dict[str, Any]:
     """Subscribe to PPM endpoints and aggregate until a stop condition.
@@ -318,7 +382,9 @@ def collect(
         sockets.append(sock)
         poller.register(sock, zmq.POLLIN)
 
-    aggregator = PpmAggregator(saturation_bs=saturation_bs)
+    aggregator = PpmAggregator(
+        saturation_bs=saturation_bs, capture_buckets=capture_buckets
+    )
     started_s = time.monotonic()
     warned_version = False
     try:
@@ -342,11 +408,12 @@ def collect(
                     aggregator.version_mismatches += 1
                     if not warned_version:
                         logger.warning(
-                            "PPM schema version %d != consumer %d; decoding anyway",
+                            "discarding PPM schema version %d; consumer requires %d",
                             metrics.version,
                             ppm.PPM_VERSION,
                         )
                         warned_version = True
+                    continue
                 aggregator.observe(metrics)
     finally:
         for sock in sockets:
@@ -404,6 +471,13 @@ def build_parser() -> argparse.ArgumentParser:
             "num_queued > 0 iterations are kept"
         ),
     )
+    parser.add_argument(
+        "--capture-buckets",
+        help=(
+            "comma-separated upper CUDA-graph decode buckets; when omitted, "
+            "exact eager batch sizes are used"
+        ),
+    )
     parser.add_argument("-o", "--output", type=Path, help="snapshot JSON output path")
     parser.add_argument("--verbose", action="store_true")
     return parser
@@ -419,11 +493,19 @@ def main() -> None:
     logger.info("subscribing to %d endpoint(s):", len(endpoints))
     for endpoint in endpoints:
         logger.info("  %s", endpoint)
+    capture_buckets = None
+    if args.capture_buckets:
+        capture_buckets = tuple(
+            int(value.strip())
+            for value in args.capture_buckets.split(",")
+            if value.strip()
+        )
     snapshot = collect(
         endpoints,
         duration_s=args.duration_s,
         max_messages=args.max_messages,
         saturation_bs=args.saturation_bs,
+        capture_buckets=capture_buckets,
     )
     text = json.dumps(snapshot, indent=2) + "\n"
     if args.output:
