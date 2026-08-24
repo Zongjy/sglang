@@ -383,6 +383,7 @@ class Qwen2Model(nn.Module):
 
         # For EAGLE3 support
         self.layers_to_capture = []
+        self._dflash_capture_slots: Optional[Dict[int, int]] = None
 
     def get_input_embedding(self, input_ids: torch.Tensor) -> torch.Tensor:
         if hasattr(self.config, "scale_emb"):
@@ -392,6 +393,12 @@ class Qwen2Model(nn.Module):
 
     def get_input_embeddings(self) -> nn.Embedding:
         return self.embed_tokens
+
+    def set_dflash_layers_to_capture(self, layers_to_capture: List[int]) -> None:
+        self.layers_to_capture = list(layers_to_capture)
+        self._dflash_capture_slots = {
+            layer_id: slot for slot, layer_id in enumerate(self.layers_to_capture)
+        }
 
     def forward(
         self,
@@ -408,11 +415,14 @@ class Qwen2Model(nn.Module):
             else:
                 hidden_states = input_embeds
             residual = None
+            upstream_dflash_aux = None
         else:
             assert pp_proxy_tensors is not None
             hidden_states = pp_proxy_tensors["hidden_states"]
             residual = pp_proxy_tensors["residual"]
+            upstream_dflash_aux = pp_proxy_tensors.tensors.get("dspark_aux")
 
+        capture_dflash = self._dflash_capture_slots is not None
         aux_hidden_states = []
         for i in range(self.start_layer, self.end_layer):
             if i in self.layers_to_capture:
@@ -427,12 +437,15 @@ class Qwen2Model(nn.Module):
                 residual,
             )
         if not self.pp_group.is_last_rank:
-            return PPProxyTensors(
-                {
-                    "hidden_states": hidden_states,
-                    "residual": residual,
-                }
-            )
+            proxy = {
+                "hidden_states": hidden_states,
+                "residual": residual,
+            }
+            if capture_dflash:
+                proxy["dspark_aux"] = self._fill_dflash_aux_bank(
+                    upstream_dflash_aux, aux_hidden_states, hidden_states
+                )
+            return PPProxyTensors(proxy)
         else:
             if hidden_states.shape[0] != 0:
                 if residual is None:
@@ -440,10 +453,45 @@ class Qwen2Model(nn.Module):
                 else:
                     hidden_states, _ = self.norm(hidden_states, residual)
 
+        if capture_dflash:
+            aux_bank = self._fill_dflash_aux_bank(
+                upstream_dflash_aux, aux_hidden_states, hidden_states
+            )
+            aux_hidden_states = [
+                aux_bank[:, slot, :] for slot in range(aux_bank.shape[1])
+            ]
+
         if len(aux_hidden_states) == 0:
             return hidden_states
 
         return hidden_states, aux_hidden_states
+
+    def _fill_dflash_aux_bank(
+        self,
+        upstream_aux: Optional[torch.Tensor],
+        local_aux: List[torch.Tensor],
+        hidden_states: torch.Tensor,
+    ) -> torch.Tensor:
+        width = len(self.layers_to_capture)
+        if upstream_aux is not None and int(upstream_aux.shape[1]) == width:
+            bank = upstream_aux
+        else:
+            bank = torch.zeros(
+                (hidden_states.shape[0], width, hidden_states.shape[-1]),
+                dtype=hidden_states.dtype,
+                device=hidden_states.device,
+            )
+        assert self._dflash_capture_slots is not None
+        for layer_id, tensor in zip(self._local_dflash_capture_order(), local_aux):
+            bank[:, self._dflash_capture_slots[layer_id]].copy_(tensor)
+        return bank
+
+    def _local_dflash_capture_order(self) -> List[int]:
+        return [
+            layer_id
+            for layer_id in self.layers_to_capture
+            if self.start_layer <= layer_id < self.end_layer
+        ]
 
     # If this function is called, it should always initialize KV cache scale
     # factors (or else raise an exception). Thus, handled exceptions should

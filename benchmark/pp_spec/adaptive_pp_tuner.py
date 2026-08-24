@@ -449,7 +449,11 @@ def build_server_command(
     port: int,
     mamba_ratio: float | None = None,
 ) -> list[str]:
-    ratio = mamba_ratio if mamba_ratio is not None else args.mamba_full_memory_ratio
+    ratio = (
+        mamba_ratio
+        if mamba_ratio is not None
+        else getattr(args, "mamba_full_memory_ratio", None)
+    )
     command = [
         executable,
         "serve",
@@ -471,16 +475,16 @@ def build_server_command(
         str(args.page_size),
         "--random-seed",
         str(args.random_seed),
-        "--mamba-ssm-dtype",
-        args.mamba_ssm_dtype,
-        "--mamba-full-memory-ratio",
-        str(ratio),
         "--enable-metrics",
         "--host",
         args.host,
         "--port",
         str(port),
     ]
+    if getattr(args, "mamba_ssm_dtype", None) is not None:
+        command.extend(["--mamba-ssm-dtype", args.mamba_ssm_dtype])
+    if ratio is not None:
+        command.extend(["--mamba-full-memory-ratio", str(ratio)])
     explicit_capture = parse_capture_buckets(getattr(args, "capture_buckets", None))
     if explicit_capture:
         # Keep the collector and the server on exactly the same graph shape
@@ -1495,11 +1499,15 @@ def run_tp_comparison(
             return "n/a"
         return f"{entry['accept_len']:.2f}"
 
+    pp_ratio = best_ratio if best_ratio is not None else args.mamba_full_memory_ratio
+
+    def _ratio_text(value: float | None) -> str:
+        return "runtime default" if value is None else f"{value:g}"
+
     lines = [
         "PP vs TP comparison:",
         f"  runtime mamba ratio (not optimized): PP "
-        f"{best_ratio or args.mamba_full_memory_ratio:g}, "
-        f"TP {tp_ratio or args.mamba_full_memory_ratio:g}",
+        f"{_ratio_text(pp_ratio)}, TP {_ratio_text(tp_ratio)}",
         f"  native capacity: PP {','.join(map(str, best_partition))} "
         f"(cap {pp_cap}) {_tok(result['pp_native'])} vs "
         f"TP{tp_args.tp_size} (cap {tp_cap}) {_tok(result['tp_native'])}",
@@ -1606,6 +1614,11 @@ def format_gpu_plan(
 def run_tuner(args: argparse.Namespace) -> Path | None:
     if args.pp_size <= 0 or args.tp_size <= 0:
         raise TuningError("--pp-size and --tp-size must be positive.")
+    if (
+        args.mamba_full_memory_ratio is not None
+        and args.mamba_full_memory_ratio <= 0
+    ):
+        raise TuningError("--mamba-full-memory-ratio must be positive when set.")
     if args.block_size <= 0 or args.page_size <= 0 or args.cuda_graph_max_bs <= 0:
         raise TuningError(
             "--block-size, --page-size, and --cuda-graph-max-bs must be positive."
@@ -1740,7 +1753,10 @@ def run_tuner(args: argparse.Namespace) -> Path | None:
         best_ratio = None
         analysis = saved.get("analysis") or {}
         recommended = analysis.get("recommended") or {}
-        if tuple(recommended.get("partition") or ()) == best:
+        if (
+            args.mamba_full_memory_ratio is not None
+            and tuple(recommended.get("partition") or ()) == best
+        ):
             best_ratio = recommended.get("mamba_ratio")
         comparison = run_tp_comparison(
             args,
@@ -1863,7 +1879,11 @@ def run_tuner(args: argparse.Namespace) -> Path | None:
         best_partition=best,
         selection_reason=reason,
     )
-    best_ratio = analysis["recommended"].get("mamba_ratio")
+    best_ratio = (
+        analysis["recommended"].get("mamba_ratio")
+        if args.mamba_full_memory_ratio is not None
+        else None
+    )
     write_best_artifacts(
         args, run_dir, executable, selected, best, reason, mamba_ratio=best_ratio
     )
@@ -1899,12 +1919,19 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--cuda-graph-max-bs", type=int, default=32)
     parser.add_argument("--page-size", type=int, default=1)
     parser.add_argument("--random-seed", type=int, default=1)
-    parser.add_argument("--mamba-ssm-dtype", default="bfloat16")
+    parser.add_argument(
+        "--mamba-ssm-dtype",
+        choices=("float32", "bfloat16", "float16"),
+        help="optional SSM-state dtype override passed to the server",
+    )
     parser.add_argument(
         "--mamba-full-memory-ratio",
         type=float,
-        default=2.0,
-        help="fixed runtime Mamba/KV memory ratio used by the capacity model",
+        help=(
+            "optional runtime Mamba/KV memory-ratio override; when omitted, "
+            "SGLang resolves its default and the capacity model reads it from "
+            "the baseline log"
+        ),
     )
     parser.add_argument(
         "--concurrency",

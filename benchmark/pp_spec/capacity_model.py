@@ -385,7 +385,16 @@ def calibrate(
         raise CapacityModelError("mem_fraction_static must be in (0, 1]")
     if int(draft_tokens) < 0:
         raise CapacityModelError("draft_tokens must be non-negative")
-    ratio = float(2.0 if mamba_full_memory_ratio is None else mamba_full_memory_ratio)
+    if mamba_full_memory_ratio is None:
+        logged_ratio = _server_arg(baseline_log_text, "mamba_full_memory_ratio")
+        try:
+            ratio = float(2.0 if logged_ratio is None else logged_ratio)
+        except ValueError as exc:
+            raise CapacityModelError(
+                f"invalid logged mamba_full_memory_ratio={logged_ratio!r}"
+            ) from exc
+    else:
+        ratio = float(mamba_full_memory_ratio)
     if ratio <= 0:
         raise CapacityModelError("mamba_full_memory_ratio must be positive")
     if int(page_size) <= 0:

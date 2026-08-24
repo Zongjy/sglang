@@ -4,8 +4,10 @@ set -euo pipefail
 SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 REPO_ROOT=$(cd -- "$SCRIPT_DIR/../.." && pwd)
 
-MODEL=${MODEL:-Qwen/Qwen3.5-9B}
-DRAFT_MODEL=${DRAFT_MODEL:-z-lab/Qwen3.5-9B-DFlash}
+# MODEL=${MODEL:-Qwen/Qwen3.5-9B}
+# DRAFT_MODEL=${DRAFT_MODEL:-z-lab/Qwen3.5-9B-DFlash}
+MODEL=${MODEL:-Qwen/Qwen3-8B}
+DRAFT_MODEL=${DRAFT_MODEL:-z-lab/Qwen3-8B-DFlash-b16}
 DATASET=${DATASET:-$SCRIPT_DIR/data/sharegpt.json}
 GPUS=${GPUS:-0,1}
 PORT=${PORT:-31000}
@@ -14,8 +16,8 @@ RAGGED_VERIFY_MODE=${RAGGED_VERIFY_MODE:-static}
 LOAD_POINTS=${LOAD_POINTS:-4:1000:16,8:1000:32,16:1000:64,32:1000:128,64:1000:256,96:1000:384,128:1000:512}
 MAX_TOKENS=${MAX_TOKENS:-1024}
 PROMPT_MAX_TOKENS=${PROMPT_MAX_TOKENS:-2000}
-DFLASH_BLOCK_SIZE=${DFLASH_BLOCK_SIZE:-8}
-MEM_FRACTION_STATIC=${MEM_FRACTION_STATIC:-0.8}
+DFLASH_BLOCK_SIZE=${DFLASH_BLOCK_SIZE:-16}
+MEM_FRACTION_STATIC=${MEM_FRACTION_STATIC:-0.7}
 STARTUP_TIMEOUT=${STARTUP_TIMEOUT:-600}
 REQUEST_TIMEOUT_S=${REQUEST_TIMEOUT_S:-1800}
 COOLDOWN_S=${COOLDOWN_S:-10}
@@ -154,15 +156,15 @@ run_config() {
     --speculative-draft-attention-backend flashinfer
     --speculative-dflash-block-size "$DFLASH_BLOCK_SIZE"
     --attention-backend flashinfer
-    --linear-attn-backend triton
-    --enable-linear-replayssm-spec
+    # --linear-attn-backend triton
+    # --enable-linear-replayssm-spec
     --max-running-requests "$active_bs"
     --cuda-graph-max-bs-decode "$cuda_graph_bs"
     --mem-fraction-static "$MEM_FRACTION_STATIC"
     --page-size 1
     --random-seed 1
-    --mamba-ssm-dtype bfloat16
-    --mamba-full-memory-ratio 2.0
+    # --mamba-ssm-dtype bfloat16
+    # --mamba-full-memory-ratio 2.0
     --disable-radix-cache
     --trust-remote-code
     --host 127.0.0.1
@@ -263,8 +265,8 @@ for raw_load_point in "${load_point_list[@]}"; do
   # Extra arguments after "$point_tag" are appended directly to `sglang serve`.
   # -----------------------------------------------------------------------
   run_config tp2 2 1 "" "$load_point" "$active_bs" "$num_requests" "$point_tag"
-  run_config pp2_uniform 1 2 "16,16" "$load_point" "$active_bs" "$num_requests" "$point_tag"
-  run_config pp2_auto 1 2 "22,10" "$load_point" "$active_bs" "$num_requests" "$point_tag"
+  run_config pp2_uniform 1 2 "18,18" "$load_point" "$active_bs" "$num_requests" "$point_tag"
+  run_config pp2_auto 1 2 "23,13" "$load_point" "$active_bs" "$num_requests" "$point_tag"
 done
 
 if ((REPEATS == 1)) && [[ -f $SCRIPT_DIR/summarize_spectre_matrix.py ]]; then
