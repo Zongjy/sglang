@@ -133,6 +133,11 @@ class TritonAttnBackend(AttentionBackend):
     # can never carry more seqs than the pool.
     extend_dummy_seqs_capped_by_req_pool: bool = True
 
+    # The extend kernel already consumes qo_indptr.  Target-verify metadata
+    # below fills it from RaggedVerifyLayout, so variable query lengths are
+    # capture-safe as well as eager-safe.
+    supports_ragged_verify_graph: bool = True
+
     def __init__(
         self,
         model_runner: ModelRunner,
@@ -516,14 +521,26 @@ class TritonAttnBackend(AttentionBackend):
             and getattr(spec_info, "draft_token_num", None) is not None
         ):
             num_draft_tokens = int(spec_info.draft_token_num)
-        qo_indptr = self.qo_indptr[: bs + 1]
-        qo_indptr[: bs + 1] = torch.arange(
-            0,
-            (1 + bs) * num_draft_tokens,
-            step=num_draft_tokens,
-            dtype=torch.int32,
-            device=self.device,
+        layout = (
+            getattr(spec_info, "ragged_verify_layout", None)
+            if spec_info is not None
+            else None
         )
+        if layout is not None and (layout.bs != bs or layout.cap is None):
+            layout = layout.padded_to_bucket(padded_bs=bs, cap=num_draft_tokens)
+        qo_indptr = self.qo_indptr[: bs + 1]
+        if layout is None:
+            qo_indptr[: bs + 1] = torch.arange(
+                0,
+                (1 + bs) * num_draft_tokens,
+                step=num_draft_tokens,
+                dtype=torch.int32,
+                device=self.device,
+            )
+            query_lens = torch.full_like(seq_lens[:bs], num_draft_tokens)
+        else:
+            qo_indptr.copy_(layout.qo_indptr_device)
+            query_lens = layout.verify_lens
         kv_indptr = self._fill_kv_indptr_and_indices(
             bs, seq_lens, req_pool_indices, self.cuda_graph_kv_indices
         )
@@ -557,7 +574,7 @@ class TritonAttnBackend(AttentionBackend):
             custom_mask[: spec_info.custom_mask.shape[0]] = spec_info.custom_mask
         else:
             custom_mask = None
-        seq_mask_len = num_draft_tokens * (seq_lens + num_draft_tokens)
+        seq_mask_len = query_lens * (seq_lens[:bs] + query_lens)
         mask_indptr = self.mask_indptr[: bs + 1]
         mask_indptr[1 : bs + 1] = torch.cumsum(seq_mask_len, dim=0)
         return (
@@ -858,13 +875,27 @@ class TritonAttnBackend(AttentionBackend):
                 and getattr(spec_info, "draft_token_num", None) is not None
             ):
                 num_draft_tokens = int(spec_info.draft_token_num)
-            qo_indptr = torch.arange(
-                0,
-                (1 + bs) * num_draft_tokens,
-                step=num_draft_tokens,
-                dtype=torch.int32,
-                device=self.device,
+            layout = (
+                getattr(spec_info, "ragged_verify_layout", None)
+                if spec_info is not None
+                else None
             )
+            if layout is not None and layout.bs != bs:
+                layout = layout.padded_to_bucket(padded_bs=bs, cap=num_draft_tokens)
+            if layout is None:
+                qo_indptr = torch.arange(
+                    0,
+                    (1 + bs) * num_draft_tokens,
+                    step=num_draft_tokens,
+                    dtype=torch.int32,
+                    device=self.device,
+                )
+                query_lens = torch.full_like(
+                    forward_batch.seq_lens[:bs], num_draft_tokens
+                )
+            else:
+                qo_indptr = layout.qo_indptr_device
+                query_lens = layout.verify_lens
             # gpu_only: seq_lens_sum may be None; over-allocate is safe (ragged write).
             seq_lens_sum = forward_batch.seq_lens_sum
             if seq_lens_sum is None:
@@ -898,9 +929,7 @@ class TritonAttnBackend(AttentionBackend):
                 )
 
             custom_mask = spec_info.custom_mask
-            seq_mask_len = num_draft_tokens * (
-                forward_batch.seq_lens + num_draft_tokens
-            )
+            seq_mask_len = query_lens * (forward_batch.seq_lens[:bs] + query_lens)
             mask_indptr = self.mask_indptr
             mask_indptr[1 : bs + 1] = torch.cumsum(seq_mask_len[:bs], dim=0)
             mask_indptr = mask_indptr[: bs + 1]

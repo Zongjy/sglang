@@ -1113,9 +1113,11 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         # passes its own positions (uniform num_draft_tokens per request).
         if seq_positions is None:
             seq_positions = batch.spec_info.positions
-        seq_positions = seq_positions.view(batch_size, -1)
+        ragged_layout = getattr(batch.spec_info, "ragged_verify_layout", None)
+        seq_positions_flat = seq_positions.reshape(-1)
         # Split text-only and mixed batches here because SpecV2 text-only batches can avoid an extra D2H.
-        if all(mm_input is None for mm_input in mm_inputs):
+        text_only = all(mm_input is None for mm_input in mm_inputs)
+        if text_only:
             mrope_delta_tensor = torch.zeros(
                 (batch_size, 1), dtype=torch.int64, device=device
             )
@@ -1129,9 +1131,32 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
                 for i in range(batch_size)
             ]
             mrope_delta_tensor = torch.stack(mrope_deltas, dim=0).to(device=device)
-        next_input_positions = (
-            (seq_positions + mrope_delta_tensor).flatten().unsqueeze(0).repeat(3, 1)
-        )
+        if ragged_layout is None:
+            seq_positions_2d = seq_positions_flat.view(batch_size, -1)
+            positions_with_delta = (seq_positions_2d + mrope_delta_tensor).flatten()
+        elif text_only:
+            # Text-only Qwen3.5 D-Cut: positions are already packed in target
+            # query order; avoiding a request-id expansion also keeps this path
+            # allocation-light.
+            positions_with_delta = seq_positions_flat
+        else:
+            # Mixed multimodal ragged verify needs the owning request's MRoPE
+            # delta per compact row. Graph-bucket padding is a suffix outside
+            # qo_indptr[-1] and receives a harmless zero delta.
+            token_rows = torch.arange(
+                seq_positions_flat.numel(), device=device, dtype=torch.int32
+            )
+            req_ids = torch.searchsorted(
+                ragged_layout.qo_indptr_device[1:], token_rows, right=True
+            )
+            valid = req_ids < batch_size
+            safe_req_ids = req_ids.clamp(max=batch_size - 1)
+            token_deltas = mrope_delta_tensor.view(-1)[safe_req_ids]
+            token_deltas = torch.where(
+                valid, token_deltas, torch.zeros_like(token_deltas)
+            )
+            positions_with_delta = seq_positions_flat + token_deltas
+        next_input_positions = positions_with_delta.unsqueeze(0).repeat(3, 1)
 
         self.mrope_positions = next_input_positions
 

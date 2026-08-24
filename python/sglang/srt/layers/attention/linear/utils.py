@@ -4,12 +4,34 @@ from enum import Enum
 from typing import TYPE_CHECKING, Optional
 
 import msgspec
+import torch
 
 from sglang.srt.runtime_context import get_exec
 from sglang.srt.utils.common import rank0_log
 
 if TYPE_CHECKING:
     from sglang.srt.server_args import ServerArgs
+
+
+def ragged_verify_dense_scatter_indices(
+    *,
+    query_start_loc: torch.Tensor,
+    seq_len: int,
+    draft_token_num: int,
+) -> torch.Tensor:
+    """Map packed ragged verify rows into dense ``[bs, draft_token_num]`` slots.
+
+    Tokens outside a capped graph layout collapse into one ghost slot.  Linear
+    attention convolution uses the dense view, then gathers only covered rows
+    back into the packed target-forward order.
+    """
+    batch_size = query_start_loc.shape[0] - 1
+    token_pos = torch.arange(seq_len, device=query_start_loc.device, dtype=torch.int32)
+    token_slots = torch.searchsorted(query_start_loc[1:], token_pos, right=True)
+    return (
+        token_slots * draft_token_num
+        + (token_pos - query_start_loc[token_slots]).to(torch.int64)
+    ).clamp_(max=batch_size * draft_token_num)
 
 
 class LinearAttnKernelBackend(Enum):
@@ -90,10 +112,7 @@ def should_use_request_indexed_verify_scratch(server_args: ServerArgs) -> bool:
     executing lanes. Keying scratch by request slot removes that cross-lane race.
     """
     algorithm = (server_args.speculative_algorithm or "").upper()
-    return (
-        server_args.pp_size > 1
-        and algorithm in _PP_DEFERRED_MAMBA_COMMIT_ALGORITHMS
-    )
+    return server_args.pp_size > 1 and algorithm in _PP_DEFERRED_MAMBA_COMMIT_ALGORITHMS
 
 
 def resolve_linear_attn_backends(

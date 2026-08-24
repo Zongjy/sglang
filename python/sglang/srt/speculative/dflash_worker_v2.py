@@ -13,6 +13,10 @@ from sglang.kernels.ops.speculative.dflash import (
     _compute_dflash_accept_bonus_triton_unchecked,
     _prepare_dflash_draft_block_unchecked,
 )
+from sglang.kernels.ops.speculative.dspark.dspark_verify_window import (
+    BuildRaggedVerifyWindow,
+    ScatterCompactToStrided,
+)
 from sglang.srt.configs.hybrid_arch import mambaish_config
 from sglang.srt.distributed import get_tp_group
 from sglang.srt.distributed.parallel_state_wrapper import ParallelState
@@ -31,6 +35,12 @@ from sglang.srt.model_executor.forward_batch_info import (
 from sglang.srt.runtime_context import get_exec, get_schedule
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.base_spec_worker import BaseSpecWorker
+from sglang.srt.speculative.dflash_dcut import (
+    DFlashDcutEpilogue,
+    DFlashDcutPlanner,
+    dflash_dcut_batch_is_compactable,
+    dflash_dcut_enabled,
+)
 from sglang.srt.speculative.dflash_info import DFlashVerifyInput
 from sglang.srt.speculative.dflash_info_v2 import (
     DFlashDraftInputV2,
@@ -159,7 +169,15 @@ class _DflashDraftSampler:
     """
 
     def __init__(
-        self, *, weight, block_size, num_org, org_vocab_start, max_bs, tp_group=None
+        self,
+        *,
+        weight,
+        block_size,
+        num_org,
+        org_vocab_start,
+        max_bs,
+        tp_group=None,
+        compute_confidence: bool = False,
     ):
         self.weight = weight
         self.block_size = int(block_size)
@@ -167,10 +185,16 @@ class _DflashDraftSampler:
         self.org_vocab_start = int(org_vocab_start)
         self.tp_group = tp_group
         self.tp_size = int(tp_group.world_size) if tp_group is not None else 1
+        self.compute_confidence = bool(compute_confidence)
         max_tokens = int(max_bs) * (self.block_size - 1)
         device = weight.device
         # Proposed draft tokens: written in-graph, read by the worker after replay.
         self.out = torch.empty((max_tokens,), dtype=torch.int64, device=device)
+        self.confidence_out = (
+            torch.empty((max_tokens,), dtype=torch.float32, device=device)
+            if self.compute_confidence
+            else None
+        )
         if self.tp_size > 1:
             # Static buffers (fixed addresses) keep the in-graph select replay-safe.
             self.local_max = torch.empty(
@@ -179,17 +203,36 @@ class _DflashDraftSampler:
             self.local_arg = torch.empty(
                 (max_tokens,), dtype=torch.int64, device=device
             )
+            self.local_lse = (
+                torch.empty((max_tokens,), dtype=torch.float32, device=device)
+                if self.compute_confidence
+                else None
+            )
             self.gathered_max = torch.empty(
                 (self.tp_size * max_tokens,), dtype=weight.dtype, device=device
             )
             self.gathered_ids = torch.empty(
                 (self.tp_size * max_tokens,), dtype=torch.int64, device=device
             )
+            self.gathered_lse = (
+                torch.empty(
+                    (self.tp_size * max_tokens,),
+                    dtype=torch.float32,
+                    device=device,
+                )
+                if self.compute_confidence
+                else None
+            )
             self.best_rank = torch.empty(
                 (1, max_tokens), dtype=torch.int64, device=device
             )
             self.selected_ids = torch.empty(
                 (1, max_tokens), dtype=torch.int64, device=device
+            )
+            self.selected_max = (
+                torch.empty((1, max_tokens), dtype=weight.dtype, device=device)
+                if self.compute_confidence
+                else None
             )
 
     def __call__(self, hidden_states, input_ids=None):
@@ -203,25 +246,48 @@ class _DflashDraftSampler:
         n = hs.shape[0]
         logits = torch.matmul(hs, self.weight[: self.num_org].T)
         if self.tp_size == 1:
-            tokens = torch.argmax(logits, dim=-1).to(torch.long)
+            if self.compute_confidence:
+                max_values, tokens = torch.max(logits, dim=-1)
+            else:
+                tokens = torch.argmax(logits, dim=-1)
             if self.org_vocab_start:
                 tokens += self.org_vocab_start
             self.out[:n].copy_(tokens)
+            if self.compute_confidence:
+                log_normalizer = torch.logsumexp(logits, dim=-1).float()
+                self.confidence_out[:n].copy_(
+                    torch.exp(max_values.float() - log_normalizer)
+                )
             return
         local_max = self.local_max[:n]
         local_arg = self.local_arg[:n]
         torch.max(logits, dim=-1, out=(local_max, local_arg))
+        if self.compute_confidence:
+            local_lse = self.local_lse[:n]
+            local_lse.copy_(torch.logsumexp(logits, dim=-1).float())
         if self.org_vocab_start:
             local_arg.add_(self.org_vocab_start)
         gathered_max = self.gathered_max[: self.tp_size * n]
         gathered_ids = self.gathered_ids[: self.tp_size * n]
         self.tp_group.all_gather_into_tensor(gathered_max, local_max)
         self.tp_group.all_gather_into_tensor(gathered_ids, local_arg)
+        if self.compute_confidence:
+            gathered_lse = self.gathered_lse[: self.tp_size * n]
+            self.tp_group.all_gather_into_tensor(gathered_lse, local_lse)
         best_rank = self.best_rank[:, :n]
         torch.argmax(gathered_max.view(self.tp_size, n), dim=0, out=best_rank[0])
         selected = self.selected_ids[:, :n]
         torch.gather(gathered_ids.view(self.tp_size, n), 0, best_rank, out=selected)
         self.out[:n].copy_(selected.view(-1))
+        if self.compute_confidence:
+            selected_max = self.selected_max[:, :n]
+            torch.gather(
+                gathered_max.view(self.tp_size, n), 0, best_rank, out=selected_max
+            )
+            global_lse = torch.logsumexp(gathered_lse.view(self.tp_size, n), dim=0)
+            self.confidence_out[:n].copy_(
+                torch.exp(selected_max.view(-1).float() - global_lse)
+            )
 
 
 class DFlashWorkerV2(BaseSpecWorker):
@@ -331,6 +397,38 @@ class DFlashWorkerV2(BaseSpecWorker):
         # gather's implicit nonzero D2H + lengths.max().item()); keep it only
         # for platforms without GPU triton.
         self._use_triton_compact_rebuild = supports_gpu_triton
+
+        self._dcut_enabled = dflash_dcut_enabled(server_args.speculative_dflash_dcut)
+        self._dcut_planner: Optional[DFlashDcutPlanner] = None
+        self._dcut_epilogue: Optional[DFlashDcutEpilogue] = None
+        self._last_draft_confidence: Optional[torch.Tensor] = None
+        if self._dcut_enabled:
+            if SIMULATE_ACC_LEN > 1:
+                raise ValueError(
+                    "SGLANG_SIMULATE_ACC_LEN>1 is incompatible with DFLASH "
+                    "D-Cut because a forced acceptance can cross a pruned boundary."
+                )
+            self._dcut_planner = DFlashDcutPlanner(
+                value=server_args.speculative_dflash_dcut,
+                block_size=self.block_size,
+                model_runner=self.model_runner,
+                device=self.device,
+                tp_rank=self.ps.tp_rank,
+            )
+            self._dcut_epilogue = DFlashDcutEpilogue(
+                max_bs=max(get_exec().graph.cuda_graph_config.decode.bs),
+                block_size=self.block_size,
+                device=self.device,
+            )
+            self.model_runner.capture_tail_hooks.append(
+                self._dcut_epilogue.capture_hook
+            )
+            if self.ps.tp_rank == 0:
+                logger.info(
+                    "DFLASH D-Cut enabled (mode=%s, block_size=%d).",
+                    server_args.speculative_dflash_dcut,
+                    self.block_size,
+                )
 
     def _init_draft_side(
         self,
@@ -547,6 +645,7 @@ class DFlashWorkerV2(BaseSpecWorker):
             org_vocab_start=org_vocab_start,
             max_bs=max(get_exec().graph.cuda_graph_config.decode.bs),
             tp_group=tp_group if tp_group.world_size > 1 else None,
+            compute_confidence=self._dcut_enabled,
         )
 
     def _init_fused_kv_helper(self) -> None:
@@ -1200,6 +1299,146 @@ class DFlashWorkerV2(BaseSpecWorker):
 
         return out_tokens
 
+    def _greedy_sample_with_confidence_from_vocab_parallel_head(
+        self,
+        *,
+        hidden_states: torch.Tensor,
+        lm_head,
+        chunk_size: int = 256,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Greedy token ids and their normalized selected-token probability.
+
+        D-Cut ranks draft prefixes by the product of these probabilities.  For
+        TP vocab shards, both the maximum and the log-normalizer are reduced
+        across every shard, so all ranks obtain identical tokens/confidence.
+        """
+        num_tokens = int(hidden_states.shape[0])
+        out_tokens = torch.empty(
+            (num_tokens,), dtype=torch.int64, device=hidden_states.device
+        )
+        confidence = torch.empty(
+            (num_tokens,), dtype=torch.float32, device=hidden_states.device
+        )
+        if num_tokens == 0:
+            return out_tokens, confidence
+
+        weight = getattr(lm_head, "weight", None)
+        if not _is_dense_head_weight(weight):
+            if int(get_tp_group().world_size) != 1:
+                raise RuntimeError(
+                    "DFLASH D-Cut quantized lm_head confidence is only supported "
+                    "at tp=1."
+                )
+            num_org = int(getattr(lm_head, "org_vocab_size", 0)) or None
+            for start in range(0, num_tokens, int(chunk_size)):
+                end = min(num_tokens, start + int(chunk_size))
+                logits = lm_head.quant_method.apply(
+                    lm_head, hidden_states[start:end], None
+                )
+                if num_org is not None and logits.shape[-1] > num_org:
+                    logits = logits[:, :num_org]
+                max_values, token_ids = torch.max(logits, dim=-1)
+                out_tokens[start:end].copy_(token_ids)
+                confidence[start:end].copy_(
+                    torch.exp(
+                        max_values.float() - torch.logsumexp(logits, dim=-1).float()
+                    )
+                )
+            return out_tokens, confidence
+
+        tp_group = get_tp_group()
+        tp_size = int(tp_group.world_size)
+        weight_dtype = weight.dtype
+
+        if not hasattr(lm_head, "shard_indices"):
+            if tp_size != 1:
+                raise RuntimeError("DFLASH D-Cut needs lm_head.shard_indices for tp>1.")
+            for start in range(0, num_tokens, max(int(chunk_size), 1024)):
+                end = min(num_tokens, start + max(int(chunk_size), 1024))
+                hs = hidden_states[start:end]
+                if hs.dtype != weight_dtype:
+                    hs = hs.to(weight_dtype)
+                logits = torch.matmul(hs, weight.T)
+                max_values, token_ids = torch.max(logits, dim=-1)
+                out_tokens[start:end].copy_(token_ids)
+                confidence[start:end].copy_(
+                    torch.exp(
+                        max_values.float() - torch.logsumexp(logits, dim=-1).float()
+                    )
+                )
+            return out_tokens, confidence
+
+        shard = lm_head.shard_indices
+        num_org = int(shard.num_org_elements)
+        num_org_padded = int(shard.num_org_elements_padded)
+        num_added = int(shard.num_added_elements)
+        org_vocab_start = int(shard.org_vocab_start_index)
+        added_vocab_start = int(shard.added_vocab_start_index)
+
+        for start in range(0, num_tokens, int(chunk_size)):
+            end = min(num_tokens, start + int(chunk_size))
+            hs = hidden_states[start:end]
+            if hs.dtype != weight_dtype:
+                hs = hs.to(weight_dtype)
+            valid_logits = []
+            if num_org > 0:
+                valid_logits.append(torch.matmul(hs, weight[:num_org].T))
+            if num_added > 0:
+                valid_logits.append(
+                    torch.matmul(
+                        hs,
+                        weight[num_org_padded : num_org_padded + num_added].T,
+                    )
+                )
+            if not valid_logits:
+                raise RuntimeError("DFLASH lm_head shard contains no valid vocabulary.")
+            logits = (
+                valid_logits[0]
+                if len(valid_logits) == 1
+                else torch.cat(valid_logits, dim=-1)
+            )
+            local_max, local_arg = torch.max(logits, dim=-1)
+            local_lse = torch.logsumexp(logits, dim=-1).float()
+            is_base = local_arg < num_org
+            global_ids = torch.where(
+                is_base,
+                local_arg + org_vocab_start,
+                local_arg - num_org + added_vocab_start,
+            ).to(torch.int64)
+
+            chunk_len = end - start
+            if tp_size == 1:
+                out_tokens[start:end].copy_(global_ids)
+                confidence[start:end].copy_(torch.exp(local_max.float() - local_lse))
+                continue
+
+            gathered_max = torch.empty(
+                (tp_size * chunk_len,), dtype=local_max.dtype, device=hs.device
+            )
+            gathered_ids = torch.empty(
+                (tp_size * chunk_len,), dtype=torch.int64, device=hs.device
+            )
+            gathered_lse = torch.empty(
+                (tp_size * chunk_len,), dtype=torch.float32, device=hs.device
+            )
+            tp_group.all_gather_into_tensor(gathered_max, local_max.contiguous())
+            tp_group.all_gather_into_tensor(gathered_ids, global_ids.contiguous())
+            tp_group.all_gather_into_tensor(gathered_lse, local_lse.contiguous())
+            gathered_max = gathered_max.view(tp_size, chunk_len)
+            gathered_ids = gathered_ids.view(tp_size, chunk_len)
+            best_rank = torch.argmax(gathered_max, dim=0)
+            row = torch.arange(chunk_len, device=hs.device)
+            selected_max = gathered_max[best_rank, row]
+            out_tokens[start:end].copy_(gathered_ids[best_rank, row])
+            confidence[start:end].copy_(
+                torch.exp(
+                    selected_max.float()
+                    - torch.logsumexp(gathered_lse.view(tp_size, chunk_len), dim=0)
+                )
+            )
+
+        return out_tokens, confidence
+
     def _append_target_hidden_to_draft_kv_by_loc(
         self,
         *,
@@ -1771,20 +2010,40 @@ class DFlashWorkerV2(BaseSpecWorker):
         draft_logits_output = draft_out.logits_output
 
         if self._draft_sampler is not None and draft_out.can_run_graph:
-            draft_next = self._draft_sampler.out[
-                : bs * (int(self.block_size) - 1)
-            ].view(bs, int(self.block_size) - 1)
+            num_proposed = bs * (int(self.block_size) - 1)
+            draft_next = self._draft_sampler.out[:num_proposed].view(
+                bs, int(self.block_size) - 1
+            )
+            self._last_draft_confidence = (
+                self._draft_sampler.confidence_out[:num_proposed].view(
+                    bs, int(self.block_size) - 1
+                )
+                if self._dcut_enabled
+                else None
+            )
         else:
             draft_hidden = draft_logits_output.hidden_states
             if draft_hidden is None:
                 raise RuntimeError("DFLASH draft model returned no hidden states.")
             draft_hidden = draft_hidden.view(bs, int(self.block_size), -1)
-            draft_next = self._greedy_sample_from_vocab_parallel_head(
-                hidden_states=draft_hidden[:, 1:, :].reshape(
-                    -1, draft_hidden.shape[-1]
-                ),
-                lm_head=lm_head,
-            ).view(bs, int(self.block_size) - 1)
+            proposal_hidden = draft_hidden[:, 1:, :].reshape(-1, draft_hidden.shape[-1])
+            if self._dcut_enabled:
+                draft_next_flat, confidence_flat = (
+                    self._greedy_sample_with_confidence_from_vocab_parallel_head(
+                        hidden_states=proposal_hidden,
+                        lm_head=lm_head,
+                    )
+                )
+                draft_next = draft_next_flat.view(bs, int(self.block_size) - 1)
+                self._last_draft_confidence = confidence_flat.view(
+                    bs, int(self.block_size) - 1
+                )
+            else:
+                draft_next = self._greedy_sample_from_vocab_parallel_head(
+                    hidden_states=proposal_hidden,
+                    lm_head=lm_head,
+                ).view(bs, int(self.block_size) - 1)
+                self._last_draft_confidence = None
 
         draft_tokens = self._draft_block_tokens_buf[:bs]
         draft_tokens[:, 0].copy_(block_ids[:, 0])
@@ -1902,7 +2161,6 @@ class DFlashWorkerV2(BaseSpecWorker):
             pp_raw.prepare_local_sampling_metadata(batch.reqs)
 
         return block_ids, positions_2d, verify_out_cache_loc_2d, draft_tokens
-
 
     def forward_batch_generation(
         self,
@@ -2034,6 +2292,11 @@ class DFlashWorkerV2(BaseSpecWorker):
         # --- 1) Draft a fixed block with the draft model (non-PP / last PP
         # rank), or rebuild it from the raw relayed through the PP ring.
         prefix_lens = batch.seq_lens
+        dcut_timing_start = (
+            self._dcut_planner.start_step_timing()
+            if self._dcut_planner is not None
+            else None
+        )
         if pp_raw is not None:
             block_ids, positions_2d, verify_out_cache_loc_2d, draft_tokens = (
                 self._rebuild_block_from_pp_raw(pp_raw=pp_raw, batch=batch, bs=bs)
@@ -2052,6 +2315,18 @@ class DFlashWorkerV2(BaseSpecWorker):
         positions = positions_2d.reshape(-1)
         verify_out_cache_loc = verify_out_cache_loc_2d.reshape(-1)
 
+        dcut_plan = None
+        if self._dcut_planner is not None:
+            confidence = self._last_draft_confidence
+            if confidence is None:
+                raise RuntimeError(
+                    "DFLASH D-Cut draft proposal did not produce confidence."
+                )
+            dcut_plan = self._dcut_planner.plan(
+                confidence=confidence,
+                force_full=not dflash_dcut_batch_is_compactable(batch),
+            )
+
         # Must stay ahead of the target verify launch below.
         grammar_tree = (
             GrammarTree.from_linear_chain(draft_tokens) if batch.has_grammar else None
@@ -2061,31 +2336,64 @@ class DFlashWorkerV2(BaseSpecWorker):
         # TARGET_VERIFY uses standard causal masking; custom masks are unnecessary here.
         custom_mask = None
 
-        verify_input_ids = draft_tokens.reshape(-1)
+        if dcut_plan is not None:
+            ragged_window = BuildRaggedVerifyWindow.execute(
+                batch=batch,
+                layout=dcut_plan.layout,
+                draft_block_ids=block_ids,
+                draft_tokens=draft_tokens[:, 1:].contiguous(),
+                bs=bs,
+                device=device,
+                verify_num_draft_tokens=int(self.block_size),
+                model_runner=self.model_runner,
+            )
+            verify_input_ids = ragged_window.verify_ids
+            target_positions = ragged_window.positions
+            target_out_cache_loc = ragged_window.verify_cache_loc
+        else:
+            verify_input_ids = draft_tokens.reshape(-1)
+            target_positions = positions
+            target_out_cache_loc = verify_out_cache_loc
         verify_input = DFlashVerifyInput(
             draft_token=verify_input_ids,
-            positions=positions,
+            positions=target_positions,
             draft_token_num=int(self.block_size),
             custom_mask=custom_mask,
             capture_hidden_mode=CaptureHiddenMode.FULL,
+            ragged_verify_layout=(dcut_plan.layout if dcut_plan is not None else None),
         )
 
-        batch.out_cache_loc = verify_out_cache_loc
+        batch.out_cache_loc = target_out_cache_loc
         sampling_info = batch.sampling_info
+
+        if dcut_plan is not None:
+            assert self._dcut_epilogue is not None
+            self._dcut_epilogue.begin_step(dcut_plan.layout.verify_lens)
 
         seq_lens_pre_verify = (
             batch.seq_lens.clone() if self._need_mamba_verify_commit else None
         )
         seq_lens_cpu_backup = batch.seq_lens_cpu
         seq_lens_sum_backup = batch.seq_lens_sum
-        if seq_lens_cpu_backup is not None:
-            # Verify host bound = committed prefix + one verify block (matches draft).
-            verify_host_seq_lens = seq_lens_cpu_backup + int(self.block_size)
-            batch.seq_lens_cpu = verify_host_seq_lens
-            batch.seq_lens_sum = int(verify_host_seq_lens.sum())
-        elif draft_input.reserved_seq_lens_cpu is not None:
-            batch.seq_lens_cpu = draft_input.reserved_seq_lens_cpu
-            batch.seq_lens_sum = int(draft_input.reserved_seq_lens_sum)
+        backend_needs_cpu_lens = bool(
+            getattr(self.model_runner.attn_backend, "needs_cpu_seq_lens", True)
+        )
+        if backend_needs_cpu_lens:
+            if seq_lens_cpu_backup is not None:
+                if dcut_plan is None:
+                    verify_lens_cpu = torch.full_like(
+                        seq_lens_cpu_backup, int(self.block_size)
+                    )
+                else:
+                    verify_lens_cpu = dcut_plan.layout.verify_lens.to(
+                        device="cpu", dtype=seq_lens_cpu_backup.dtype
+                    )
+                verify_host_seq_lens = seq_lens_cpu_backup + verify_lens_cpu
+                batch.seq_lens_cpu = verify_host_seq_lens
+                batch.seq_lens_sum = int(verify_host_seq_lens.sum())
+            elif draft_input.reserved_seq_lens_cpu is not None:
+                batch.seq_lens_cpu = draft_input.reserved_seq_lens_cpu
+                batch.seq_lens_sum = int(draft_input.reserved_seq_lens_sum)
 
         verify_forward_batch, _ = verify_input.prepare_for_verify(
             batch, self.target_worker
@@ -2100,6 +2408,8 @@ class DFlashWorkerV2(BaseSpecWorker):
             skip_attn_backend_init=True,
             pp_proxy_tensors=pp_proxy_tensors,
         )
+        if self._dcut_planner is not None:
+            self._dcut_planner.finish_step_timing(bs=bs, start=dcut_timing_start)
         logits_output = target_out.logits_output
         can_run_cuda_graph = target_out.can_run_cuda_graph
 
@@ -2109,9 +2419,9 @@ class DFlashWorkerV2(BaseSpecWorker):
         # scheduler, which forwards it to the next PP stage.
         if self._pp_enabled and not self._pp_is_last_rank:
             pp_proxy_out = target_out.pp_hidden_states_proxy_tensors
-            assert pp_proxy_out is not None, (
-                "non-last PP rank must relay proxy hidden downstream"
-            )
+            assert (
+                pp_proxy_out is not None
+            ), "non-last PP rank must relay proxy hidden downstream"
             return GenerationBatchResult(
                 pp_hidden_states_proxy_tensors=pp_proxy_out,
                 next_token_ids=torch.empty((0,), dtype=torch.int64, device=device),
@@ -2119,6 +2429,43 @@ class DFlashWorkerV2(BaseSpecWorker):
                 speculative_num_draft_tokens=int(self.block_size),
                 pp_verify_input_raw=None,
             )
+
+        target_predict = None
+        hidden_strided = None
+        if dcut_plan is not None:
+            dense_rows = bs * int(self.block_size)
+            if dcut_plan.is_compact:
+                if can_run_cuda_graph:
+                    assert self._dcut_epilogue is not None
+                    target_predict, hidden_strided = self._dcut_epilogue.read(bs)
+                else:
+                    compact_top1 = torch.argmax(
+                        logits_output.next_token_logits, dim=-1
+                    ).view(-1, 1)
+                    target_predict = ScatterCompactToStrided.execute(
+                        compact=compact_top1,
+                        layout=dcut_plan.layout,
+                        fill_value=-1,
+                        verify_num_draft_tokens=int(self.block_size),
+                    ).view(bs, int(self.block_size))
+                    if logits_output.hidden_states is None:
+                        raise RuntimeError(
+                            "DFLASH D-Cut verify requires target hidden states."
+                        )
+                    hidden_strided = ScatterCompactToStrided.execute(
+                        compact=logits_output.hidden_states,
+                        layout=dcut_plan.layout,
+                        fill_value=0.0,
+                        verify_num_draft_tokens=int(self.block_size),
+                    )
+            else:
+                # Full-width D-Cut still rides the token-keyed graph. Padding,
+                # when present, is a suffix after the B dense request rows.
+                logits_output.next_token_logits = logits_output.next_token_logits[
+                    :dense_rows
+                ]
+                if logits_output.hidden_states is not None:
+                    hidden_strided = logits_output.hidden_states[:dense_rows]
 
         grammar_mask = None
         if batch.has_grammar:
@@ -2130,7 +2477,9 @@ class DFlashWorkerV2(BaseSpecWorker):
                 barrier=grammar_barrier,
             )
 
-        if sampling_info is not None:
+        if sampling_info is not None and not (
+            dcut_plan is not None and dcut_plan.is_compact
+        ):
             apply_dflash_verify_logits_adjustments(
                 next_token_logits=logits_output.next_token_logits,
                 sampling_info=sampling_info,
@@ -2145,7 +2494,6 @@ class DFlashWorkerV2(BaseSpecWorker):
         new_seq_lens = None
         # Only the greedy branch sets target_predict; the simulated-acceptance
         # override below checks for it.
-        target_predict = None
         if (
             sampling_info is not None
             and not sampling_info.is_all_greedy
@@ -2167,10 +2515,13 @@ class DFlashWorkerV2(BaseSpecWorker):
             out_tokens[:, int(self.block_size) - 1].fill_(0)
             out_tokens.scatter_(1, accept_len.to(torch.int64)[:, None], bonus[:, None])
         else:
-            target_predict = torch.argmax(logits_output.next_token_logits, dim=-1).view(
-                bs, int(self.block_size)
-            )
-            if self._use_triton_accept_bonus:
+            if target_predict is None:
+                target_predict = torch.argmax(
+                    logits_output.next_token_logits, dim=-1
+                ).view(bs, int(self.block_size))
+            if self._use_triton_accept_bonus and not (
+                dcut_plan is not None and dcut_plan.is_compact
+            ):
                 try:
                     (
                         accept_len,
@@ -2198,6 +2549,11 @@ class DFlashWorkerV2(BaseSpecWorker):
                     accept_len, bonus = compute_dflash_correct_drafts_and_bonus(
                         candidates=candidates,
                         target_predict=target_predict,
+                        verify_lens=(
+                            dcut_plan.layout.verify_lens
+                            if dcut_plan is not None and dcut_plan.is_compact
+                            else None
+                        ),
                     )
                     commit_lens = accept_len.to(torch.int32) + 1  # [bs]
                     out_tokens = torch.empty(
@@ -2217,6 +2573,11 @@ class DFlashWorkerV2(BaseSpecWorker):
                 accept_len, bonus = compute_dflash_correct_drafts_and_bonus(
                     candidates=candidates,
                     target_predict=target_predict,
+                    verify_lens=(
+                        dcut_plan.layout.verify_lens
+                        if dcut_plan is not None and dcut_plan.is_compact
+                        else None
+                    ),
                 )
                 commit_lens = accept_len.to(torch.int32) + 1  # [bs]
                 out_tokens = torch.empty(
@@ -2285,7 +2646,11 @@ class DFlashWorkerV2(BaseSpecWorker):
             )
 
         # --- 3) Materialize committed verify-input tokens into draft KV cache.
-        hidden = logits_output.hidden_states
+        hidden = (
+            hidden_strided
+            if hidden_strided is not None
+            else logits_output.hidden_states
+        )
         if hidden is None:
             raise RuntimeError(
                 "DFLASH verify requires target hidden states, but got None."
@@ -2322,9 +2687,9 @@ class DFlashWorkerV2(BaseSpecWorker):
             )
             pp_raw_out = DFlashPPVerifyInputRaw(
                 bonus_tokens=bonus.to(device=device, dtype=torch.int64),
-                draft_tokens=next_draft_tokens[
-                    :, 1:
-                ].to(device=device, dtype=torch.int64).clone(),
+                draft_tokens=next_draft_tokens[:, 1:]
+                .to(device=device, dtype=torch.int64)
+                .clone(),
                 accept_lens=commit_lens.to(device=device, dtype=torch.int64),
                 accept_index=None,
             )
@@ -2333,6 +2698,7 @@ class DFlashWorkerV2(BaseSpecWorker):
             logits_output=logits_output,
             next_token_ids=out_tokens.reshape(-1),
             accept_lens=commit_lens,
+            cap_lens=(dcut_plan.layout.verify_lens if dcut_plan is not None else None),
             can_run_cuda_graph=can_run_cuda_graph,
             next_draft_input=next_draft_input,
             speculative_num_draft_tokens=int(self.block_size),

@@ -649,14 +649,19 @@ def can_dflash_use_fused_qkv_proj(qkv_proj: Any) -> Tuple[bool, str]:
 def _fused_correct_drafts_and_bonus_kernel(
     candidates_ptr,
     target_predict_ptr,
+    verify_lens_ptr,
     num_correct_drafts_ptr,
     bonus_tokens_ptr,
     block_size,
+    has_verify_lens: tl.constexpr,
     BLOCK: tl.constexpr,
 ):
     b = tl.program_id(0).to(tl.int64)
     offs = tl.arange(0, BLOCK)
-    in_row = offs < block_size - 1
+    max_correct = block_size - 1
+    if has_verify_lens:
+        max_correct = tl.load(verify_lens_ptr + b).to(tl.int32) - 1
+    in_row = offs < max_correct
     drafts = tl.load(candidates_ptr + b * block_size + 1 + offs, mask=in_row, other=-1)
     targets = tl.load(target_predict_ptr + b * block_size + offs, mask=in_row, other=-2)
     eq = (drafts == targets) & in_row
@@ -672,6 +677,7 @@ def compute_dflash_correct_drafts_and_bonus(
     *,
     candidates: torch.Tensor,
     target_predict: torch.Tensor,
+    verify_lens: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Compute DFlash accept lengths and bonus tokens (greedy verify rule).
 
@@ -702,6 +708,18 @@ def compute_dflash_correct_drafts_and_bonus(
         raise ValueError(f"batch size must be positive, got {bs}.")
     if block_size <= 0:
         raise ValueError(f"block_size must be positive, got {block_size}.")
+    if verify_lens is not None:
+        if verify_lens.shape != (bs,):
+            raise ValueError(
+                f"verify_lens must have shape {(bs,)}, got {tuple(verify_lens.shape)}."
+            )
+        if not verify_lens.is_cuda and torch.any(
+            (verify_lens < 1) | (verify_lens > block_size)
+        ):
+            raise ValueError(f"verify_lens values must be in [1, {block_size}].")
+        verify_lens = verify_lens.to(
+            device=candidates.device, dtype=torch.int32
+        ).contiguous()
 
     if candidates.is_cuda:
         num_correct_drafts = torch.empty(
@@ -711,14 +729,19 @@ def compute_dflash_correct_drafts_and_bonus(
         _fused_correct_drafts_and_bonus_kernel[(bs,)](
             candidates.contiguous(),
             target_predict.contiguous(),
+            verify_lens,
             num_correct_drafts,
             bonus_tokens,
             block_size,
+            has_verify_lens=verify_lens is not None,
             BLOCK=triton.next_power_of_2(max(block_size - 1, 1)),
         )
         return num_correct_drafts, bonus_tokens
 
     matches = candidates[:, 1:] == target_predict[:, :-1]
+    if verify_lens is not None:
+        positions = torch.arange(block_size - 1, device=candidates.device)
+        matches = matches & (positions.unsqueeze(0) < (verify_lens - 1).unsqueeze(1))
     correct_len = matches.to(torch.int32).cumprod(dim=1).sum(dim=1)
     bonus = target_predict[torch.arange(bs, device=target_predict.device), correct_len]
     return correct_len.to(torch.int32), bonus.to(torch.int64)

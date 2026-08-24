@@ -263,9 +263,7 @@ class SchedulerMetricsReporter:
             def _ppm_draft_reporter(t, **_kwargs):
                 self._ppm_gpu_draft_acc += t
 
-            self.draft_forward_device_timer = DeviceTimer(
-                reporter=_ppm_draft_reporter
-            )
+            self.draft_forward_device_timer = DeviceTimer(reporter=_ppm_draft_reporter)
         else:
             logger.warning(
                 "PPM enabled but SGLANG_ENABLE_METRICS_DEVICE_TIMER is off; "
@@ -336,7 +334,6 @@ class SchedulerMetricsReporter:
         if publisher is not None:
             publisher.shutdown()
             self.scheduler._ppm_publisher = None
-
 
     def _init_fpm(self):
         """Initialize Forward Pass Metrics (FPM) publisher if configured."""
@@ -918,7 +915,15 @@ class SchedulerMetricsReporter:
                 draft_per_round = get_spec().speculative_num_draft_tokens - 1
             else:
                 draft_per_round = get_spec().speculative_num_steps or 0
-            total_draft_tokens = self.spec_num_forward_ct * draft_per_round
+            dcut = get_spec().speculative_dflash_dcut
+            uses_dcut = dcut == "auto" or (
+                not isinstance(dcut, str) and float(dcut) != 0.0
+            )
+            total_draft_tokens = (
+                max(0, self.spec_num_cap_tokens - self.spec_num_forward_ct)
+                if uses_dcut and self.spec_num_cap_tokens > 0
+                else self.spec_num_forward_ct * draft_per_round
+            )
             spec_accept_rate = (
                 num_correct_drafts / total_draft_tokens if total_draft_tokens > 0 else 0
             )
@@ -938,12 +943,20 @@ class SchedulerMetricsReporter:
                 and read_ragged_verify_mode() is RaggedVerifyMode.CAP_ACCEPT
                 else 0
             )
+            dcut_keep_ratio = None
+            if uses_dcut and self.spec_num_cap_tokens > 0:
+                full_verify_tokens = self.spec_num_forward_ct * (
+                    get_spec().speculative_num_draft_tokens or 1
+                )
+                dcut_keep_ratio = self.spec_num_cap_tokens / full_verify_tokens
             self.spec_total_num_accept_tokens += self.spec_num_accept_tokens
             self.spec_total_num_forward_ct += self.spec_num_forward_ct
             self.spec_num_accept_tokens = self.spec_num_forward_ct = 0
             self.spec_num_block_accept_tokens = 0
             self.spec_num_cap_tokens = 0
             msg += f"accept len: {spec_accept_length:.2f}, accept rate: {spec_accept_rate:.2f}, "
+            if dcut_keep_ratio is not None:
+                msg += f"D-Cut keep ratio: {dcut_keep_ratio:.3f}, "
             if spec_cap_length > 0:
                 msg += f"cap len: {spec_cap_length:.2f}, "
             if spec_block_accept_length > 0:

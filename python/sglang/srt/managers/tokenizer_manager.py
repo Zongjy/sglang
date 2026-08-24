@@ -2783,10 +2783,28 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             and hasattr(recv_obj, "spec_num_correct_drafts")
             and len(recv_obj.spec_num_correct_drafts) > i
         ):
-            # Total number of proposed draft tokens per request.
-            num_proposed_drafts = recv_obj.spec_verify_ct[i] * (
-                self.server_args.speculative_num_draft_tokens - 1
+            # Total number of draft tokens actually sent to the verifier.
+            # D-Cut's cap counter stores verify queries including one mandatory
+            # anchor per round; ordinary spec decode keeps the fixed-width rule.
+            dcut = self.server_args.speculative_dflash_dcut
+            uses_dcut = dcut == "auto" or (
+                not isinstance(dcut, str) and float(dcut) != 0.0
             )
+            cap_tokens = getattr(recv_obj, "spec_num_cap_tokens", None)
+            if uses_dcut and cap_tokens is not None and len(cap_tokens) > i:
+                num_proposed_drafts = max(0, cap_tokens[i] - recv_obj.spec_verify_ct[i])
+                full_verify_tokens = recv_obj.spec_verify_ct[i] * (
+                    self.server_args.speculative_num_draft_tokens
+                )
+                meta_info["spec_dcut_keep_ratio"] = (
+                    cap_tokens[i] / full_verify_tokens
+                    if full_verify_tokens > 0
+                    else 0.0
+                )
+            else:
+                num_proposed_drafts = recv_obj.spec_verify_ct[i] * (
+                    self.server_args.speculative_num_draft_tokens - 1
+                )
             num_correct_drafts = recv_obj.spec_num_correct_drafts[i]
 
             # Calculate per-request acceptance rate and average acceptance length.

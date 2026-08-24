@@ -131,6 +131,11 @@ if TYPE_CHECKING:
 def ragged_verify_compact_graphs_enabled(spec_algorithm: SpeculativeAlgorithm) -> bool:
     if not spec_algorithm.supports_ragged_verify():
         return False
+    if spec_algorithm.is_dflash():
+        # D-Cut is intrinsically a compact ragged-verify mode. Keep ordinary
+        # DFlash unchanged and do not require DSpark's environment knob.
+        dcut = get_spec().speculative_dflash_dcut
+        return dcut == "auto" or (not isinstance(dcut, str) and float(dcut) != 0)
     from sglang.srt.speculative.ragged_verify import ragged_verify_compact_enabled
 
     return ragged_verify_compact_enabled()

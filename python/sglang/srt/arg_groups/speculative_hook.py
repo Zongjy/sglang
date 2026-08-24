@@ -162,6 +162,29 @@ def _handle_dflash(server_args: ServerArgs) -> None:
             "DFLASH speculative decoding requires setting --speculative-draft-model-path."
         )
 
+    dcut = server_args.speculative_dflash_dcut
+    dcut_enabled = dcut == "auto" or (not isinstance(dcut, str) and float(dcut) != 0)
+    if isinstance(dcut, str) and dcut != "auto":
+        raise ValueError(
+            '--speculative-dflash-dcut must be a ratio in [0, 1] or "auto", '
+            f"got {dcut!r}."
+        )
+    if not isinstance(dcut, str) and not 0.0 <= float(dcut) <= 1.0:
+        raise ValueError(
+            "--speculative-dflash-dcut must be in [0, 1], " f"got {dcut!r}."
+        )
+    if dcut_enabled:
+        if server_args.pp_size > 1:
+            raise ValueError(
+                "DFLASH D-Cut does not support pipeline parallelism yet. "
+                "Use --pp-size 1."
+            )
+        if not server_args.device.startswith("cuda"):
+            raise ValueError(
+                "DFLASH D-Cut currently requires a CUDA target because its compact "
+                "verify selector and graph path use Triton CUDA kernels."
+            )
+
     # DFLASH does not use EAGLE-style `num_steps`/`topk`, but those fields still
     # affect generic scheduler/KV-cache accounting (buffer sizing, KV freeing,
     # RoPE reservation). Force them to 1 to avoid surprising memory behavior.
@@ -237,6 +260,12 @@ def _handle_dflash(server_args: ServerArgs) -> None:
                 inferred_block_size,
             )
         server_args.speculative_num_draft_tokens = inferred_block_size
+
+    if dcut_enabled and int(server_args.speculative_num_draft_tokens) < 2:
+        raise ValueError(
+            "DFLASH D-Cut requires a verify block with at least one draft token "
+            "in addition to the anchor (block_size >= 2)."
+        )
 
     if server_args.speculative_draft_window_size is not None:
         draft_tokens = int(server_args.speculative_num_draft_tokens)

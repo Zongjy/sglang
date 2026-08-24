@@ -107,6 +107,21 @@ from sglang.utils import is_in_ci
 
 logger = logging.getLogger(__name__)
 
+
+def parse_dflash_dcut(value: Union[str, float, int]) -> Union[float, Literal["auto"]]:
+    """Parse ``--speculative-dflash-dcut`` without accepting arbitrary strings."""
+    if isinstance(value, str):
+        value = value.strip()
+        if value == "auto":
+            return "auto"
+    try:
+        return float(value)
+    except (TypeError, ValueError) as exc:
+        raise argparse.ArgumentTypeError(
+            'expected a ratio in [0, 1] or "auto"'
+        ) from exc
+
+
 # Define constants
 DEFAULT_UVICORN_ACCESS_LOG_EXCLUDE_PREFIXES = ()
 
@@ -2096,6 +2111,20 @@ class ServerArgs:
         "DFLASH only. Block size (verify window length). Alias of --speculative-num-draft-tokens for DFLASH.",
         NS("spec"),
     ] = None
+    speculative_dflash_dcut: A[
+        Union[float, Literal["auto"]],
+        Arg(
+            help=(
+                "DFLASH only. Enable D-Cut adaptive verification-depth pruning. "
+                "A float in [0, 1] keeps that fraction of target verify query "
+                "tokens globally across the batch (including one mandatory anchor "
+                "per request); 'auto' selects among 1/4, 1/2, 3/4, and full using "
+                "an online runtime cost model. 0 disables D-Cut."
+            ),
+            type_parser=parse_dflash_dcut,
+        ),
+        NS("spec"),
+    ] = 0.0
     speculative_dspark_block_size: A[
         Optional[int],
         "DSPARK only. Draft block size gamma (number of proposed draft tokens). The verify window is gamma + 1, so this sets --speculative-num-draft-tokens = gamma + 1. Omit to auto-infer gamma from the draft checkpoint block_size.",
