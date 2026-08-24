@@ -60,6 +60,7 @@ class RequestResult:
     prompt_tokens: int | None
     accept_length: float | None
     server_accept_length: float | None
+    dcut_keep_ratio: float | None
     spec_verify_ct: int | None
     spec_num_correct_drafts: int | None
     error: str | None = None
@@ -86,6 +87,8 @@ class PointSummary:
     accept_length_p50: float | None
     accept_length_p90: float | None
     accept_length_p99: float | None
+    mean_dcut_keep_ratio: float | None
+    weighted_dcut_keep_ratio: float | None
     spec_metric_requests: int
     total_spec_verify_ct: int
     total_spec_num_correct_drafts: int
@@ -103,6 +106,7 @@ class RequestMetricState:
     completion_tokens: int | None = None
     prompt_tokens: int | None = None
     server_accept_length: float | None = None
+    dcut_keep_ratio: float | None = None
     spec_verify_ct: int | None = None
     spec_num_correct_drafts: int | None = None
     finished: bool = False
@@ -134,9 +138,7 @@ class RequestMetricState:
             meta.get("spec_verify_ct"), "spec_verify_ct"
         )
         if spec_verify_ct is not None:
-            _ensure_monotonic(
-                self.spec_verify_ct, spec_verify_ct, "spec_verify_ct"
-            )
+            _ensure_monotonic(self.spec_verify_ct, spec_verify_ct, "spec_verify_ct")
             self.spec_verify_ct = spec_verify_ct
 
         spec_num_correct_drafts = _optional_nonnegative_int(
@@ -153,6 +155,10 @@ class RequestMetricState:
         server_accept_length = meta.get("spec_accept_length")
         if server_accept_length is not None:
             self.server_accept_length = float(server_accept_length)
+
+        dcut_keep_ratio = meta.get("spec_dcut_keep_ratio")
+        if dcut_keep_ratio is not None:
+            self.dcut_keep_ratio = float(dcut_keep_ratio)
 
         if meta.get("finish_reason") is not None:
             self.finished = True
@@ -314,6 +320,7 @@ async def request_once(
         prompt_tokens=metrics.prompt_tokens,
         accept_length=metrics.accept_length,
         server_accept_length=metrics.server_accept_length,
+        dcut_keep_ratio=metrics.dcut_keep_ratio,
         spec_verify_ct=metrics.spec_verify_ct,
         spec_num_correct_drafts=metrics.spec_num_correct_drafts,
         error=error,
@@ -395,15 +402,13 @@ async def run_point(
         await queue.join()
         await asyncio.gather(*tasks)
     finally:
-        await asyncio.gather(*(client.aclose() for client in clients), return_exceptions=True)
+        await asyncio.gather(
+            *(client.aclose() for client in clients), return_exceptions=True
+        )
 
     results.sort(key=lambda r: r.request_index)
     duration = max(
-        (
-            r.completion_offset_s
-            for r in results
-            if r.completion_offset_s is not None
-        ),
+        (r.completion_offset_s for r in results if r.completion_offset_s is not None),
         default=time.perf_counter() - benchmark_started,
     )
     good = [r for r in results if r.error is None]
@@ -421,9 +426,14 @@ async def run_point(
     total_spec_num_correct_drafts = sum(
         r.spec_num_correct_drafts or 0 for r in spec_results
     )
-    accepts = [
-        r.accept_length for r in spec_results if r.accept_length is not None
+    accepts = [r.accept_length for r in spec_results if r.accept_length is not None]
+    dcut_results = [
+        r
+        for r in spec_results
+        if r.dcut_keep_ratio is not None and r.spec_verify_ct is not None
     ]
+    dcut_keep_ratios = [r.dcut_keep_ratio for r in dcut_results]
+    dcut_verify_ct = sum(r.spec_verify_ct or 0 for r in dcut_results)
     summary = PointSummary(
         label=config.label,
         max_concurrency=point.max_concurrency,
@@ -442,12 +452,22 @@ async def run_point(
         mean_accept_length=calculate_accept_length(
             total_spec_verify_ct, total_spec_num_correct_drafts
         ),
-        request_mean_accept_length=(
-            sum(accepts) / len(accepts) if accepts else None
-        ),
+        request_mean_accept_length=(sum(accepts) / len(accepts) if accepts else None),
         accept_length_p50=percentile(accepts, 0.5),
         accept_length_p90=percentile(accepts, 0.9),
         accept_length_p99=percentile(accepts, 0.99),
+        mean_dcut_keep_ratio=(
+            sum(dcut_keep_ratios) / len(dcut_keep_ratios) if dcut_keep_ratios else None
+        ),
+        weighted_dcut_keep_ratio=(
+            sum(
+                (r.dcut_keep_ratio or 0.0) * (r.spec_verify_ct or 0)
+                for r in dcut_results
+            )
+            / dcut_verify_ct
+            if dcut_verify_ct > 0
+            else None
+        ),
         spec_metric_requests=len(spec_results),
         total_spec_verify_ct=total_spec_verify_ct,
         total_spec_num_correct_drafts=total_spec_num_correct_drafts,
@@ -480,9 +500,7 @@ async def warm_up(config: argparse.Namespace, prompt: str) -> None:
 async def main_async(config: argparse.Namespace) -> None:
     from transformers import AutoTokenizer
 
-    tokenizer = AutoTokenizer.from_pretrained(
-        config.tokenizer, trust_remote_code=True
-    )
+    tokenizer = AutoTokenizer.from_pretrained(config.tokenizer, trust_remote_code=True)
     total_requests = max(p.num_requests for p in config.points)
     prompts = load_sharegpt_prompts(
         Path(config.dataset), total_requests, config.prompt_max_tokens, tokenizer
@@ -494,10 +512,15 @@ async def main_async(config: argparse.Namespace) -> None:
 
     summaries: list[PointSummary] = []
     for point in config.points:
-        print(f"=== {config.label} C={point.max_concurrency} QPS={point.request_rate_rps} ===", flush=True)
+        print(
+            f"=== {config.label} C={point.max_concurrency} QPS={point.request_rate_rps} ===",
+            flush=True,
+        )
         results, summary = await run_point(config, point, prompts)
         summaries.append(summary)
-        with open(out_dir / f"{config.label}_c{point.max_concurrency}.jsonl", "w") as handle:
+        with open(
+            out_dir / f"{config.label}_c{point.max_concurrency}.jsonl", "w"
+        ) as handle:
             for result in results:
                 handle.write(json.dumps(asdict(result)) + "\n")
         print(json.dumps(asdict(summary), indent=2), flush=True)
@@ -522,9 +545,7 @@ def main() -> None:
         default=str(DEFAULT_DATASET),
         help="ShareGPT JSON dataset path",
     )
-    parser.add_argument(
-        "--tokenizer", default="Qwen/Qwen3.6-27B"
-    )
+    parser.add_argument("--tokenizer", default="Qwen/Qwen3.6-27B")
     parser.add_argument("--load-points", default=DEFAULT_LOAD_POINTS)
     parser.add_argument("--max-tokens", type=int, default=1024)
     parser.add_argument("--prompt-max-tokens", type=int, default=700)
