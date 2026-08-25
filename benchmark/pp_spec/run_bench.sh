@@ -13,7 +13,7 @@ GPUS=${GPUS:-0,1}
 PORT=${PORT:-31000}
 REPEATS=${REPEATS:-1}
 RAGGED_VERIFY_MODE=${RAGGED_VERIFY_MODE:-static}
-LOAD_POINTS=${LOAD_POINTS:-4:1000:16,8:1000:32,16:1000:64,32:1000:128,64:1000:256,96:1000:384,128:1000:512}
+LOAD_POINTS=${LOAD_POINTS:-8:2:32,16:4:64,32:8:128,64:16:256,96:24:384,128:32:512}
 MAX_TOKENS=${MAX_TOKENS:-1024}
 PROMPT_MAX_TOKENS=${PROMPT_MAX_TOKENS:-2000}
 DFLASH_BLOCK_SIZE=${DFLASH_BLOCK_SIZE:-16}
@@ -21,7 +21,7 @@ MEM_FRACTION_STATIC=${MEM_FRACTION_STATIC:-0.7}
 STARTUP_TIMEOUT=${STARTUP_TIMEOUT:-600}
 REQUEST_TIMEOUT_S=${REQUEST_TIMEOUT_S:-1800}
 COOLDOWN_S=${COOLDOWN_S:-10}
-OUTPUT_ROOT=${OUTPUT_ROOT:-$SCRIPT_DIR/results/replayssm_$(date -u +%Y%m%d_%H%M%S)}
+OUTPUT_ROOT=${OUTPUT_ROOT:-$SCRIPT_DIR/results/$MODEL_$(date -u +%Y%m%d_%H%M%S)}
 
 BASE_URL="http://127.0.0.1:$PORT"
 SERVER_PID=
@@ -269,7 +269,8 @@ for raw_load_point in "${load_point_list[@]}"; do
   run_config pp2_auto 1 2 "23,13" "$load_point" "$active_bs" "$num_requests" "$point_tag"
 done
 
-if ((REPEATS == 1)) && [[ -f $SCRIPT_DIR/summarize_spectre_matrix.py ]]; then
-  python "$SCRIPT_DIR/summarize_spectre_matrix.py" "$OUTPUT_ROOT"
+if ((REPEATS == 1)); then
+  python "$SCRIPT_DIR/summarize_spectre.py" "$OUTPUT_ROOT"
+  python "$SCRIPT_DIR/plot_performance.py" "$OUTPUT_ROOT/summary.csv"
 fi
 echo "All benchmark points complete: $OUTPUT_ROOT"

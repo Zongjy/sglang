@@ -12,7 +12,6 @@ from __future__ import annotations
 
 import argparse
 import asyncio
-import csv
 import json
 import math
 import random
@@ -528,11 +527,6 @@ async def main_async(config: argparse.Namespace) -> None:
 
     with open(out_dir / f"{config.label}_summary.json", "w") as handle:
         json.dump([asdict(s) for s in summaries], handle, indent=2)
-    with open(out_dir / f"{config.label}_summary.csv", "w", newline="") as handle:
-        writer = csv.DictWriter(handle, fieldnames=list(asdict(summaries[0]).keys()))
-        writer.writeheader()
-        for s in summaries:
-            writer.writerow(asdict(s))
     print(f"saved summaries to {out_dir}", flush=True)
 
 

@@ -40,10 +40,32 @@ def series_style(label: str):
 def load_rows():
     by_label = defaultdict(list)
     with open(CSV_PATH, newline="") as f:
-        for row in csv.DictReader(f):
+        reader = csv.DictReader(f)
+        required = {
+            "label",
+            "max_concurrency",
+            "output_throughput_tok_s",
+            "ttft_p50_s",
+            "tpot_p99_s",
+        }
+        missing = required.difference(reader.fieldnames or ())
+        if missing:
+            raise ValueError(
+                f"{CSV_PATH} is missing required column(s): {sorted(missing)}"
+            )
+        for line_number, row in enumerate(reader, start=2):
             if not row.get("label"):
                 continue
-            r = {k: float(v) for k, v in row.items() if k and k != "label"}
+            r = {}
+            for key, value in row.items():
+                if not key or key == "label" or value is None or not value.strip():
+                    continue
+                try:
+                    r[key] = float(value)
+                except ValueError as exc:
+                    raise ValueError(
+                        f"{CSV_PATH}:{line_number}: invalid {key}={value!r}"
+                    ) from exc
             r["label"] = row["label"]
             by_label[r["label"]].append(r)
     for series in by_label.values():

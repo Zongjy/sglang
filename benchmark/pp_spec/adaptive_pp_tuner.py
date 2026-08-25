@@ -9,13 +9,12 @@ Only ``--pp-size`` and ``--tp-size`` are required.  The default workflow:
    memory calibration from the startup log;
 4. finds the latency-equivalent prefix partitions, then refines that small set
    with raw Mamba/KV memory capacity; and
-5. writes the recommended partition and launch script -- optionally
-   followed by a measured PP-vs-TP topology comparison (--compare-tp).
+5. writes the recommended partition and its supporting analysis.
 
-Every run is self-contained under ``tuning_runs/`` and includes logs,
-measurements, a final JSON result, and a directly executable launch
-script.  Child process groups are tracked explicitly; unrelated SGLang
-servers are never killed.
+Every run is self-contained and includes logs, measurements, the PPM snapshot,
+a readable analysis report, a partition sweep plot, and a final JSON result.
+Child process groups are tracked explicitly; unrelated SGLang servers are
+never killed.
 """
 
 from __future__ import annotations
@@ -30,7 +29,6 @@ import shlex
 import shutil
 import signal
 import socket
-import statistics
 import subprocess
 import sys
 import time
@@ -47,7 +45,7 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 REPO_ROOT = SCRIPT_DIR.parents[1]
 DEFAULT_MODEL = "Qwen/Qwen3.5-9B"
 DEFAULT_DRAFT_MODEL = "z-lab/Qwen3.5-9B-DFlash"
-DEFAULT_OUTPUT_ROOT = SCRIPT_DIR / "tuning_runs"
+DEFAULT_OUTPUT_ROOT = SCRIPT_DIR / "results"
 DEFAULT_DATASET = SCRIPT_DIR / "data" / "sharegpt.json"
 FINAL_RUNNING_LIMIT = re.compile(
     r"max_total_num_tokens=\d+.*max_running_requests=(\d+)"
@@ -56,8 +54,6 @@ MAMBA_RUNNING_LIMIT = re.compile(
     r"max_running_requests is capped to (\d+) by the mamba state cache "
     r"\(max_mamba_cache_size=(\d+), (\d+) state slots per request\)"
 )
-# Decode batch, #running-req: 4, ..., accept len: 3.46, accept rate: ...
-ACCEPT_LEN = re.compile(r"Decode batch.*accept len: ([0-9.]+)")
 
 
 class TuningError(RuntimeError):
@@ -144,19 +140,6 @@ class ManagedProcess:
                 except ProcessLookupError:
                     pass
         self.log_handle.close()
-
-
-@dataclass
-class ComparisonResult:
-    partition: tuple[int, ...]
-    status: str
-    throughput_tok_s: float | None
-    repeats: list[dict[str, Any]]
-    server_log: str
-    benchmark_logs: list[str]
-    error: str | None = None
-    runtime_capacity: dict[str, int] | None = None
-    accept_len: float | None = None
 
 
 def _json_ready(value: Any) -> Any:
@@ -546,42 +529,6 @@ def wait_for_server(server: ManagedProcess, base_url: str, timeout_s: float) -> 
     )
 
 
-def parse_accept_len(log_path: Path) -> float | None:
-    """Median 'accept len' over the Decode batch lines of a server log."""
-    try:
-        text = log_path.read_text(errors="replace")
-    except OSError:
-        return None
-    values = [float(v) for v in ACCEPT_LEN.findall(text)]
-    return float(statistics.median(values)) if values else None
-
-
-def check_accept_len_consistency(
-    named_results: Sequence[tuple[str, ComparisonResult]],
-    tolerance: float = 0.03,
-) -> list[str]:
-    """Warn when compared runs disagree on mean accepted length.
-
-    Any throughput comparison is invalid if the accept lengths differ; the
-    caller prints the returned warnings but does not block.
-    """
-    measured = [
-        (name, item)
-        for name, item in named_results
-        if item.status == "ok" and item.accept_len
-    ]
-    warnings: list[str] = []
-    for (name_a, a), (name_b, b) in itertools.combinations(measured, 2):
-        rel = abs(a.accept_len - b.accept_len) / max(a.accept_len, b.accept_len)
-        if rel > tolerance:
-            warnings.append(
-                f"throughput comparison INVALID: accept_len differs "
-                f"({name_a} {a.accept_len:.3f} vs {name_b} "
-                f"{b.accept_len:.3f}, {rel:.1%} > {tolerance:.0%})"
-            )
-    return warnings
-
-
 def parse_runtime_capacity(log_path: Path) -> dict[str, int]:
     """Read the resolved scheduler/Mamba capacity from a healthy server log."""
     try:
@@ -788,103 +735,6 @@ def wait_for_load(load: ManagedProcess, timeout_s: float, settle_s: float) -> No
     raise TuningError(
         f"Profile load did not become ready in {timeout_s:g}s; see {load.log_path}.\n"
         f"{tail_file(load.log_path)}"
-    )
-
-
-def run_comparison_benchmark(
-    args: argparse.Namespace,
-    base_url: str,
-    partition: Sequence[int],
-    phase_dir: Path,
-    concurrency: int,
-    server_log: Path,
-) -> ComparisonResult:
-    phase_dir.mkdir(parents=True, exist_ok=True)
-    repeats = []
-    benchmark_logs = []
-    requests = max(16, 2 * concurrency)
-    label_base = "p" + "-".join(map(str, partition))
-    for repeat in range(args.compare_repeats):
-        label = f"{label_base}_r{repeat}"
-        output_dir = phase_dir / "benchmark"
-        command = benchmark_command(
-            args,
-            base_url,
-            label,
-            output_dir,
-            concurrency,
-            requests,
-            args.decode_tokens_per_request,
-        )
-        log_path = phase_dir / f"benchmark_r{repeat}.log"
-        benchmark_logs.append(str(log_path))
-        with log_path.open("w") as handle:
-            try:
-                completed = subprocess.run(
-                    command,
-                    cwd=REPO_ROOT,
-                    text=True,
-                    stdout=handle,
-                    stderr=subprocess.STDOUT,
-                    timeout=args.compare_timeout_s,
-                )
-            except subprocess.TimeoutExpired:
-                return ComparisonResult(
-                    tuple(partition),
-                    "benchmark_failed",
-                    None,
-                    repeats,
-                    str(server_log),
-                    benchmark_logs,
-                    f"benchmark timed out after {args.compare_timeout_s:g}s",
-                )
-        if completed.returncode != 0:
-            return ComparisonResult(
-                tuple(partition),
-                "benchmark_failed",
-                None,
-                repeats,
-                str(server_log),
-                benchmark_logs,
-                tail_file(log_path),
-            )
-        summary_path = output_dir / f"{label}_summary.json"
-        try:
-            summaries = json.loads(summary_path.read_text())
-            summary = summaries[0]
-        except (OSError, json.JSONDecodeError, IndexError) as exc:
-            return ComparisonResult(
-                tuple(partition),
-                "benchmark_failed",
-                None,
-                repeats,
-                str(server_log),
-                benchmark_logs,
-                f"cannot read {summary_path}: {exc}",
-            )
-        repeats.append(summary)
-        if summary.get("completed") != summary.get("num_requests"):
-            return ComparisonResult(
-                tuple(partition),
-                "benchmark_failed",
-                None,
-                repeats,
-                str(server_log),
-                benchmark_logs,
-                "not all benchmark requests completed",
-            )
-    throughput = float(
-        statistics.median(item["output_throughput_tok_s"] for item in repeats)
-    )
-    return ComparisonResult(
-        tuple(partition),
-        "ok",
-        throughput,
-        repeats,
-        str(server_log),
-        benchmark_logs,
-        runtime_capacity=parse_runtime_capacity(server_log),
-        accept_len=parse_accept_len(server_log),
     )
 
 
@@ -1324,212 +1174,7 @@ def analyze_ppm(
         "stage_model": model.to_dict(),
         "optimization": result.to_dict(),
     }
-    write_json(output_dir / "analysis.json", analysis)
     return analysis
-
-
-def parse_measured_capacity(log_path: Path) -> dict[str, int]:
-    """Read measured Mamba slots and the resolved request cap from a log."""
-    try:
-        text = log_path.read_text(errors="replace")
-    except OSError:
-        return {}
-    measured: dict[str, int] = {}
-    slot_values = [
-        int(value)
-        for value in re.findall(r"max_mamba_cache_size: (\d+)", text)
-    ]
-    if slot_values:
-        measured["mamba_slots"] = min(slot_values)
-    measured.update(parse_runtime_capacity(log_path))
-    return measured
-
-
-TP_COMPARISON_SETTLE_S = 5.0
-
-
-def run_tp_comparison(
-    args: argparse.Namespace,
-    run_dir: Path,
-    executable: str,
-    selected: Sequence[GPUInfo],
-    best_partition: Sequence[int],
-    best_ratio: float | None = None,
-) -> dict[str, Any]:
-    """PP vs TP topology comparison, self-contained on fresh servers.
-
-    Measures BOTH sides at their native capacity first -- the PP server at
-    the recommended partition (the runtime ratio is fixed, not optimized), the
-    TP server (tp_size = pp_size * tp_size, pp_size = 1, no layer partition,
-    no comm benchmark, no PPM -- event_loop_pp does not run) at the configured
-    ratio -- then re-measures each
-    side above the common cap at --max-running-requests = min(PP_BS, TP_BS)
-    with offered concurrency >= 2x that value (the side already below the
-    common cap keeps its native measurement).  The accept_len consistency
-    check applies to the comparison.  The PP side uses the recommended
-    partition's ratio; the TP side uses the configured default because the
-    current capacity model is not TP-shard aware.
-    """
-    tp_ratio = args.mamba_full_memory_ratio
-    tp_args = argparse.Namespace(**vars(args))
-    tp_args.tp_size = args.tp_size * args.pp_size
-    tp_args.pp_size = 1
-    tp_args.fixed_active_requests = None
-    pp_args = argparse.Namespace(**vars(args))
-    pp_args.fixed_active_requests = None
-
-    phase_dir = run_dir / "tp_comparison"
-    result: dict[str, Any] = {
-        "tp_size": tp_args.tp_size,
-        "pp_partition": list(best_partition),
-        "tp_mamba_ratio": tp_ratio,
-        "tp_capacity_est": None,
-    }
-
-    def stop_and_settle(server: ManagedProcess | None) -> None:
-        """Stop a server and let the GPU fully drain before the next start.
-
-        ManagedProcess.stop already kills the whole process group and waits;
-        the extra settle covers driver-side memory release so the next
-        server never sees the previous one's allocation (the TP/PP
-        comparison runs three servers sequentially on the same GPUs).
-        """
-        if server is not None:
-            server.stop()
-        time.sleep(TP_COMPARISON_SETTLE_S)
-
-    server: ManagedProcess | None = None
-    try:
-        # PP side at its recommended partition/ratio, native capacity.
-        server, pp_url, _ = start_server(
-            pp_args, executable, selected, best_partition,
-            phase_dir / "pp_native", mamba_ratio=best_ratio,
-        )
-        pp_capacity = parse_measured_capacity(server.log_path)
-        pp_cap = pp_capacity.get("max_running_requests")
-        result["pp_capacity"] = pp_capacity
-        pp_native = run_comparison_benchmark(
-            pp_args, pp_url, best_partition, phase_dir / "pp_native",
-            max(2 * (pp_cap or args.concurrency), 16), server.log_path,
-        )
-        result["pp_native"] = asdict(pp_native)
-        # Exactly one server on the GPUs at any time from here on.
-        stop_and_settle(server)
-        server = None
-
-        # TP side at its swept ratio, native capacity.
-        server, tp_url, _ = start_server(
-            tp_args, executable, selected, (), phase_dir / "tp_native",
-            mamba_ratio=tp_ratio,
-        )
-        tp_capacity = parse_measured_capacity(server.log_path)
-        tp_cap = tp_capacity.get("max_running_requests")
-        result["tp_capacity"] = tp_capacity
-        tp_native = run_comparison_benchmark(
-            tp_args, tp_url, (), phase_dir / "tp_native",
-            max(2 * (tp_cap or args.concurrency), 16), server.log_path,
-        )
-        result["tp_native"] = asdict(tp_native)
-        stop_and_settle(server)
-        server = None
-
-        if (
-            pp_cap
-            and tp_cap
-            and pp_native.status == "ok"
-            and tp_native.status == "ok"
-        ):
-            common = min(pp_cap, tp_cap)
-            concurrency = max(2 * common, 16)
-            result["equal_concurrency"] = common
-
-            if pp_cap > common:
-                pp_capped_args = argparse.Namespace(**vars(pp_args))
-                pp_capped_args.fixed_active_requests = common
-                pp_dir = phase_dir / "pp_capped"
-                server, pp_url, _ = start_server(
-                    pp_capped_args, executable, selected, best_partition, pp_dir,
-                    mamba_ratio=best_ratio,
-                )
-                pp_equal = run_comparison_benchmark(
-                    pp_capped_args, pp_url, best_partition, pp_dir, concurrency,
-                    server.log_path,
-                )
-                stop_and_settle(server)
-                server = None
-            else:
-                pp_equal = pp_native
-            result["pp_equal"] = asdict(pp_equal)
-
-            if tp_cap > common:
-                tp_capped_args = argparse.Namespace(**vars(tp_args))
-                tp_capped_args.fixed_active_requests = common
-                tp_dir = phase_dir / "tp_capped"
-                server, tp_url, _ = start_server(
-                    tp_capped_args, executable, selected, (), tp_dir,
-                    mamba_ratio=tp_ratio,
-                )
-                tp_equal = run_comparison_benchmark(
-                    tp_capped_args, tp_url, (), tp_dir, concurrency,
-                    server.log_path,
-                )
-                stop_and_settle(server)
-                server = None
-            else:
-                tp_equal = tp_native
-            result["tp_equal"] = asdict(tp_equal)
-
-            warnings = check_accept_len_consistency(
-                [("pp", pp_equal), ("tp", tp_equal)]
-            )
-            result["accept_len_warnings"] = warnings
-            for warning in warnings:
-                print(f"[WARNING] {warning}", flush=True)
-    finally:
-        if server is not None:
-            server.stop()
-
-    def _tok(entry: dict[str, Any] | None) -> str:
-        if not entry or entry.get("throughput_tok_s") is None:
-            return "n/a"
-        return f"{entry['throughput_tok_s']:.1f} tok/s"
-
-    def _acc(entry: dict[str, Any] | None) -> str:
-        if not entry or entry.get("accept_len") is None:
-            return "n/a"
-        return f"{entry['accept_len']:.2f}"
-
-    pp_ratio = best_ratio if best_ratio is not None else args.mamba_full_memory_ratio
-
-    def _ratio_text(value: float | None) -> str:
-        return "runtime default" if value is None else f"{value:g}"
-
-    lines = [
-        "PP vs TP comparison:",
-        f"  runtime mamba ratio (not optimized): PP "
-        f"{_ratio_text(pp_ratio)}, TP {_ratio_text(tp_ratio)}",
-        f"  native capacity: PP {','.join(map(str, best_partition))} "
-        f"(cap {pp_cap}) {_tok(result['pp_native'])} vs "
-        f"TP{tp_args.tp_size} (cap {tp_cap}) {_tok(result['tp_native'])}",
-    ]
-    if "equal_concurrency" in result:
-        lines.append(
-            f"  equal concurrency (cap {result['equal_concurrency']}): "
-            f"PP {_tok(result.get('pp_equal'))} (accept {_acc(result.get('pp_equal'))}) vs "
-            f"TP {_tok(result.get('tp_equal'))} (accept {_acc(result.get('tp_equal'))})"
-        )
-        verdict = (
-            "accept_len consistent"
-            if not result.get("accept_len_warnings")
-            else "accept_len DIFFERS; comparison invalid"
-        )
-        lines.append(f"  accept_len consistency: {verdict}")
-    text = "\n".join(lines)
-    print(text, flush=True)
-    phase_dir.mkdir(parents=True, exist_ok=True)
-    (phase_dir / "tp_comparison.txt").write_text(text + "\n")
-    result["summary"] = text
-    return result
 
 
 def create_run_dir(root: Path, tp_size: int, pp_size: int) -> Path:
@@ -1542,49 +1187,6 @@ def create_run_dir(root: Path, tp_size: int, pp_size: int) -> Path:
         suffix += 1
     candidate.mkdir(parents=True)
     return candidate
-
-
-def write_best_artifacts(
-    args: argparse.Namespace,
-    run_dir: Path,
-    executable: str,
-    selected_gpus: Sequence[GPUInfo],
-    partition: Sequence[int],
-    reason: str,
-    mamba_ratio: float | None = None,
-) -> None:
-    visible = ",".join(str(gpu.index) for gpu in selected_gpus)
-    command = build_server_command(
-        args, executable, args.final_port, mamba_ratio=mamba_ratio
-    )
-    config = {
-        "tp_size": args.tp_size,
-        "pp_size": args.pp_size,
-        "partition": tuple(partition),
-        "mamba_full_memory_ratio": (
-            mamba_ratio if mamba_ratio is not None else args.mamba_full_memory_ratio
-        ),
-        "cuda_visible_devices": visible,
-        "selection_reason": reason,
-        "command": command,
-    }
-    write_json(run_dir / "best_config.json", config)
-    env_lines = [f"export CUDA_VISIBLE_DEVICES={shlex.quote(visible)}"]
-    if args.pp_size > 1:
-        value = ",".join(map(str, partition))
-        env_lines.append(f"export SGLANG_PP_LAYER_PARTITION={shlex.quote(value)}")
-    else:
-        env_lines.append("unset SGLANG_PP_LAYER_PARTITION")
-    (run_dir / "best_config.env").write_text("\n".join(env_lines) + "\n")
-    launch = run_dir / "launch_best.sh"
-    launch.write_text(
-        "#!/usr/bin/env bash\nset -euo pipefail\n"
-        + "\n".join(env_lines)
-        + "\nexec "
-        + shlex.join(command)
-        + "\n"
-    )
-    launch.chmod(0o755)
 
 
 def format_gpu_plan(
@@ -1625,10 +1227,8 @@ def run_tuner(args: argparse.Namespace) -> Path | None:
         )
     if args.decode_tokens_per_request <= 0:
         raise TuningError("--decode-tokens-per-request must be positive.")
-    if args.compare_repeats <= 0 or args.compare_timeout_s <= 0:
-        raise TuningError("--compare-repeats and --compare-timeout-s must be positive.")
     replay_state: dict[str, Any] = {}
-    replay_dir = args.reanalyze or args.compare_tp_only
+    replay_dir = args.reanalyze
     if replay_dir:
         replay_result = replay_dir / "result.json"
         if replay_result.is_file():
@@ -1731,50 +1331,21 @@ def run_tuner(args: argparse.Namespace) -> Path | None:
         "explicit_device_order": explicit_devices,
         "gpu_plan": gpu_plan,
         "server_command": build_server_command(
-            args, executable, args.port or args.final_port
+            args, executable, args.port or 30000
         ),
     }
     if args.dry_run:
         print(json.dumps(_json_ready(dry_plan), indent=2))
         return None
 
-    if args.compare_tp_only:
-        # Convenience: skip PP baseline/profile/analysis and only (re-)run
-        # the TP comparison of an existing run, reading the best partition
-        # and ratio from its result.json.
-        run_dir = args.compare_tp_only
-        result_path = run_dir / "result.json"
-        if not result_path.is_file():
-            raise TuningError(f"--compare-tp-only needs {result_path}.")
-        saved = replay_state
-        if not saved.get("best_partition"):
-            raise TuningError(f"{result_path} has no best_partition yet.")
-        best = tuple(saved["best_partition"])
-        best_ratio = None
-        analysis = saved.get("analysis") or {}
-        recommended = analysis.get("recommended") or {}
-        if (
-            args.mamba_full_memory_ratio is not None
-            and tuple(recommended.get("partition") or ()) == best
-        ):
-            best_ratio = recommended.get("mamba_ratio")
-        comparison = run_tp_comparison(
-            args,
-            run_dir,
-            executable,
-            selected,
-            best,
-            best_ratio=best_ratio,
-        )
-        saved["tp_comparison"] = comparison
-        write_json(result_path, saved)
-        print(
-            f"[done] TP comparison written to {run_dir / 'tp_comparison'}",
-            flush=True,
-        )
-        return run_dir
-
-    run_dir = create_run_dir(args.output_root, args.tp_size, args.pp_size)
+    if args.output_dir:
+        run_dir = args.output_dir.resolve()
+        try:
+            run_dir.mkdir(parents=True, exist_ok=False)
+        except FileExistsError as exc:
+            raise TuningError(f"--output-dir already exists: {run_dir}") from exc
+    else:
+        run_dir = create_run_dir(args.output_root, args.tp_size, args.pp_size)
     state: dict[str, Any] = {
         "status": "running",
         "started_at": datetime.now(timezone.utc).isoformat(),
@@ -1789,7 +1360,6 @@ def run_tuner(args: argparse.Namespace) -> Path | None:
     if args.pp_size == 1:
         reason = "PP size is 1; no layer boundary exists to tune"
         state.update(status="complete", best_partition=baseline, selection_reason=reason)
-        write_best_artifacts(args, run_dir, executable, selected, baseline, reason)
         write_json(run_dir / "result.json", state)
         print(f"[done] {reason}")
         return run_dir
@@ -1879,27 +1449,9 @@ def run_tuner(args: argparse.Namespace) -> Path | None:
         best_partition=best,
         selection_reason=reason,
     )
-    best_ratio = (
-        analysis["recommended"].get("mamba_ratio")
-        if args.mamba_full_memory_ratio is not None
-        else None
-    )
-    write_best_artifacts(
-        args, run_dir, executable, selected, best, reason, mamba_ratio=best_ratio
-    )
     write_json(run_dir / "result.json", state)
-    if args.compare_tp:
-        try:
-            state["tp_comparison"] = run_tp_comparison(
-                args, run_dir, executable, selected, best,
-                best_ratio=best_ratio,
-            )
-        except TuningError as exc:
-            print(f"[warn] TP comparison failed: {exc}", flush=True)
-            state["tp_comparison_error"] = str(exc)
-        write_json(run_dir / "result.json", state)
     print(f"[done] best partition: {','.join(map(str, best))} ({reason})", flush=True)
-    print(f"[done] launch script: {run_dir / 'launch_best.sh'}", flush=True)
+    print(f"[done] result: {run_dir / 'result.json'}", flush=True)
     return run_dir
 
 
@@ -1953,7 +1505,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--dataset",
         type=Path,
         default=DEFAULT_DATASET,
-        help="ShareGPT JSON dataset used by profiling and --compare-tp",
+        help="ShareGPT JSON dataset used by the profiling load",
     )
     parser.add_argument(
         "--profile-output-tokens",
@@ -1971,28 +1523,14 @@ def build_parser() -> argparse.ArgumentParser:
         default=256,
         help=(
             "decode length per request assumed by the capacity model's KV "
-            "working set and used by --compare-tp measurements "
-            "(default: 256)"
+            "working set (default: 256)"
         ),
-    )
-    parser.add_argument(
-        "--compare-repeats",
-        type=int,
-        default=2,
-        help="measurement repeats per --compare-tp point (default: 2)",
-    )
-    parser.add_argument(
-        "--compare-timeout-s",
-        type=float,
-        default=1800.0,
-        help="per-benchmark timeout for --compare-tp measurements",
     )
     parser.add_argument("--request-timeout-s", type=float, default=1800.0)
     parser.add_argument("--memory-reserve-gib", type=float, default=2.0)
     parser.add_argument("--server-startup-timeout-s", type=float, default=600.0)
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, help="fixed tuning port; default: choose a free port")
-    parser.add_argument("--final-port", type=int, default=30000)
     parser.add_argument("--visible-devices", help="override CUDA_VISIBLE_DEVICES")
     parser.add_argument(
         "--current-partition",
@@ -2001,7 +1539,17 @@ def build_parser() -> argparse.ArgumentParser:
             "a plain SGLang launch)"
         ),
     )
-    parser.add_argument("--output-root", type=Path, default=DEFAULT_OUTPUT_ROOT)
+    parser.add_argument(
+        "--output-dir",
+        type=Path,
+        help="exact directory for this run; it must not already exist",
+    )
+    parser.add_argument(
+        "--output-root",
+        type=Path,
+        default=DEFAULT_OUTPUT_ROOT,
+        help="parent for an auto-named run when --output-dir is omitted",
+    )
     parser.add_argument(
         "--ppm-collect-s",
         type=float,
@@ -2065,24 +1613,6 @@ def build_parser() -> argparse.ArgumentParser:
             "baseline/ppm_snapshot.json + baseline/server.log, refits the "
             "stage/capacity models, and re-renders the report and sweep plot "
             "into <run_dir>/reanalysis/ without starting a server"
-        ),
-    )
-    parser.add_argument(
-        "--compare-tp",
-        action="store_true",
-        help=(
-            "after PP tuning, also start a TP baseline (tp_size = pp_size x "
-            "tp_size, pp_size = 1) and compare throughput at equal "
-            "concurrency (min of both caps) and at each side's native capacity"
-        ),
-    )
-    parser.add_argument(
-        "--compare-tp-only",
-        type=Path,
-        help=(
-            "skip PP baseline/profile/analysis and only run the TP "
-            "comparison for an existing run directory, reading the best "
-            "partition / ratio from its result.json"
         ),
     )
     parser.add_argument("--dry-run", action="store_true")
