@@ -2005,8 +2005,9 @@ class DFlashWorkerV2(BaseSpecWorker):
             capture_hidden_mode=CaptureHiddenMode.NULL,
         )
 
-        with torch.inference_mode():
-            draft_out = self.draft_model_runner.forward(forward_batch)
+        with torch.profiler.record_function("sglang.dflash.draft_model_forward"):
+            with torch.inference_mode():
+                draft_out = self.draft_model_runner.forward(forward_batch)
         draft_logits_output = draft_out.logits_output
 
         if self._draft_sampler is not None and draft_out.can_run_graph:
@@ -2179,11 +2180,12 @@ class DFlashWorkerV2(BaseSpecWorker):
                 target_capture_mode = CaptureHiddenMode.FULL
             else:
                 target_capture_mode = CaptureHiddenMode.NULL
-            batch_output = self.target_worker.forward_batch_generation(
-                batch,
-                pp_proxy_tensors=pp_proxy_tensors,
-                capture_hidden_mode=target_capture_mode,
-            )
+            with torch.profiler.record_function("sglang.dflash.target_prefill_forward"):
+                batch_output = self.target_worker.forward_batch_generation(
+                    batch,
+                    pp_proxy_tensors=pp_proxy_tensors,
+                    capture_hidden_mode=target_capture_mode,
+                )
 
             # Non-last PP rank: only relay the target prefill forward; draft
             # KV materialization happens exclusively on the last rank.
@@ -2401,13 +2403,14 @@ class DFlashWorkerV2(BaseSpecWorker):
         batch.seq_lens_cpu = seq_lens_cpu_backup
         batch.seq_lens_sum = seq_lens_sum_backup
 
-        target_out = self.target_worker.forward_batch_generation(
-            batch=None,
-            forward_batch=verify_forward_batch,
-            is_verify=True,
-            skip_attn_backend_init=True,
-            pp_proxy_tensors=pp_proxy_tensors,
-        )
+        with torch.profiler.record_function("sglang.dflash.target_verify_forward"):
+            target_out = self.target_worker.forward_batch_generation(
+                batch=None,
+                forward_batch=verify_forward_batch,
+                is_verify=True,
+                skip_attn_backend_init=True,
+                pp_proxy_tensors=pp_proxy_tensors,
+            )
         if self._dcut_planner is not None:
             self._dcut_planner.finish_step_timing(bs=bs, start=dcut_timing_start)
         logits_output = target_out.logits_output

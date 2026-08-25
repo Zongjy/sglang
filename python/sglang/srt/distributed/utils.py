@@ -95,12 +95,24 @@ def split_tensor_along_last_dim(
 def get_pp_indices(
     num_hidden_layers: int, pp_rank: int, pp_size: int
 ) -> Tuple[int, int]:
-    """Try to evenly distribute layers across partitions.
+    """Resolve the configured PP slice or evenly distribute the layers.
+
+    ``--pp-layer-partition`` is read from the published runtime context so it
+    works in Ray actors. ``SGLANG_PP_LAYER_PARTITION`` is the legacy fallback.
     If the number of layers is not divisible by the number of partitions,
     the last N partitions will have one extra layer, where N = remainder.
     """
-    # partition_list_str can be set to None in sglang
-    partition_list_str = os.getenv("SGLANG_PP_LAYER_PARTITION", None)
+    # The ServerArgs value is serialized to Ray actors. Keep the environment
+    # variable as a compatibility fallback for existing launch scripts.
+    partition_list_str = None
+    try:
+        from sglang.srt.runtime_context import get_parallel
+
+        partition_list_str = get_parallel().pp_layer_partition
+    except (AttributeError, ValueError):
+        pass
+    if partition_list_str is None:
+        partition_list_str = os.getenv("SGLANG_PP_LAYER_PARTITION", None)
     if partition_list_str is not None:
         try:
             partitions = [int(layer) for layer in partition_list_str.split(",")]

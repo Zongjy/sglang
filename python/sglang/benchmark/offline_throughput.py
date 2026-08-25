@@ -360,6 +360,49 @@ def monitor_trace_file(known_files, directory, interval=1):
             break
 
 
+def _ray_placement_bundles(server_args: ServerArgs):
+    total_gpus = server_args.tp_size * server_args.pp_size
+    if not server_args.enable_dp_attention:
+        total_gpus *= server_args.dp_size
+    if total_gpus % server_args.nnodes != 0:
+        raise ValueError(
+            f"world size {total_gpus} must be divisible by nnodes={server_args.nnodes}"
+        )
+    gpus_per_node = total_gpus // server_args.nnodes
+    bundles = [{"CPU": 1, "GPU": gpus_per_node} for _ in range(server_args.nnodes)]
+    strategy = "STRICT_PACK" if server_args.nnodes == 1 else "STRICT_SPREAD"
+    return bundles, strategy
+
+
+def _ray_runtime_env_vars():
+    exact = {
+        "HF_ENDPOINT",
+        "HF_HUB_OFFLINE",
+        "HF_TOKEN",
+        "TRANSFORMERS_OFFLINE",
+    }
+    prefixes = ("CUDA_", "GLOO_", "NCCL_", "NVSHMEM_", "SGLANG_", "UCX_")
+    secret_markers = (
+        "ACCESS_KEY",
+        "API_KEY",
+        "CREDENTIAL",
+        "PASSWORD",
+        "PRIVATE_KEY",
+        "SECRET",
+        "TOKEN",
+    )
+    result = {
+        name: value
+        for name, value in os.environ.items()
+        if name in exact or name.startswith(prefixes)
+        if name != "CUDA_VISIBLE_DEVICES"
+        if name == "HF_TOKEN"
+        or not any(marker in name.upper() for marker in secret_markers)
+    }
+    result["RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES"] = "1"
+    return result
+
+
 def _create_ray_engine_backend(server_args: ServerArgs):
     """Create a RayEngine inside a Ray actor on a placement group.
 
@@ -371,15 +414,20 @@ def _create_ray_engine_backend(server_args: ServerArgs):
     from ray.util.placement_group import placement_group
     from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
 
-    env_vars = {"RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES": "1"}
-    if os.environ.get("HF_TOKEN"):
-        env_vars["HF_TOKEN"] = os.environ["HF_TOKEN"]
+    env_vars = _ray_runtime_env_vars()
     if not ray.is_initialized():
         ray.init(runtime_env=RuntimeEnv(env_vars=env_vars))
 
-    total_gpus = server_args.tp_size * server_args.pp_size
-    pg = placement_group([{"CPU": 1, "GPU": total_gpus}], strategy="STRICT_PACK")
-    ray.get(pg.ready())
+    bundles, strategy = _ray_placement_bundles(server_args)
+    pg = placement_group(bundles, strategy=strategy)
+    try:
+        ray.get(pg.ready(), timeout=server_args.watchdog_timeout)
+    except ray.exceptions.GetTimeoutError as exc:
+        ray.util.remove_placement_group(pg)
+        raise RuntimeError(
+            "Ray placement group was not ready within "
+            f"{server_args.watchdog_timeout:g}s; requested bundles={bundles}"
+        ) from exc
 
     @ray.remote
     class _EngineActor:
@@ -394,6 +442,7 @@ def _create_ray_engine_backend(server_args: ServerArgs):
     actor = _EngineActor.options(
         num_cpus=1,
         num_gpus=0,
+        runtime_env=RuntimeEnv(env_vars=env_vars),
         scheduling_strategy=PlacementGroupSchedulingStrategy(
             placement_group=pg,
             placement_group_bundle_index=0,

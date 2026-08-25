@@ -109,7 +109,7 @@ class StageCostModel:
         *,
         layout: LayerLayout | None = None,
         capture_buckets: Sequence[int] | None = None,
-    ) -> "StageCostModel":
+    ) -> StageCostModel:
         partition = tuple(int(value) for value in current_partition)
         if min_samples <= 0:
             raise StageModelError("min_samples must be positive")
@@ -132,7 +132,9 @@ class StageCostModel:
                         source=str(raw_layout.get("source", "snapshot")),
                     )
                 except Exception as exc:
-                    raise StageModelError(f"invalid snapshot layer layout: {exc}") from exc
+                    raise StageModelError(
+                        f"invalid snapshot layer layout: {exc}"
+                    ) from exc
         if layout is not None and layout.num_layers != num_layers:
             raise StageModelError(
                 f"layout has L={layout.num_layers}, partition has L={num_layers}"
@@ -142,7 +144,9 @@ class StageCostModel:
         if not isinstance(ranks_data, Mapping) or not ranks_data:
             raise StageModelError("snapshot has no per-rank aggregates")
         rank_maps = {int(key): value for key, value in ranks_data.items()}
-        invalid = [rank for rank, value in rank_maps.items() if not isinstance(value, Mapping)]
+        invalid = [
+            rank for rank, value in rank_maps.items() if not isinstance(value, Mapping)
+        ]
         if invalid:
             raise StageModelError(f"invalid rank aggregate(s): {invalid}")
         missing = [rank for rank in range(pp_size) if rank not in rank_maps]
@@ -190,7 +194,9 @@ class StageCostModel:
             sorted({int(value) for value in capture_values if int(value) > 0})
         )
         if resolved_capture:
-            missing_capture = [value for value in resolved_capture if value not in buckets]
+            missing_capture = [
+                value for value in resolved_capture if value not in buckets
+            ]
             if missing_capture:
                 warnings.append(
                     "capture bucket(s) have no measured PPM samples: "
@@ -218,7 +224,7 @@ class StageCostModel:
         current_partition: Sequence[int],
         pp_loop_size: int = 1,
         layout: LayerLayout | None = None,
-    ) -> "StageCostModel":
+    ) -> StageCostModel:
         """Build from a compact offline profile JSON.
 
         Each bucket may either provide measured ``service_ms``/``fixed_ms``
@@ -236,7 +242,9 @@ class StageCostModel:
         if sum(partition) != int(num_layers):
             raise StageModelError("current partition does not sum to num_layers")
         if layout is not None and layout.num_layers != int(num_layers):
-            raise StageModelError("layout and offline profile have different layer counts")
+            raise StageModelError(
+                "layout and offline profile have different layer counts"
+            )
         buckets: dict[int, BucketEstimate] = {}
         for raw_bucket, raw in profiles.items():
             bucket = int(raw_bucket)
@@ -285,9 +293,7 @@ class StageCostModel:
                         )
                     last_fixed = raw.get("last_fixed_ms")
                     residual = (
-                        float(last_fixed)
-                        if last_fixed is not None
-                        else draft + other
+                        float(last_fixed) if last_fixed is not None else draft + other
                     )
                     if residual < 0.0:
                         raise StageModelError(
@@ -295,8 +301,7 @@ class StageCostModel:
                         )
                     fixed = tuple([0.0] * (pp_size - 1) + [residual])
                 service = tuple(
-                    layer * count + fixed[rank]
-                    for rank, count in enumerate(partition)
+                    layer * count + fixed[rank] for rank, count in enumerate(partition)
                 )
             elif not fixed:
                 fixed = tuple(value - layer * n for value, n in zip(service, partition))
@@ -366,7 +371,11 @@ class StageCostModel:
             return key
         measured = tuple(sorted(self.buckets))
         measured_index = bisect.bisect_left(measured, key)
-        return measured[-1] if measured_index >= len(measured) else measured[measured_index]
+        return (
+            measured[-1]
+            if measured_index >= len(measured)
+            else measured[measured_index]
+        )
 
     def bucket_for_bs(self, bs: float | int) -> int:
         return self._bucket_key(bs)
@@ -379,7 +388,9 @@ class StageCostModel:
             raise StageModelError("model has no fitted buckets")
         return self.buckets[max(self.buckets)]
 
-    def layer_time_ms(self, bs: float | int | None = None, *, bucket: int | None = None) -> float:
+    def layer_time_ms(
+        self, bs: float | int | None = None, *, bucket: int | None = None
+    ) -> float:
         """Return the measured per-target-layer time at an upper bucket."""
         estimate = (
             self.buckets[int(bucket)]
@@ -412,6 +423,7 @@ class StageCostModel:
         bucket: int | None = None,
         estimate: BucketEstimate | None = None,
         t_comm_ms: float = 0.0,
+        stage_comm_ms: Sequence[float] | None = None,
         layout: LayerLayout | None = None,
     ) -> tuple[float, ...]:
         """Predict stage service times for one candidate partition."""
@@ -426,6 +438,20 @@ class StageCostModel:
             else self.estimate_for_bs(bs if bs is not None else 1)
         )
         active_layout = layout or self.layout
+        if stage_comm_ms is None:
+            comm_costs = tuple(
+                0.0 if rank == 0 else float(t_comm_ms) for rank in range(self.pp_size)
+            )
+        else:
+            comm_costs = tuple(float(value) for value in stage_comm_ms)
+            if len(comm_costs) == self.pp_size - 1:
+                comm_costs = (0.0, *comm_costs)
+            if len(comm_costs) != self.pp_size or any(
+                value < 0.0 for value in comm_costs
+            ):
+                raise StageModelError(
+                    "stage_comm_ms must contain PP or PP-1 non-negative values"
+                )
         ranges: list[tuple[int, int]] = []
         start = 0
         for count in counts:
@@ -445,7 +471,7 @@ class StageCostModel:
                 fixed = active_estimate.fixed_ms[-1]
             else:
                 fixed = middle
-            values.append(layer_ms + fixed + (t_comm_ms if rank > 0 else 0.0))
+            values.append(layer_ms + fixed + comm_costs[rank])
         return tuple(values)
 
     def cycle_time_ms(
@@ -456,6 +482,7 @@ class StageCostModel:
         bucket: int | None = None,
         estimate: BucketEstimate | None = None,
         t_comm_ms: float = 0.0,
+        stage_comm_ms: Sequence[float] | None = None,
         layout: LayerLayout | None = None,
     ) -> float:
         """Return ``max_r stage_service_r`` for one execution bucket."""
@@ -466,6 +493,7 @@ class StageCostModel:
                 bucket=bucket,
                 estimate=estimate,
                 t_comm_ms=t_comm_ms,
+                stage_comm_ms=stage_comm_ms,
                 layout=layout,
             )
         )
@@ -561,7 +589,9 @@ def _fit_bucket(
             # service-only fallback is less precise (and is reported as a
             # warning) but avoids silently fitting a zero layer cost.
             draft_hint, _, _ = _cell_stats(cell, "gpu_draft_ms")
-            target = max(measured_service - (draft_hint if rank == pp_size - 1 else 0.0), 0.0)
+            target = max(
+                measured_service - (draft_hint if rank == pp_size - 1 else 0.0), 0.0
+            )
             warnings.append(
                 f"bucket {bucket} rank {rank}: gpu_target_ms is missing; "
                 "estimated target time from service_ms"
@@ -588,7 +618,9 @@ def _fit_bucket(
         )
     layer_var = sum(target_var) / len(target_var)
     if len(target_per_layer) > 1:
-        dispersion = statistics.pstdev(target_per_layer) / layer_ms if layer_ms > 0 else 0.0
+        dispersion = (
+            statistics.pstdev(target_per_layer) / layer_ms if layer_ms > 0 else 0.0
+        )
     else:
         dispersion = 0.0
         warnings.append(f"bucket {bucket}: only one rank contributed a layer estimate")
@@ -625,9 +657,7 @@ def _fit_bucket(
         fixed_var.append(variance)
 
     sample_count = sum(
-        int(
-            (_bucket_cell(rank_maps[rank], bucket) or {}).get("count", 0)
-        )
+        int((_bucket_cell(rank_maps[rank], bucket) or {}).get("count", 0))
         for rank in range(pp_size)
     )
     return BucketEstimate(

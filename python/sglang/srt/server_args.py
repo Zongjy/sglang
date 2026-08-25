@@ -1041,6 +1041,15 @@ class ServerArgs:
         ),
         NS("parallel"),
     ] = 1
+    pp_layer_partition: A[
+        Optional[str],
+        (
+            "Comma-separated transformer layer counts for PP stages. The list "
+            "must contain --pp-size positive integers and sum to the model's "
+            "hidden-layer count. This supersedes SGLANG_PP_LAYER_PARTITION."
+        ),
+        NS("parallel"),
+    ] = None
     pp_max_micro_batch_size: A[
         Optional[int],
         "The maximum micro batch size in pipeline parallelism.",
@@ -9095,6 +9104,25 @@ class ServerArgs:
             assert (
                 self.tp_size * self.pp_size
             ) % self.nnodes == 0, "tp_size must be divisible by number of nodes"
+
+        if self.pp_layer_partition is not None:
+            try:
+                pp_partition = [
+                    int(value.strip())
+                    for value in self.pp_layer_partition.split(",")
+                    if value.strip()
+                ]
+            except ValueError as exc:
+                raise ValueError(
+                    "--pp-layer-partition must contain comma-separated integers"
+                ) from exc
+            if len(pp_partition) != self.pp_size or any(
+                value <= 0 for value in pp_partition
+            ):
+                raise ValueError(
+                    "--pp-layer-partition must contain exactly "
+                    f"{self.pp_size} positive layer counts"
+                )
 
         assert (
             self.pp_max_micro_batch_size is None or self.pp_max_micro_batch_size >= 1

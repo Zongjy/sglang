@@ -85,6 +85,7 @@ class OptimizationResult:
     target_bs: float
     accept_len: float
     t_comm_ms: float
+    stage_comm_ms: tuple[float, ...]
     noise_sigma: float
     best: OptimizerCandidate
     candidates: list[OptimizerCandidate]
@@ -158,6 +159,7 @@ class OptimizationResult:
             "target_bs": self.target_bs,
             "accept_len": self.accept_len,
             "t_comm_ms": self.t_comm_ms,
+            "stage_comm_ms": list(self.stage_comm_ms),
             "noise_sigma": self.noise_sigma,
             "best": self._candidate_dict(self.best),
             "selected": self._candidate_dict(self.selected),
@@ -266,6 +268,7 @@ def _candidate_from_model(
     estimate: BucketEstimate,
     partition: Sequence[int],
     t_comm_ms: float,
+    stage_comm_ms: Sequence[float] | None,
     layout: LayerLayout | None,
 ) -> OptimizerCandidate:
     counts = tuple(int(value) for value in partition)
@@ -275,6 +278,7 @@ def _candidate_from_model(
             counts,
             estimate=estimate,
             t_comm_ms=t_comm_ms,
+            stage_comm_ms=stage_comm_ms,
             layout=layout,
         )
     )
@@ -286,7 +290,13 @@ def _candidate_from_model(
     decomposition: list[StageDecomposition] = []
     for rank, (count, begin) in enumerate(zip(counts, starts)):
         layer_ms = _layer_cost(model, estimate, begin, begin + count, layout)
-        comm = t_comm_ms if rank > 0 else 0.0
+        if stage_comm_ms is None:
+            comm = t_comm_ms if rank > 0 else 0.0
+        else:
+            resolved_comm = tuple(float(value) for value in stage_comm_ms)
+            if len(resolved_comm) == len(counts) - 1:
+                resolved_comm = (0.0, *resolved_comm)
+            comm = resolved_comm[rank]
         fixed = max(stage_ms[rank] - layer_ms - comm, 0.0)
         decomposition.append(
             StageDecomposition(
@@ -300,8 +310,7 @@ def _candidate_from_model(
     bottleneck_rank = max(range(len(stage_ms)), key=stage_ms.__getitem__)
     count = counts[bottleneck_rank]
     variance = (
-        count * count * estimate.layer_cost_var
-        + estimate.fixed_var[bottleneck_rank]
+        count * count * estimate.layer_cost_var + estimate.fixed_var[bottleneck_rank]
     )
     return OptimizerCandidate(
         partition=counts,
@@ -332,9 +341,7 @@ def _capacity_fields(
         kv_tokens=getattr(estimate, "kv_tokens", None),
         mamba_slots=getattr(estimate, "mamba_slots", None),
         mamba_ratio=getattr(estimate, "ratio", None),
-        memory_capacity=(
-            None if memory_capacity is None else int(memory_capacity)
-        ),
+        memory_capacity=(None if memory_capacity is None else int(memory_capacity)),
         scheduler_limit=getattr(estimate, "scheduler_limit", None),
         effective_limit=getattr(estimate, "effective_limit", None),
         mamba_capacity=getattr(estimate, "mamba_capacity", None),
@@ -354,6 +361,7 @@ def _family_partitions(
     pp_size: int,
     min_layers: int,
     max_layers: Sequence[int] | None,
+    prefix_l_range: tuple[int, int] | None = None,
 ) -> list[tuple[int, ...]]:
     if pp_size <= 0 or num_layers <= 0:
         raise OptimizerError("num_layers and pp_size must be positive")
@@ -365,17 +373,20 @@ def _family_partitions(
     if len(limits) != pp_size:
         raise OptimizerError("max_layers must have one entry per PP rank")
     if pp_size == 1:
-        return (
-            [(num_layers,)]
-            if min_layers <= num_layers <= limits[0]
-            else []
-        )
+        return [(num_layers,)] if min_layers <= num_layers <= limits[0] else []
     upper = (num_layers - 1) // (pp_size - 1)
-    lower = max(int(min_layers), 1)
+    min_count = max(int(min_layers), 1)
+    lower = min_count
+    if prefix_l_range is not None:
+        range_lower, range_upper = map(int, prefix_l_range)
+        lower = max(lower, range_lower)
+        upper = min(upper, range_upper)
     partitions: list[tuple[int, ...]] = []
     for l in range(lower, upper + 1):
         partition = uniform_prefix_partition(num_layers, pp_size, l)
-        if all(lower <= count <= limits[rank] for rank, count in enumerate(partition)):
+        if all(
+            min_count <= count <= limits[rank] for rank, count in enumerate(partition)
+        ):
             partitions.append(partition)
     return partitions
 
@@ -393,6 +404,8 @@ def optimize(
     target_bs: float | int | None = None,
     layout: LayerLayout | None = None,
     relative_tolerance: float = DEFAULT_RELATIVE_TOLERANCE,
+    prefix_l_range: tuple[int, int] | None = None,
+    stage_comm_ms: Sequence[float] | None = None,
 ) -> OptimizationResult:
     """Select a prefix-uniform partition at one measured execution bucket.
 
@@ -416,7 +429,11 @@ def optimize(
     if active_layout is not None and active_layout.num_layers != model.num_layers:
         raise OptimizerError("layout and stage model have different layer counts")
     partitions = _family_partitions(
-        model.num_layers, model.pp_size, min_layers, max_layers
+        model.num_layers,
+        model.pp_size,
+        min_layers,
+        max_layers,
+        prefix_l_range=prefix_l_range,
     )
     if not partitions:
         raise OptimizerError(
@@ -425,6 +442,17 @@ def optimize(
     warnings: list[str] = []
     if t_comm_ms < 0:
         raise OptimizerError("t_comm_ms must be non-negative")
+    resolved_stage_comm_ms = None
+    if stage_comm_ms is not None:
+        resolved_stage_comm_ms = tuple(float(value) for value in stage_comm_ms)
+        if len(resolved_stage_comm_ms) == model.pp_size - 1:
+            resolved_stage_comm_ms = (0.0, *resolved_stage_comm_ms)
+        if len(resolved_stage_comm_ms) != model.pp_size or any(
+            value < 0.0 for value in resolved_stage_comm_ms
+        ):
+            raise OptimizerError(
+                "stage_comm_ms must contain PP or PP-1 non-negative values"
+            )
     capacity_cache: dict[tuple[int, ...], Any] = {}
 
     def capacity_for(partition: tuple[int, ...]) -> Any:
@@ -440,21 +468,23 @@ def optimize(
     for partition in partitions:
         latency_candidates.append(
             _candidate_from_model(
-                model, estimate, partition, float(t_comm_ms), active_layout
+                model,
+                estimate,
+                partition,
+                float(t_comm_ms),
+                resolved_stage_comm_ms,
+                active_layout,
             )
         )
     latency_candidates.sort(key=lambda item: (item.cycle_time_ms, item.partition))
     compute_best = latency_candidates[0]
     noise_band = max(
         max(float(noise_sigma), 0.0) * compute_best.noise_std_ms,
-        max(float(relative_tolerance), 0.0)
-        * max(compute_best.cycle_time_ms, 0.0),
+        max(float(relative_tolerance), 0.0) * max(compute_best.cycle_time_ms, 0.0),
     )
     threshold = compute_best.cycle_time_ms + noise_band
     latency_band_raw = [
-        item
-        for item in latency_candidates
-        if item.cycle_time_ms <= threshold + 1e-12
+        item for item in latency_candidates if item.cycle_time_ms <= threshold + 1e-12
     ]
 
     evaluated: dict[tuple[int, ...], OptimizerCandidate] = {}
@@ -477,9 +507,7 @@ def optimize(
             key=lambda item: item.partition,
         )
         feasible_band = [
-            item
-            for item in indifference
-            if _is_feasible(capacity_for(item.partition))
+            item for item in indifference if _is_feasible(capacity_for(item.partition))
         ]
         if feasible_band:
             # Every item here is latency-equivalent by construction.  Prefer
@@ -514,7 +542,12 @@ def optimize(
                 )
 
     current_raw = _candidate_from_model(
-        model, estimate, model.current_partition, float(t_comm_ms), active_layout
+        model,
+        estimate,
+        model.current_partition,
+        float(t_comm_ms),
+        resolved_stage_comm_ms,
+        active_layout,
     )
     current_feasible = True
     if capacity is not None:
@@ -534,10 +567,8 @@ def optimize(
     if capacity is None:
         keep_current = current_in_band
     else:
-        keep_current = (
-            current_in_band
-            and (current_raw.memory_capacity or 0)
-            >= (best.memory_capacity or 0)
+        keep_current = current_in_band and (current_raw.memory_capacity or 0) >= (
+            best.memory_capacity or 0
         )
     current_text = ",".join(map(str, model.current_partition))
     if keep_current:
@@ -567,7 +598,9 @@ def optimize(
         if not current_feasible:
             recommendation += " (current partition fails the memory feasibility check)"
         elif not current_is_deployable:
-            recommendation += " (current partition is outside the prefix-uniform family)"
+            recommendation += (
+                " (current partition is outside the prefix-uniform family)"
+            )
 
     selected = current_raw if keep_current else best
     diagnostic_throughput = (
@@ -583,6 +616,13 @@ def optimize(
         target_bs=float(estimate.bucket),
         accept_len=float(estimate.accept_len),
         t_comm_ms=float(t_comm_ms),
+        stage_comm_ms=(
+            resolved_stage_comm_ms
+            if resolved_stage_comm_ms is not None
+            else tuple(
+                0.0 if rank == 0 else float(t_comm_ms) for rank in range(model.pp_size)
+            )
+        ),
         noise_sigma=float(noise_sigma),
         best=best,
         candidates=shown,

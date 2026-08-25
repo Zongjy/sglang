@@ -4,78 +4,65 @@ set -euo pipefail
 SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 REPO_ROOT=$(cd -- "$SCRIPT_DIR/../.." && pwd)
 
-MODEL=${MODEL:-Qwen/Qwen3-8B}
-DRAFT_MODEL=${DRAFT_MODEL:-z-lab/Qwen3-8B-DFlash-b16}
-DATASET=${DATASET:-$SCRIPT_DIR/data/sharegpt.json}
-GPUS=${GPUS:-0,1}
+MODEL=${MODEL:-Qwen/Qwen3.5-9B}
+DRAFT_MODEL=${DRAFT_MODEL:-z-lab/Qwen3.5-9B-DFlash}
 PP_SIZE=${PP_SIZE:-2}
 TP_SIZE=${TP_SIZE:-1}
-BLOCK_SIZE=${BLOCK_SIZE:-16}
-MEM_FRACTION_STATIC=${MEM_FRACTION_STATIC:-0.7}
-CUDA_GRAPH_MAX_BS=${CUDA_GRAPH_MAX_BS:-32}
-CONCURRENCY=${CONCURRENCY:-32}
-PROMPT_TOKENS=${PROMPT_TOKENS:-256}
-DECODE_TOKENS_PER_REQUEST=${DECODE_TOKENS_PER_REQUEST:-256}
-PPM_COLLECT_S=${PPM_COLLECT_S:-30}
-MEMORY_RESERVE_GIB=${MEMORY_RESERVE_GIB:-2.0}
-REQUEST_TIMEOUT_S=${REQUEST_TIMEOUT_S:-1800}
-STARTUP_TIMEOUT_S=${STARTUP_TIMEOUT_S:-600}
-COMM_BENCHMARK_TOKENS=${COMM_BENCHMARK_TOKENS:-64,128,256,512,1024}
-OUTPUT_DIR=${OUTPUT_DIR:-$SCRIPT_DIR/results/${MODEL}_pp_partition_tune_$(date -u +%Y%m%d_%H%M%S)}
+NNODES=${NNODES:-1}
+BATCH_SIZE=${BATCH_SIZE:-32}
+INPUT_TOKENS=${INPUT_TOKENS:-256}
+OUTPUT_TOKENS=${OUTPUT_TOKENS:-128}
+PROFILE_STEPS=${PROFILE_STEPS:-32}
+BLOCK_SIZE=${BLOCK_SIZE:-8}
+PAGE_SIZE=${PAGE_SIZE:-1}
+MEM_FRACTION_STATIC=${MEM_FRACTION_STATIC:-0.82}
+MAMBA_SSM_DTYPE=${MAMBA_SSM_DTYPE:-bfloat16}
+MAMBA_FULL_MEMORY_RATIO=${MAMBA_FULL_MEMORY_RATIO:-2.0}
+OUTPUT_DIR=${OUTPUT_DIR:-$SCRIPT_DIR/results/${MODEL//\//_}_profile_$(date -u +%Y%m%d_%H%M%S)}
 
 ATTENTION_BACKEND=${ATTENTION_BACKEND:-flashinfer}
 DRAFT_ATTENTION_BACKEND=${DRAFT_ATTENTION_BACKEND:-flashinfer}
 DTYPE=${DTYPE:-bfloat16}
 
-[[ -f $DATASET ]] || {
-  echo "ShareGPT dataset not found: $DATASET" >&2
-  exit 1
-}
+if [[ -z ${CURRENT_PARTITION:-} ]]; then
+  echo "CURRENT_PARTITION is required (for example: CURRENT_PARTITION=16,16)" >&2
+  exit 2
+fi
 
-tuner_args=(
-  --pp-size "$PP_SIZE"
-  --tp-size "$TP_SIZE"
+profile_args=(
+  profile
+  --output-dir "$OUTPUT_DIR"
   --model-path "$MODEL"
   --draft-model-path "$DRAFT_MODEL"
+  --pp-size "$PP_SIZE"
+  --tp-size "$TP_SIZE"
+  --nnodes "$NNODES"
+  --current-partition "$CURRENT_PARTITION"
+  --batch-size "$BATCH_SIZE"
+  --input-tokens "$INPUT_TOKENS"
+  --output-tokens "$OUTPUT_TOKENS"
+  --profile-steps "$PROFILE_STEPS"
   --block-size "$BLOCK_SIZE"
+  --page-size "$PAGE_SIZE"
   --mem-fraction-static "$MEM_FRACTION_STATIC"
-  --cuda-graph-max-bs "$CUDA_GRAPH_MAX_BS"
-  --concurrency "$CONCURRENCY"
-  --prompt-tokens "$PROMPT_TOKENS"
-  --decode-tokens-per-request "$DECODE_TOKENS_PER_REQUEST"
-  --dataset "$DATASET"
-  --visible-devices "$GPUS"
-  --ppm-collect-s "$PPM_COLLECT_S"
-  --memory-reserve-gib "$MEMORY_RESERVE_GIB"
-  --request-timeout-s "$REQUEST_TIMEOUT_S"
-  --server-startup-timeout-s "$STARTUP_TIMEOUT_S"
-  --comm-benchmark-tokens "$COMM_BENCHMARK_TOKENS"
-  --output-dir "$OUTPUT_DIR"
+  --mamba-ssm-dtype "$MAMBA_SSM_DTYPE"
+  --mamba-full-memory-ratio "$MAMBA_FULL_MEMORY_RATIO"
 )
 
-if [[ -n ${CURRENT_PARTITION:-} ]]; then
-  tuner_args+=(--current-partition "$CURRENT_PARTITION")
+if [[ -n ${EXECUTION_BUCKET:-} ]]; then
+  profile_args+=(--execution-bucket "$EXECUTION_BUCKET")
 fi
-if [[ -n ${FIXED_ACTIVE_REQUESTS:-} ]]; then
-  tuner_args+=(--fixed-active-requests "$FIXED_ACTIVE_REQUESTS")
+if [[ -n ${MAX_RUNNING_REQUESTS:-} ]]; then
+  profile_args+=(--max-running-requests "$MAX_RUNNING_REQUESTS")
 fi
-if [[ -n ${CAPTURE_BUCKETS:-} ]]; then
-  tuner_args+=(--capture-buckets "$CAPTURE_BUCKETS")
-fi
-if [[ -n ${MAMBA_SSM_DTYPE:-} ]]; then
-  tuner_args+=(--mamba-ssm-dtype "$MAMBA_SSM_DTYPE")
-fi
-if [[ -n ${MAMBA_FULL_MEMORY_RATIO:-} ]]; then
-  tuner_args+=(--mamba-full-memory-ratio "$MAMBA_FULL_MEMORY_RATIO")
-fi
-if [[ -n ${T_COMM_MS:-} ]]; then
-  tuner_args+=(--t-comm-ms "$T_COMM_MS")
+if [[ ${OFFLINE:-0} == 1 ]]; then
+  profile_args+=(--offline)
 fi
 
-echo "PP tuner output: $OUTPUT_DIR"
+echo "RayEngine PP profile output: $OUTPUT_DIR"
 cd "$REPO_ROOT"
 exec python "$SCRIPT_DIR/adaptive_pp_tuner.py" \
-  "${tuner_args[@]}" \
+  "${profile_args[@]}" \
   "$@" \
   --server-args \
   --dtype "$DTYPE" \
