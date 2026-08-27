@@ -1,12 +1,5 @@
 #!/usr/bin/env python3
-"""Summarize SGLang Torch profiler traces into per-PP-stage costs.
-
-The parser deliberately uses only the Chrome trace schema emitted by
-``torch.profiler``.  It treats consecutive ``run_batch`` annotations as
-steady-state iteration windows and measures the union of GPU activity inside
-each window.  DFlash target/draft attribution is best-effort: kernels are
-matched to the new record-function ranges through external/correlation ids.
-"""
+"""Extract intrinsic PP stage costs from Kineto Chrome traces."""
 
 from __future__ import annotations
 
@@ -14,23 +7,15 @@ import gzip
 import json
 import re
 import statistics
-from dataclasses import asdict, dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable, Sequence
 
+
 PP_RANK = re.compile(r"(?:^|[-_.])PP[-_](\d+)(?:[-_.]|$)", re.IGNORECASE)
 TP_RANK = re.compile(r"(?:^|[-_.])TP[-_](\d+)(?:[-_.]|$)", re.IGNORECASE)
-
-TARGET_MARKERS = {
-    "sglang.dflash.target_verify_forward",
-    "sglang.dflash.target_prefill_forward",
-}
-VERIFY_MARKERS = {"sglang.dflash.target_verify_forward"}
-DRAFT_MARKERS = {"sglang.dflash.draft_model_forward"}
-PP_WAIT_PREFIXES = (
-    "scheduler.pp.wait_",
-    "recv_res_dict_from_prev_stage",
-)
+VERIFY_MARKER = "sglang.dflash.target_verify_forward"
+P2P_KERNEL = re.compile(r"(?:nccl|rccl).*?(?:sendrecv|send|recv)", re.IGNORECASE)
 
 
 class TraceProfileError(RuntimeError):
@@ -42,58 +27,41 @@ class Interval:
     start_us: float
     end_us: float
 
-    @property
-    def duration_us(self) -> float:
-        return max(self.end_us - self.start_us, 0.0)
-
 
 @dataclass
 class RankTraceProfile:
-    path: str
     pp_rank: int
     tp_rank: int
-    service_samples_ms: list[float]
+    intrinsic_samples_ms: list[float]
     target_samples_ms: list[float]
-    draft_samples_ms: list[float]
-    wait_samples_ms: list[float]
-    used_gpu_events: bool
-    warnings: list[str] = field(default_factory=list)
+    pp_p2p_windows: int
 
     @property
-    def service_median_ms(self) -> float:
-        return _median(self.service_samples_ms)
+    def intrinsic_median_ms(self) -> float:
+        return float(statistics.median(self.intrinsic_samples_ms))
+
+    @property
+    def target_median_ms(self) -> float:
+        return float(statistics.median(self.target_samples_ms))
 
 
-def _median(values: Sequence[float]) -> float:
-    return float(statistics.median(values)) if values else 0.0
-
-
-def _variance_of_mean(values: Sequence[float]) -> float:
-    if len(values) <= 1:
-        return 0.0
-    return float(statistics.pvariance(values) / len(values))
-
-
-def _read_trace(path: Path) -> dict[str, Any]:
+def _read_trace(path: Path) -> list[dict[str, Any]]:
     opener = gzip.open if path.suffix == ".gz" else open
     try:
         with opener(path, "rt", encoding="utf-8") as handle:
             payload = json.load(handle)
     except (OSError, json.JSONDecodeError) as exc:
         raise TraceProfileError(f"cannot read profiler trace {path}: {exc}") from exc
-    if not isinstance(payload, dict) or not isinstance(
-        payload.get("traceEvents"), list
-    ):
-        raise TraceProfileError(f"{path} is not a Chrome trace with traceEvents")
-    return payload
+    events = payload.get("traceEvents") if isinstance(payload, dict) else None
+    if not isinstance(events, list):
+        raise TraceProfileError(f"{path} is not a Kineto Chrome trace")
+    return [event for event in events if isinstance(event, dict)]
 
 
 def _rank_from_path(path: Path, pattern: re.Pattern[str], label: str) -> int:
     match = pattern.search(path.name)
     if match is None:
-        raise TraceProfileError(
-            f"cannot infer {label} rank from trace filename {path.name!r}"
-        )
+        raise TraceProfileError(f"cannot infer {label} rank from {path.name!r}")
     return int(match.group(1))
 
 
@@ -117,9 +85,8 @@ def _merge(intervals: Iterable[Interval]) -> list[Interval]:
         if not merged or interval.start_us > merged[-1].end_us:
             merged.append(interval)
         else:
-            previous = merged[-1]
             merged[-1] = Interval(
-                previous.start_us, max(previous.end_us, interval.end_us)
+                merged[-1].start_us, max(merged[-1].end_us, interval.end_us)
             )
     return merged
 
@@ -151,96 +118,90 @@ def _arg_id(args: Any, names: Sequence[str]) -> str | None:
 
 def _is_gpu_event(event: dict[str, Any]) -> bool:
     category = str(event.get("cat", "")).lower()
-    if category in {"kernel", "gpu_memcpy", "gpu_memset"}:
-        return True
-    return "kernel" in category and "cuda_runtime" not in category
+    return category in {"kernel", "gpu_memcpy", "gpu_memset"} or (
+        "kernel" in category and "cuda_runtime" not in category
+    )
 
 
-def _category_for_timestamp(
-    timestamp_us: float,
-    target_markers: Sequence[Interval],
-    draft_markers: Sequence[Interval],
-) -> str | None:
-    if _contains(target_markers, timestamp_us):
-        return "target"
-    if _contains(draft_markers, timestamp_us):
-        return "draft"
-    return None
+def _is_pp_p2p(event: dict[str, Any]) -> bool:
+    args = event.get("args")
+    if not isinstance(args, dict):
+        return False
+    return (
+        str(args.get("Process Group Description", "")).strip().casefold()
+        == "pp:device"
+        and str(args.get("Collective name", "")).strip().casefold()
+        in {"send", "recv"}
+    )
 
 
-def _classified_gpu_intervals(
-    events: Sequence[dict[str, Any]],
-    target_markers: Sequence[Interval],
-    draft_markers: Sequence[Interval],
-) -> tuple[list[Interval], list[Interval], list[Interval]]:
-    external_category: dict[str, str] = {}
-    correlation_category: dict[str, str] = {}
+def _is_p2p_candidate(event: dict[str, Any]) -> bool:
+    args = event.get("args")
+    collective = args.get("Collective name") if isinstance(args, dict) else None
+    return str(collective).strip().casefold() in {"send", "recv"} or bool(
+        P2P_KERNEL.search(str(event.get("name", "")))
+    )
 
+
+def _target_gpu_intervals(
+    events: Sequence[dict[str, Any]], verify_markers: Sequence[Interval]
+) -> list[Interval]:
+    external_ids: set[str] = set()
+    correlation_ids: set[str] = set()
     for event in events:
         interval = _as_interval(event)
         if interval is None or _is_gpu_event(event):
             continue
-        category = _category_for_timestamp(
-            interval.start_us, target_markers, draft_markers
-        )
-        if category is None:
+        if not _contains(verify_markers, interval.start_us):
             continue
         external_id = _arg_id(event.get("args"), ("External id", "external id"))
         if external_id is not None:
-            external_category[external_id] = category
+            external_ids.add(external_id)
         correlation = _arg_id(
             event.get("args"),
             ("correlation", "Correlation id", "correlation_id"),
         )
         if correlation is not None:
-            correlation_category[correlation] = category
+            correlation_ids.add(correlation)
 
     for event in events:
-        category_name = str(event.get("cat", "")).lower()
-        if "cuda_runtime" not in category_name:
+        if "cuda_runtime" not in str(event.get("cat", "")).lower():
             continue
         interval = _as_interval(event)
-        if interval is None:
+        if interval is None or not _contains(verify_markers, interval.start_us):
             continue
-        category = _category_for_timestamp(
-            interval.start_us, target_markers, draft_markers
-        )
         correlation = _arg_id(
             event.get("args"),
             ("correlation", "Correlation id", "correlation_id"),
         )
-        if category is not None and correlation is not None:
-            correlation_category[correlation] = category
+        if correlation is not None:
+            correlation_ids.add(correlation)
 
-    all_gpu: list[Interval] = []
     target_gpu: list[Interval] = []
-    draft_gpu: list[Interval] = []
     for event in events:
-        if not _is_gpu_event(event):
+        if not _is_gpu_event(event) or _is_pp_p2p(event):
             continue
         interval = _as_interval(event)
         if interval is None:
             continue
-        all_gpu.append(interval)
         args = event.get("args")
         external_id = _arg_id(args, ("External id", "external id"))
-        correlation = _arg_id(args, ("correlation", "Correlation id", "correlation_id"))
-        category = external_category.get(external_id or "") or correlation_category.get(
-            correlation or ""
+        correlation = _arg_id(
+            args, ("correlation", "Correlation id", "correlation_id")
         )
-        if category == "target":
+        if (external_id is not None and external_id in external_ids) or (
+            correlation is not None and correlation in correlation_ids
+        ):
             target_gpu.append(interval)
-        elif category == "draft":
-            draft_gpu.append(interval)
-    return _merge(all_gpu), _merge(target_gpu), _merge(draft_gpu)
+    return _merge(target_gpu)
 
 
 def parse_rank_trace(path: Path, trim_samples: int = 1) -> RankTraceProfile:
-    payload = _read_trace(path)
-    events = [event for event in payload["traceEvents"] if isinstance(event, dict)]
+    if trim_samples < 0:
+        raise TraceProfileError("trim_samples cannot be negative")
+    events = _read_trace(path)
     pp_rank = _rank_from_path(path, PP_RANK, "PP")
     tp_rank = _rank_from_path(path, TP_RANK, "TP")
-
     run_batches = sorted(
         (
             interval
@@ -251,110 +212,96 @@ def parse_rank_trace(path: Path, trim_samples: int = 1) -> RankTraceProfile:
         key=lambda item: item.start_us,
     )
     if len(run_batches) < 2:
-        raise TraceProfileError(
-            f"{path} has fewer than two run_batch ranges; increase --profile-steps"
-        )
+        raise TraceProfileError(f"{path} has fewer than two run_batch ranges")
 
-    target_markers = _merge(
-        interval
-        for event in events
-        if event.get("name") in TARGET_MARKERS
-        if (interval := _as_interval(event)) is not None
-    )
     verify_markers = _merge(
         interval
         for event in events
-        if event.get("name") in VERIFY_MARKERS
+        if event.get("name") == VERIFY_MARKER
         if (interval := _as_interval(event)) is not None
     )
-    draft_markers = _merge(
+    if not verify_markers:
+        raise TraceProfileError(f"{path} has no {VERIFY_MARKER} marker")
+
+    all_gpu = [
         interval
         for event in events
-        if event.get("name") in DRAFT_MARKERS
+        if _is_gpu_event(event)
         if (interval := _as_interval(event)) is not None
-    )
-    wait_intervals = _merge(
-        interval
-        for event in events
-        if any(
-            str(event.get("name", "")).startswith(prefix) for prefix in PP_WAIT_PREFIXES
+    ]
+    if not all_gpu:
+        raise TraceProfileError(f"{path} has no GPU events")
+    ambiguous_p2p = []
+    for event in events:
+        if not _is_gpu_event(event) or not _is_p2p_candidate(event):
+            continue
+        if _is_pp_p2p(event):
+            continue
+        args = event.get("args")
+        process_group = (
+            str(args.get("Process Group Description", "")).strip().casefold()
+            if isinstance(args, dict)
+            else ""
         )
+        if not process_group or process_group == "pp:device":
+            ambiguous_p2p.append(event)
+    if ambiguous_p2p:
+        raise TraceProfileError(
+            f"{path} has {len(ambiguous_p2p)} Send/Recv GPU events without "
+            "complete process-group metadata"
+        )
+    pp_p2p = _merge(
+        interval
+        for event in events
+        if _is_gpu_event(event) and _is_pp_p2p(event)
         if (interval := _as_interval(event)) is not None
     )
-    all_gpu, target_gpu, draft_gpu = _classified_gpu_intervals(
-        events, target_markers, draft_markers
+    intrinsic_gpu = _merge(
+        interval
+        for event in events
+        if _is_gpu_event(event) and not _is_pp_p2p(event)
+        if (interval := _as_interval(event)) is not None
     )
+    target_gpu = _target_gpu_intervals(events, verify_markers)
+    if not target_gpu:
+        raise TraceProfileError(
+            f"{path} cannot correlate {VERIFY_MARKER} to GPU events"
+        )
 
-    windows: list[Interval] = []
-    for index, batch in enumerate(run_batches[:-1]):
-        windows.append(Interval(batch.start_us, run_batches[index + 1].start_us))
-
-    # DFlash traces contain prefill and decode in the same capture. Retain only
-    # windows containing target-verify work when those markers are available.
-    if verify_markers:
-        decode_windows = [
-            window
-            for window in windows
-            if any(
-                window.start_us <= marker.start_us < window.end_us
-                for marker in verify_markers
-            )
-        ]
-        if decode_windows:
-            windows = decode_windows
-
+    windows = [
+        Interval(batch.start_us, run_batches[index + 1].start_us)
+        for index, batch in enumerate(run_batches[:-1])
+        if any(
+            batch.start_us <= marker.start_us < run_batches[index + 1].start_us
+            for marker in verify_markers
+        )
+    ]
     if trim_samples > 0 and len(windows) > 2 * trim_samples:
         windows = windows[trim_samples:-trim_samples]
     if not windows:
-        raise TraceProfileError(f"{path} has no usable steady-state run_batch windows")
+        raise TraceProfileError(f"{path} has no steady-state verify windows")
 
-    used_gpu_events = bool(all_gpu)
-    service_samples = []
-    target_samples = []
-    draft_samples = []
-    wait_samples = []
-    warnings: list[str] = []
+    intrinsic_samples: list[float] = []
+    target_samples: list[float] = []
+    pp_p2p_windows = 0
     for window in windows:
-        if used_gpu_events:
-            service_us = _overlap_us(all_gpu, window)
-            target_us = _overlap_us(target_gpu, window)
-            draft_us = _overlap_us(draft_gpu, window)
-        else:
-            service_us = _overlap_us(run_batches, window)
-            target_us = _overlap_us(target_markers, window)
-            draft_us = _overlap_us(draft_markers, window)
-        if service_us <= 0.0:
-            continue
-        service_samples.append(service_us / 1000.0)
+        intrinsic_us = _overlap_us(intrinsic_gpu, window)
+        target_us = _overlap_us(target_gpu, window)
+        if intrinsic_us <= 0.0 or target_us <= 0.0:
+            raise TraceProfileError(
+                f"{path} has a verify window without correlated GPU work"
+            )
+        if target_us > intrinsic_us + 1e-6:
+            raise TraceProfileError(f"{path} target GPU union exceeds intrinsic union")
+        pp_p2p_windows += _overlap_us(pp_p2p, window) > 0.0
+        intrinsic_samples.append(intrinsic_us / 1000.0)
         target_samples.append(target_us / 1000.0)
-        draft_samples.append(draft_us / 1000.0)
-        wait_samples.append(_overlap_us(wait_intervals, window) / 1000.0)
-
-    if not service_samples:
-        raise TraceProfileError(f"{path} has no positive service-time samples")
-    if not used_gpu_events:
-        warnings.append(
-            "trace has no GPU events; service times use CPU run_batch ranges"
-        )
-    if target_markers and not any(value > 0 for value in target_samples):
-        warnings.append(
-            "DFlash target markers were found but GPU correlation was unavailable"
-        )
-    if draft_markers and not any(value > 0 for value in draft_samples):
-        warnings.append(
-            "DFlash draft markers were found but GPU correlation was unavailable"
-        )
-
     return RankTraceProfile(
-        path=str(path),
         pp_rank=pp_rank,
         tp_rank=tp_rank,
-        service_samples_ms=service_samples,
+        intrinsic_samples_ms=intrinsic_samples,
         target_samples_ms=target_samples,
-        draft_samples_ms=draft_samples,
-        wait_samples_ms=wait_samples,
-        used_gpu_events=used_gpu_events,
-        warnings=warnings,
+        pp_p2p_windows=pp_p2p_windows,
     )
 
 
@@ -362,50 +309,54 @@ def summarize_trace_dir(
     trace_dir: Path,
     *,
     pp_size: int,
+    tp_size: int,
     trim_samples: int = 1,
 ) -> dict[str, Any]:
+    if pp_size <= 0 or tp_size <= 0:
+        raise TraceProfileError("pp_size and tp_size must be positive")
     paths = sorted(path for path in trace_dir.rglob("*.trace.json*") if path.is_file())
     if not paths:
-        raise TraceProfileError(f"no *.trace.json[.gz] files found under {trace_dir}")
-
+        raise TraceProfileError(f"no Kineto traces found under {trace_dir}")
     profiles = [parse_rank_trace(path, trim_samples=trim_samples) for path in paths]
-    by_pp: dict[int, list[RankTraceProfile]] = {}
+
+    by_rank: dict[tuple[int, int], RankTraceProfile] = {}
     for profile in profiles:
-        by_pp.setdefault(profile.pp_rank, []).append(profile)
-    missing = [rank for rank in range(pp_size) if rank not in by_pp]
-    if missing:
-        raise TraceProfileError(f"trace set is missing PP rank(s) {missing}")
+        rank = (profile.pp_rank, profile.tp_rank)
+        if rank in by_rank:
+            raise TraceProfileError(f"duplicate (PP, TP) trace rank {rank}")
+        by_rank[rank] = profile
+    expected = {
+        (pp_rank, tp_rank)
+        for pp_rank in range(pp_size)
+        for tp_rank in range(tp_size)
+    }
+    actual = set(by_rank)
+    if actual != expected:
+        raise TraceProfileError(
+            f"trace ranks do not match PP{pp_size}xTP{tp_size}: "
+            f"missing={sorted(expected - actual)}, extra={sorted(actual - expected)}"
+        )
+    if pp_size > 1 and any(
+        profile.pp_p2p_windows != len(profile.intrinsic_samples_ms)
+        for profile in profiles
+    ):
+        missing = sorted(
+            (profile.pp_rank, profile.tp_rank)
+            for profile in profiles
+            if profile.pp_p2p_windows != len(profile.intrinsic_samples_ms)
+        )
+        raise TraceProfileError(
+            f"Kineto PP Send/Recv metadata is missing from verify windows on ranks {missing}"
+        )
 
-    selected: list[RankTraceProfile] = []
-    for pp_rank in range(pp_size):
-        # A TP stage advances at its slowest shard. Use the shard with the
-        # largest median service time as the conservative stage observation.
-        selected.append(max(by_pp[pp_rank], key=lambda item: item.service_median_ms))
-
-    service_ms = [item.service_median_ms for item in selected]
-    target_ms = [_median(item.target_samples_ms) for item in selected]
-    draft_ms = [_median(item.draft_samples_ms) for item in selected]
-    wait_ms = [_median(item.wait_samples_ms) for item in selected]
+    selected = [
+        max(
+            (by_rank[(pp_rank, tp_rank)] for tp_rank in range(tp_size)),
+            key=lambda item: item.intrinsic_median_ms,
+        )
+        for pp_rank in range(pp_size)
+    ]
     return {
-        "schema_version": 1,
-        "trace_dir": str(trace_dir),
-        "service_ms": service_ms,
-        "service_var": [
-            _variance_of_mean(item.service_samples_ms) for item in selected
-        ],
-        "target_ms": target_ms,
-        "target_var": [_variance_of_mean(item.target_samples_ms) for item in selected],
-        "draft_ms": draft_ms[-1] if draft_ms else 0.0,
-        "draft_var": (
-            _variance_of_mean(selected[-1].draft_samples_ms) if selected else 0.0
-        ),
-        "wait_ms": wait_ms,
-        "wait_fraction": [
-            wait / service if service > 0 else 0.0
-            for wait, service in zip(wait_ms, service_ms)
-        ],
-        "samples": min(len(item.service_samples_ms) for item in selected),
-        "selected_traces": [asdict(item) for item in selected],
-        "all_traces": [asdict(item) for item in profiles],
-        "warnings": [warning for item in profiles for warning in item.warnings],
+        "intrinsic_service_ms": [item.intrinsic_median_ms for item in selected],
+        "target_ms": [item.target_median_ms for item in selected],
     }

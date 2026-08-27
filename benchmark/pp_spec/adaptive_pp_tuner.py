@@ -25,13 +25,10 @@ from __future__ import annotations
 import argparse
 import importlib.util
 import json
-import math
 import os
 import shlex
 import subprocess
 import sys
-from dataclasses import asdict, is_dataclass
-from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
@@ -39,31 +36,17 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 REPO_ROOT = SCRIPT_DIR.parents[1]
 DEFAULT_MODEL = "Qwen/Qwen3.5-9B"
 DEFAULT_DRAFT_MODEL = "z-lab/Qwen3.5-9B-DFlash"
-PROFILE_MANIFEST = "profile_manifest.json"
+PROFILE_CONFIG = "profile.json"
 
 
 class TuningError(RuntimeError):
     pass
 
 
-def _json_ready(value: Any) -> Any:
-    if is_dataclass(value):
-        return _json_ready(asdict(value))
-    if isinstance(value, Path):
-        return str(value)
-    if isinstance(value, tuple):
-        return [_json_ready(item) for item in value]
-    if isinstance(value, list):
-        return [_json_ready(item) for item in value]
-    if isinstance(value, dict):
-        return {str(key): _json_ready(item) for key, item in value.items()}
-    return value
-
-
 def write_json(path: Path, payload: Any) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w") as handle:
-        json.dump(_json_ready(payload), handle, indent=2)
+        json.dump(payload, handle, indent=2)
         handle.write("\n")
 
 
@@ -107,6 +90,18 @@ def _contains_flag(arguments: Sequence[str], name: str) -> bool:
     return any(item == name or item.startswith(name + "=") for item in arguments)
 
 
+def _execution_bucket(args: argparse.Namespace) -> int:
+    max_running = args.max_running_requests or args.batch_size
+    if args.execution_bucket is not None:
+        return args.execution_bucket
+    if max_running % args.pp_size:
+        raise TuningError(
+            "--max-running-requests must be divisible by --pp-size when "
+            "--execution-bucket is omitted"
+        )
+    return max_running // args.pp_size
+
+
 def build_profile_command(args: argparse.Namespace, profile_dir: Path) -> list[str]:
     if args.tp_size <= 0 or args.pp_size <= 0 or args.nnodes <= 0:
         raise TuningError("--tp-size, --pp-size, and --nnodes must be positive")
@@ -129,6 +124,9 @@ def build_profile_command(args: argparse.Namespace, profile_dir: Path) -> list[s
     max_running = args.max_running_requests or args.batch_size
     if max_running <= 0:
         raise TuningError("--max-running-requests must be positive")
+    execution_bucket = _execution_bucket(args)
+    if execution_bucket <= 0:
+        raise TuningError("--execution-bucket must be positive")
     command = [
         sys.executable,
         "-m",
@@ -162,14 +160,18 @@ def build_profile_command(args: argparse.Namespace, profile_dir: Path) -> list[s
         str(args.mamba_full_memory_ratio),
         "--max-running-requests",
         str(max_running),
+        "--cuda-graph-max-bs-decode",
+        str(execution_bucket),
         "--dataset-name",
         "random",
         "--random-input-len",
         str(args.input_tokens),
         "--random-output-len",
         str(args.output_tokens),
+        # The random sampler interprets this as the lower/full length ratio.
+        # 1.0 keeps every profiled request at the declared lengths.
         "--random-range-ratio",
-        "0",
+        "1.0",
         "--num-prompts",
         str(args.batch_size),
         "--profile",
@@ -196,6 +198,7 @@ def build_profile_command(args: argparse.Namespace, profile_dir: Path) -> list[s
         "--pp-layer-partition",
         "--nnodes",
         "--use-ray",
+        "--cuda-graph-max-bs-decode",
     )
     if any(_contains_flag(extra, name) for name in controlled):
         raise TuningError(
@@ -221,32 +224,9 @@ def run_profile(args: argparse.Namespace) -> Path:
     profile_dir.mkdir(parents=True, exist_ok=True)
     command = build_profile_command(args, profile_dir)
     partition = parse_partition(args.current_partition, args.pp_size)
-    execution_bucket = args.execution_bucket or math.ceil(
-        args.batch_size / args.pp_size
-    )
+    execution_bucket = _execution_bucket(args)
     if execution_bucket <= 0:
         raise TuningError("--execution-bucket must be positive")
-    manifest = {
-        "schema_version": 1,
-        "status": "running",
-        "started_at": datetime.now(timezone.utc).isoformat(),
-        "profile_dir": profile_dir,
-        "model_path": args.model_path,
-        "draft_model_path": args.draft_model_path,
-        "tp_size": args.tp_size,
-        "pp_size": args.pp_size,
-        "nnodes": args.nnodes,
-        "current_partition": partition,
-        "batch_size": args.batch_size,
-        "execution_bucket": execution_bucket,
-        "input_tokens": args.input_tokens,
-        "output_tokens": args.output_tokens,
-        "profile_steps": args.profile_steps,
-        "block_size": args.block_size,
-        "command": command,
-    }
-    write_json(profile_dir / PROFILE_MANIFEST, manifest)
-
     env = os.environ.copy()
     env["SGLANG_TORCH_PROFILER_DIR"] = str(profile_dir)
     env["SGLANG_PROFILE_WITH_STACK"] = "false"
@@ -267,8 +247,6 @@ def run_profile(args: argparse.Namespace) -> Path:
             stderr=subprocess.STDOUT,
         )
     if completed.returncode != 0:
-        manifest.update(status="failed", returncode=completed.returncode)
-        write_json(profile_dir / PROFILE_MANIFEST, manifest)
         raise TuningError(
             f"SGLang offline profile failed with code {completed.returncode}; "
             f"see {log_path}"
@@ -280,66 +258,55 @@ def run_profile(args: argparse.Namespace) -> Path:
             "profile completed but no trace files are visible. For multi-node "
             "runs, use a profile directory shared at the same path by every Ray node."
         )
-    manifest.update(
-        status="complete",
-        completed_at=datetime.now(timezone.utc).isoformat(),
-        traces=[str(path.relative_to(profile_dir)) for path in traces],
+    write_json(
+        profile_dir / PROFILE_CONFIG,
+        {
+            "model_path": args.model_path,
+            "tp_size": args.tp_size,
+            "pp_size": args.pp_size,
+            "current_partition": list(partition),
+            "execution_bucket": execution_bucket,
+        },
     )
-    write_json(profile_dir / PROFILE_MANIFEST, manifest)
     print(f"[profile] traces written under {profile_dir}", flush=True)
     return profile_dir
 
 
-def _load_manifest(profile_dir: Path) -> dict[str, Any]:
-    path = profile_dir / PROFILE_MANIFEST
+def _load_profile(profile_dir: Path) -> dict[str, Any]:
+    path = profile_dir / PROFILE_CONFIG
     try:
-        manifest = json.loads(path.read_text())
+        profile = json.loads(path.read_text())
     except (OSError, json.JSONDecodeError) as exc:
         raise TuningError(f"cannot read {path}: {exc}") from exc
-    if manifest.get("status") != "complete":
-        raise TuningError(f"profile is not complete: {path}")
-    return manifest
+    return profile
 
 
 def _typed_layer_costs(
     layout: Any,
-    observations: Sequence[tuple[Sequence[int], Sequence[float]]],
-) -> tuple[float, float, float, list[str]]:
-    per_layer = []
-    for partition, target_ms in observations:
-        ranks = (
-            range(1, len(partition) - 1)
-            if len(partition) > 2
-            else range(len(partition))
-        )
-        for rank in ranks:
-            value = target_ms[rank]
-            count = partition[rank]
-            if value > 0.0 and count > 0:
-                per_layer.append(value / count)
-    fallback = float(sorted(per_layer)[len(per_layer) // 2]) if per_layer else 0.0
-    warnings: list[str] = []
-    if observations and len(observations[0][0]) <= 2:
-        warnings.append(
-            "PP<=2 has no middle stage; endpoint overhead cannot be separated "
-            "completely from typed layer costs"
-        )
+    partition: Sequence[int],
+    target_ms: Sequence[float],
+) -> tuple[float, float, float]:
+    fit_ranks = (
+        range(1, len(partition) - 1)
+        if len(partition) > 2
+        else range(len(partition))
+    )
+    per_layer = [
+        target_ms[rank] / partition[rank]
+        for rank in fit_ranks
+        if target_ms[rank] > 0.0 and partition[rank] > 0
+    ]
+    conservative_cost = max(per_layer, default=0.0)
     if layout is None or not per_layer:
-        return fallback, fallback, fallback, warnings
+        return conservative_cost, conservative_cost, conservative_cost
 
     rows: list[tuple[int, int, float]] = []
-    for partition, target_ms in observations:
-        fit_ranks = (
-            range(1, len(partition) - 1)
-            if len(partition) > 2
-            else range(len(partition))
-        )
-        start = 0
-        for rank, (count, observed) in enumerate(zip(partition, target_ms)):
-            gdn, full = layout.count_range(start, start + count)
-            start += count
-            if rank in fit_ranks and observed > 0.0:
-                rows.append((gdn, full, observed))
+    start = 0
+    for rank, (count, observed) in enumerate(zip(partition, target_ms)):
+        gdn, full = layout.count_range(start, start + count)
+        start += count
+        if rank in fit_ranks and observed > 0.0:
+            rows.append((gdn, full, observed))
     gg = sum(gdn * gdn for gdn, _full, _value in rows)
     ff = sum(full * full for _gdn, full, _value in rows)
     gf = sum(gdn * full for gdn, full, _value in rows)
@@ -347,36 +314,28 @@ def _typed_layer_costs(
     fy = sum(full * value for _gdn, full, value in rows)
     determinant = gg * ff - gf * gf
     if determinant <= 1e-9:
-        warnings.append(
-            "baseline stages do not provide independent GDN/full compositions; "
-            "using one average per-layer cost"
-        )
-        return fallback, fallback, fallback, warnings
+        return conservative_cost, conservative_cost, conservative_cost
     gdn_cost = (gy * ff - fy * gf) / determinant
     full_cost = (fy * gg - gy * gf) / determinant
     if gdn_cost <= 0.0 or full_cost <= 0.0:
-        warnings.append(
-            "typed least-squares fit produced a non-positive layer cost; using "
-            "one average per-layer cost"
-        )
-        return fallback, fallback, fallback, warnings
+        return conservative_cost, conservative_cost, conservative_cost
     weighted = sum(gdn * gdn_cost + full * full_cost for gdn, full, _ in rows) / sum(
         gdn + full for gdn, full, _ in rows
     )
-    return weighted, gdn_cost, full_cost, warnings
+    return weighted, gdn_cost, full_cost
+
+
+def _intrinsic_service_observation(summary: Mapping[str, Any]) -> list[float]:
+    intrinsic = [float(value) for value in summary["intrinsic_service_ms"]]
+    if not intrinsic:
+        raise TuningError("trace summary has no intrinsic stage times")
+    return intrinsic
 
 
 def _target_observation(summary: Mapping[str, Any]) -> list[float]:
-    service = [float(value) for value in summary["service_ms"]]
-    target = [float(value) for value in summary.get("target_ms", ())]
-    if any(value > 0.0 for value in target):
-        return target
-    target = list(service)
-    if target:
-        # The last stage owns DFlash proposal/materialization. Exclude it from
-        # a fallback layer fit and recover its residual after fitting the other
-        # ranks or neighboring partition profiles.
-        target[-1] = 0.0
+    target = [float(value) for value in summary["target_ms"]]
+    if not target or any(value <= 0.0 for value in target):
+        raise TuningError("trace summary has no positive target stage times")
     return target
 
 
@@ -384,48 +343,33 @@ def _bucket_profile(
     summary: Mapping[str, Any],
     partition: Sequence[int],
     layout: Any,
-    accept_len: float,
-    typed_costs: tuple[float, float, float, list[str]] | None = None,
-) -> tuple[dict[str, Any], list[str]]:
-    service = [float(value) for value in summary["service_ms"]]
+    typed_costs: tuple[float, float, float] | None = None,
+) -> dict[str, Any]:
+    intrinsic_service = _intrinsic_service_observation(summary)
     target = _target_observation(summary)
-    draft = float(summary.get("draft_ms", 0.0))
-    layer, gdn, full, warnings = typed_costs or _typed_layer_costs(
-        layout, [(partition, target)]
+    if len(intrinsic_service) != len(partition) or len(target) != len(partition):
+        raise TuningError("trace stage count does not match the baseline partition")
+    layer, gdn, full = typed_costs or _typed_layer_costs(
+        layout, partition, target
     )
-    warnings = list(warnings)
     fixed: list[float] = []
     start = 0
-    for rank, (count, observed) in enumerate(zip(partition, service)):
+    for rank, (count, observed) in enumerate(zip(partition, intrinsic_service)):
         if layout is not None:
             gdn_count, full_count = layout.count_range(start, start + count)
             predicted_layers = gdn_count * gdn + full_count * full
         else:
             predicted_layers = count * layer
         start += count
-        residual = observed - predicted_layers
-        if residual < 0.0:
-            warnings.append(
-                f"rank {rank} fixed residual {residual:.3f} ms was clamped to zero"
-            )
-            residual = 0.0
-        fixed.append(residual)
+        fixed.append(max(observed - predicted_layers, 0.0))
 
     raw = {
-        "service_ms": service,
-        "service_var": summary.get("service_var", [0.0] * len(service)),
         "fixed_ms": fixed,
-        "fixed_var": summary.get("service_var", [0.0] * len(service)),
         "layer_cost_ms": layer,
         "gdn_cost_ms": gdn,
         "full_cost_ms": full,
-        "draft_ms": draft,
-        "draft_var": float(summary.get("draft_var", 0.0)),
-        "accept_len": accept_len,
-        "wait_fraction": summary.get("wait_fraction", [0.0] * len(service)),
-        "samples": int(summary.get("samples", 0)),
     }
-    return raw, warnings
+    return raw
 
 
 def run_analysis(args: argparse.Namespace) -> Path:
@@ -435,106 +379,53 @@ def run_analysis(args: argparse.Namespace) -> Path:
     import torch_trace_profile
     from model_layout import LayerLayout
 
-    profile_dirs = [path.resolve() for path in args.profile_dir]
+    profile_dir = args.profile_dir.resolve()
     if args.trim_samples < 0:
         raise TuningError("--trim-samples cannot be negative")
-    if args.target_batch_size is not None and args.target_batch_size <= 0:
-        raise TuningError("--target-batch-size must be positive")
-    if args.accept_len < 0.0:
-        raise TuningError("--accept-len cannot be negative")
-    manifests = [_load_manifest(path) for path in profile_dirs]
-    first = manifests[0]
-    pp_size = int(first["pp_size"])
-    partition = (
-        parse_partition(args.current_partition, pp_size)
-        if args.current_partition
-        else tuple(int(value) for value in first["current_partition"])
-    )
-    model_path = args.model_path or str(first["model_path"])
-    num_layers = sum(partition)
-    for manifest in manifests:
-        if int(manifest["pp_size"]) != pp_size:
-            raise TuningError("all profiles must use the same pp_size")
-        profile_partition = tuple(int(value) for value in manifest["current_partition"])
-        if len(profile_partition) != pp_size or sum(profile_partition) != num_layers:
-            raise TuningError(
-                "all profile partitions must cover the same model layers and pp_size"
-            )
-        if str(manifest["model_path"]) != str(first["model_path"]):
-            raise TuningError("all profiles must use the same model")
+    profile = _load_profile(profile_dir)
+    pp_size = int(profile["pp_size"])
+    tp_size = int(profile["tp_size"])
+    try:
+        partition = tuple(int(value) for value in profile["current_partition"])
+    except (KeyError, TypeError, ValueError) as exc:
+        raise TuningError("baseline profile has an invalid partition") from exc
+    if len(partition) != pp_size or any(value <= 0 for value in partition):
+        raise TuningError("baseline profile partition does not match pp_size")
+    model_path = str(profile["model_path"])
     if len(set(partition[:-1])) > 1:
         raise TuningError(
             "the thin optimizer currently searches (l,...,l,residual); the first "
-            "PP stages in --current-partition must have the same layer count"
+            "PP stages in the baseline partition must have the same layer count"
         )
 
-    layout = None
-    layout_warning = None
     try:
         layout = LayerLayout.from_model_path(model_path, local_files_only=True)
     except Exception as exc:
-        layout_warning = (
-            f"model layout unavailable; treating all layers equally ({exc})"
-        )
+        raise TuningError(f"cannot load model layer layout: {exc}") from exc
 
-    observations: dict[int, list[dict[str, Any]]] = {}
-    warnings: list[str] = []
-    for profile_dir, manifest in zip(profile_dirs, manifests):
-        bucket = int(manifest.get("execution_bucket", manifest["batch_size"]))
-        profile_partition = tuple(int(value) for value in manifest["current_partition"])
-        try:
-            summary = torch_trace_profile.summarize_trace_dir(
-                profile_dir,
-                pp_size=pp_size,
-                trim_samples=args.trim_samples,
-            )
-        except torch_trace_profile.TraceProfileError as exc:
-            raise TuningError(str(exc)) from exc
-        observations.setdefault(bucket, []).append(
-            {
-                "profile_dir": profile_dir,
-                "partition": profile_partition,
-                "summary": summary,
-            }
+    bucket = int(profile["execution_bucket"])
+    try:
+        summary = torch_trace_profile.summarize_trace_dir(
+            profile_dir,
+            pp_size=pp_size,
+            tp_size=tp_size,
+            trim_samples=args.trim_samples,
         )
-        warnings.extend(summary.get("warnings", ()))
-    if layout_warning:
-        warnings.append(layout_warning)
+    except torch_trace_profile.TraceProfileError as exc:
+        raise TuningError(str(exc)) from exc
 
-    profiles: dict[int, dict[str, Any]] = {}
-    for bucket, bucket_observations in sorted(observations.items()):
-        baseline = next(
-            (
-                item
-                for item in bucket_observations
-                if tuple(item["partition"]) == partition
-            ),
-            None,
-        )
-        if baseline is None:
-            raise TuningError(
-                f"execution bucket {bucket} has no profile for baseline "
-                f"partition {partition}"
-            )
-        typed_costs = _typed_layer_costs(
-            layout,
-            [
-                (
-                    item["partition"],
-                    _target_observation(item["summary"]),
-                )
-                for item in bucket_observations
-            ],
-        )
-        raw, bucket_warnings = _bucket_profile(
-            baseline["summary"],
-            partition,
-            layout,
-            args.accept_len,
-            typed_costs=typed_costs,
-        )
-        profiles[bucket] = raw
-        warnings.extend(bucket_warnings)
+    typed_costs = _typed_layer_costs(
+        layout,
+        partition,
+        _target_observation(summary),
+    )
+    raw = _bucket_profile(
+        summary,
+        partition,
+        layout,
+        typed_costs=typed_costs,
+    )
+    profiles = {bucket: raw}
 
     try:
         model = stage_model.StageCostModel.from_bucket_profiles(
@@ -542,18 +433,15 @@ def run_analysis(args: argparse.Namespace) -> Path:
             num_layers=sum(partition),
             pp_size=pp_size,
             current_partition=partition,
-            pp_loop_size=args.pp_loop_size or pp_size,
             layout=layout,
         )
     except stage_model.StageModelError as exc:
         raise TuningError(str(exc)) from exc
-    model.warnings.extend(warnings)
     max_layers = parse_int_list(args.max_layers_per_rank, "--max-layers-per-rank")
     if args.min_layers <= 0:
         raise TuningError("--min-layers must be positive")
     if max_layers is not None and len(max_layers) != pp_size:
         raise TuningError("--max-layers-per-rank needs one value per PP rank")
-    target_bucket = args.target_batch_size or max(profiles)
     stage_comm_ms = parse_float_list(args.stage_comm_ms, "--stage-comm-ms")
     if stage_comm_ms is not None and len(stage_comm_ms) not in (
         pp_size - 1,
@@ -572,8 +460,7 @@ def run_analysis(args: argparse.Namespace) -> Path:
     try:
         result = partition_optimizer.optimize(
             model,
-            target_bs=target_bucket,
-            t_comm_ms=args.t_comm_ms,
+            target_bs=bucket,
             min_layers=args.min_layers,
             max_layers=max_layers,
             k_best=args.k_best,
@@ -583,101 +470,12 @@ def run_analysis(args: argparse.Namespace) -> Path:
         )
     except (partition_optimizer.OptimizerError, stage_model.StageModelError) as exc:
         raise TuningError(str(exc)) from exc
-
-    validation = []
-    for bucket, bucket_observations in sorted(observations.items()):
-        estimate = model.estimate_for_bs(bucket)
-        for item in bucket_observations:
-            candidate_partition = tuple(item["partition"])
-            predicted_stages = model.predict_stages(
-                candidate_partition,
-                estimate=estimate,
-                t_comm_ms=args.t_comm_ms,
-                stage_comm_ms=result.stage_comm_ms,
-                layout=layout,
-            )
-            measured_stages = tuple(
-                float(value) + result.stage_comm_ms[rank]
-                for rank, value in enumerate(item["summary"]["service_ms"])
-            )
-            predicted_cycle = max(predicted_stages)
-            measured_cycle = max(measured_stages)
-            relative_error = (
-                abs(predicted_cycle - measured_cycle) / measured_cycle
-                if measured_cycle > 0.0
-                else 0.0
-            )
-            validation.append(
-                {
-                    "bucket": bucket,
-                    "partition": candidate_partition,
-                    "predicted_stage_ms": predicted_stages,
-                    "measured_stage_ms": measured_stages,
-                    "predicted_cycle_ms": predicted_cycle,
-                    "measured_cycle_ms": measured_cycle,
-                    "relative_error": relative_error,
-                }
-            )
-            if candidate_partition != partition and relative_error > 0.10:
-                model.warnings.append(
-                    f"profiled partition {candidate_partition} at bucket {bucket} "
-                    f"has {relative_error:.1%} model error; collect another nearby "
-                    "partition before deployment"
-                )
-    result.warnings.extend(model.warnings)
-
-    output_dir = (args.output_dir or (profile_dirs[0] / "analysis")).resolve()
+    output_dir = (args.output_dir or (profile_dir / "analysis")).resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
-    payload = {
-        "schema_version": 1,
-        "created_at": datetime.now(timezone.utc).isoformat(),
-        "source_profiles": profile_dirs,
-        "model_path": model_path,
-        "current_partition": partition,
-        "target_batch_size": target_bucket,
-        "trace_observations": observations,
-        "profile_validation": validation,
-        "stage_model": model.to_dict(),
-        "optimization": result.to_dict(),
-        "modeling": {
-            "objective": "minimize measured post-overlap bottleneck stage time",
-            "candidate_family": "(l,...,l,L-(P-1)l)",
-            "boundary_radius": args.boundary_radius,
-            "memory_constraint": (
-                "max_layers_per_rank" if max_layers is not None else "not calibrated"
-            ),
-            "stage_comm_ms": stage_comm_ms,
-            "inspiration": [
-                "HexGen: compute + communication with hard memory constraints",
-                "Tessera: profile post-overlap costs before partition selection",
-            ],
-        },
-    }
-    write_json(output_dir / "analysis.json", payload)
+    write_json(output_dir / "analysis.json", result.to_dict())
     report = result.to_report()
-    profiled_selected = [
-        item
-        for item in validation
-        if tuple(item["partition"]) == result.selected.partition
-        and int(item["bucket"]) == int(result.target_bucket)
-    ]
-    if profiled_selected:
-        item = profiled_selected[0]
-        report += (
-            "\nprofiled selected partition: measured cycle "
-            f"{item['measured_cycle_ms']:.3f} ms, model error "
-            f"{item['relative_error']:.1%}\n"
-        )
-    if max_layers is None:
-        report += (
-            "\nWARNING: no per-rank memory constraint was supplied; validate the "
-            "recommended partition before deployment.\n"
-        )
     (output_dir / "analysis.txt").write_text(report + "\n")
     selected = result.selected.partition
-    (output_dir / "recommended.env").write_text(
-        "SGLANG_PP_LAYER_PARTITION=" + ",".join(map(str, selected)) + "\n"
-    )
     (output_dir / "recommended.args").write_text(
         "--pp-layer-partition " + ",".join(map(str, selected)) + "\n"
     )
@@ -711,11 +509,11 @@ def build_parser() -> argparse.ArgumentParser:
     profile.add_argument("--output-tokens", type=int, default=128)
     profile.add_argument("--profile-steps", type=int, default=32)
     profile.add_argument("--max-running-requests", type=int)
-    profile.add_argument("--block-size", type=int, default=8)
+    profile.add_argument("--block-size", type=int, default=16)
     profile.add_argument("--page-size", type=int, default=1)
-    profile.add_argument("--mem-fraction-static", type=float, default=0.82)
-    profile.add_argument("--mamba-ssm-dtype", default="bfloat16")
-    profile.add_argument("--mamba-full-memory-ratio", type=float, default=2.0)
+    profile.add_argument("--mem-fraction-static", type=float, default=0.75)
+    profile.add_argument("--mamba-ssm-dtype", default="float32")
+    profile.add_argument("--mamba-full-memory-ratio", type=float, default=0.9)
     profile.add_argument("--offline", action="store_true")
     profile.add_argument(
         "--no-trust-remote-code",
@@ -731,22 +529,13 @@ def build_parser() -> argparse.ArgumentParser:
     )
 
     analyze = subparsers.add_parser("analyze", help="analyze existing traces")
-    analyze.add_argument("--profile-dir", type=Path, action="append", required=True)
+    analyze.add_argument("--profile-dir", type=Path, required=True)
     analyze.add_argument("--output-dir", type=Path)
-    analyze.add_argument("--model-path")
-    analyze.add_argument(
-        "--current-partition",
-        help="baseline partition to optimize; default: first profile manifest",
-    )
-    analyze.add_argument("--target-batch-size", type=int)
-    analyze.add_argument("--pp-loop-size", type=int)
-    analyze.add_argument("--accept-len", type=float, default=1.0)
-    analyze.add_argument("--t-comm-ms", type=float, default=0.0)
     analyze.add_argument(
         "--stage-comm-ms",
         help=(
-            "comma-separated exposed communication cost per PP rank (P values) "
-            "or per boundary (P-1 values); overrides --t-comm-ms"
+            "optional explicit communication floor per PP rank (P values) or "
+            "per boundary (P-1 values), added after trace PP Send/Recv is excluded"
         ),
     )
     analyze.add_argument("--trim-samples", type=int, default=1)

@@ -108,6 +108,7 @@ class RequestMetricState:
     dcut_keep_ratio: float | None = None
     spec_verify_ct: int | None = None
     spec_num_correct_drafts: int | None = None
+    finish_reason: dict | str | None = None
     finished: bool = False
 
     def observe(self, meta: dict, observed_s: float) -> None:
@@ -159,7 +160,11 @@ class RequestMetricState:
         if dcut_keep_ratio is not None:
             self.dcut_keep_ratio = float(dcut_keep_ratio)
 
-        if meta.get("finish_reason") is not None:
+        finish_reason = meta.get("finish_reason")
+        if finish_reason is not None:
+            if self.finish_reason is not None and finish_reason != self.finish_reason:
+                raise ValueError("finish_reason changed within one response stream")
+            self.finish_reason = finish_reason
             self.finished = True
 
     @property
@@ -174,11 +179,23 @@ class RequestMetricState:
             self.first_token_s, self.last_token_s, self.completion_tokens
         )
 
-    def validation_error(self) -> str | None:
+    def validation_error(self, expected_completion_tokens: int) -> str | None:
         if not self.finished:
             return "stream ended without finish_reason"
         if self.completion_tokens is None:
             return "finished response has no completion_tokens"
+        reason_type = (
+            self.finish_reason.get("type")
+            if isinstance(self.finish_reason, dict)
+            else self.finish_reason
+        )
+        if reason_type != "length":
+            return f"unexpected finish_reason type {reason_type!r}"
+        if self.completion_tokens != expected_completion_tokens:
+            return (
+                f"completion_tokens={self.completion_tokens}, expected "
+                f"{expected_completion_tokens}"
+            )
         if self.completion_tokens > 0 and self.first_token_s is None:
             return "finished response has tokens but no token arrival timestamp"
         return None
@@ -250,8 +267,6 @@ def calculate_tpot(
 def percentile(values: list[float], q: float) -> float | None:
     if not values:
         return None
-    if not 0 <= q <= 1:
-        raise ValueError(f"percentile q must be in [0, 1], got {q}")
     ordered = sorted(values)
     position = (len(ordered) - 1) * q
     lower = math.floor(position)
@@ -260,6 +275,31 @@ def percentile(values: list[float], q: float) -> float | None:
         return ordered[lower]
     weight = position - lower
     return ordered[lower] * (1 - weight) + ordered[upper] * weight
+
+
+async def iter_sse_data(response: httpx.Response):
+    """Yield SSE data fields without treating Unicode separators as newlines."""
+    buffer = bytearray()
+    async for chunk in response.aiter_bytes():
+        buffer.extend(chunk)
+        while True:
+            lf_index = buffer.find(b"\n\n")
+            crlf_index = buffer.find(b"\r\n\r\n")
+            candidates = [index for index in (lf_index, crlf_index) if index >= 0]
+            if not candidates:
+                break
+            boundary = min(candidates)
+            delimiter_length = 4 if boundary == crlf_index else 2
+            event = bytes(buffer[:boundary]).replace(b"\r\n", b"\n")
+            del buffer[: boundary + delimiter_length]
+            data_lines = []
+            for line in event.split(b"\n"):
+                if line.startswith(b"data:"):
+                    data_lines.append(line.removeprefix(b"data:").lstrip(b" "))
+            if data_lines:
+                yield b"\n".join(data_lines)
+    if buffer.strip(b"\r\n"):
+        raise ValueError(f"stream ended with {len(buffer)} bytes of incomplete SSE data")
 
 
 async def request_once(
@@ -287,11 +327,9 @@ async def request_once(
     try:
         async with client.stream("POST", "/generate", json=payload) as response:
             response.raise_for_status()
-            async for line in response.aiter_lines():
-                if not line.startswith("data:"):
-                    continue
-                raw = line.removeprefix("data:").strip()
-                if not raw or raw == "[DONE]":
+            async for raw in iter_sse_data(response):
+                raw = raw.strip()
+                if not raw or raw == b"[DONE]":
                     continue
                 chunk = json.loads(raw)
                 meta = chunk.get("meta_info") or {}
@@ -300,7 +338,7 @@ async def request_once(
         error = repr(exc)
     stream_close_s = time.perf_counter() - started
     if error is None:
-        error = metrics.validation_error()
+        error = metrics.validation_error(max_tokens)
     completion_offset_s = (
         dispatch_offset_s + metrics.last_token_s
         if error is None and metrics.last_token_s is not None
@@ -386,7 +424,7 @@ async def run_point(
 
         tasks = [asyncio.create_task(worker(client)) for client in clients]
         for request_index, (prompt, offset) in enumerate(
-            zip(prompts[: point.num_requests], arrival_offsets, strict=True)
+            zip(prompts[: point.num_requests], arrival_offsets)
         ):
             delay = benchmark_started + offset - time.perf_counter()
             if delay > 0:
@@ -496,10 +534,14 @@ async def warm_up(config: argparse.Namespace, prompt: str) -> None:
     await asyncio.sleep(config.cooldown_s)
 
 
-async def main_async(config: argparse.Namespace) -> None:
+async def main_async(config: argparse.Namespace) -> list[PointSummary]:
     from transformers import AutoTokenizer
 
-    tokenizer = AutoTokenizer.from_pretrained(config.tokenizer, trust_remote_code=True)
+    tokenizer = AutoTokenizer.from_pretrained(
+        config.tokenizer,
+        revision=config.tokenizer_revision,
+        trust_remote_code=True,
+    )
     total_requests = max(p.num_requests for p in config.points)
     prompts = load_sharegpt_prompts(
         Path(config.dataset), total_requests, config.prompt_max_tokens, tokenizer
@@ -528,6 +570,7 @@ async def main_async(config: argparse.Namespace) -> None:
     with open(out_dir / f"{config.label}_summary.json", "w") as handle:
         json.dump([asdict(s) for s in summaries], handle, indent=2)
     print(f"saved summaries to {out_dir}", flush=True)
+    return summaries
 
 
 def main() -> None:
@@ -540,6 +583,7 @@ def main() -> None:
         help="ShareGPT JSON dataset path",
     )
     parser.add_argument("--tokenizer", default="Qwen/Qwen3.6-27B")
+    parser.add_argument("--tokenizer-revision", default="main")
     parser.add_argument("--load-points", default=DEFAULT_LOAD_POINTS)
     parser.add_argument("--max-tokens", type=int, default=1024)
     parser.add_argument("--prompt-max-tokens", type=int, default=700)
@@ -550,7 +594,18 @@ def main() -> None:
     parser.add_argument("--output-dir", default=str(REPO_ROOT / "results"))
     config = parser.parse_args()
     config.points = parse_load_points(config.load_points)
-    asyncio.run(main_async(config))
+    summaries = asyncio.run(main_async(config))
+    incomplete = [
+        summary
+        for summary in summaries
+        if summary.completed != summary.num_requests
+    ]
+    if incomplete:
+        details = ", ".join(
+            f"C={item.max_concurrency}: {item.completed}/{item.num_requests}"
+            for item in incomplete
+        )
+        raise SystemExit(f"benchmark completed with failed requests: {details}")
 
 
 if __name__ == "__main__":
