@@ -138,6 +138,15 @@ def mm_runtime_reservation_gb(
     return reserved_mb / 1024
 
 
+def _suggest_mem_fraction_static(
+    *, pre_model_load_memory: float, slack_gb: float, rest_memory_gb: float
+) -> tuple[float, float]:
+    """Return the exact and three-decimal static fractions that clear a deficit."""
+    minimum = max(0.0, 1 - (slack_gb + rest_memory_gb) / pre_model_load_memory)
+    suggested = math.ceil((minimum + 1e-9) * 1000) / 1000
+    return minimum, suggested
+
+
 if TYPE_CHECKING:
     from sglang.srt.distributed.parallel_state_wrapper import ParallelState
     from sglang.srt.mem_cache.unified_memory_pool import (
@@ -1835,13 +1844,16 @@ class KVCacheConfigurator:
         if self.mambaish_config is not None:
             rest_memory = self._handle_max_mamba_cache(rest_memory)
 
-        # Loaded weights (target + draft) can exceed the static budget
+        # Fixed allocations (weights, Mamba/ReplaySSM, and runtime reserves)
+        # can exceed the static budget. Infer the required fraction from the
+        # final deficit so the suggestion includes every deduction above.
         if rest_memory <= 0:
-            minimum_mem_fraction_static = (
-                1 - available_gpu_memory / pre_model_load_memory
-            )
-            suggested_mem_fraction_static = (
-                math.ceil(minimum_mem_fraction_static * 1000) / 1000
+            minimum_mem_fraction_static, suggested_mem_fraction_static = (
+                _suggest_mem_fraction_static(
+                    pre_model_load_memory=pre_model_load_memory,
+                    slack_gb=slack_gb,
+                    rest_memory_gb=rest_memory,
+                )
             )
             raise ValueError(
                 f"Loaded weights leave no GPU memory for the KV cache under "

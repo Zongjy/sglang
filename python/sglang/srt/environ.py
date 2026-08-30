@@ -887,8 +887,9 @@ class Envs:
     # ===================================================================
     SGLANG_IS_FLASHINFER_AVAILABLE = EnvBool(True)
     SGLANG_FLASHINFER_USE_PAGED = EnvBool(False)
-    # Default to the pick from flashinfer
-    SGLANG_FLASHINFER_WORKSPACE_SIZE = EnvInt(384 * 1024 * 1024)
+    # Covers large split-KV prefill plans (including DFlash BS128) without
+    # relying on model-name allowlists or backend construction order.
+    SGLANG_FLASHINFER_WORKSPACE_SIZE = EnvInt(512 * 1024 * 1024)
     # Per-rank dispatch capacity of the FlashInfer MoE A2A dispatcher. Unset
     # means each call site keeps its own default.
     SGLANG_FLASHINFER_NUM_MAX_DISPATCH_TOKENS_PER_RANK = EnvInt(None)

@@ -37,7 +37,9 @@ def series_style(label: str):
     if "dp" in normalized:
         return dict(color="tab:red", linestyle="-.", marker="D")
     if "uniform" in normalized:
-        return dict(color="tab:blue", linestyle="--", marker="^")
+        return dict(color="tab:blue", linestyle="-.", marker="^")
+    if "auto" in normalized:
+        return dict(color="tab:blue", linestyle="-", marker="s")
     return dict(color="tab:orange", linestyle="-", marker="o")
 
 
