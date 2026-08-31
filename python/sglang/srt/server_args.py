@@ -107,6 +107,8 @@ from sglang.utils import is_in_ci
 
 logger = logging.getLogger(__name__)
 
+_DEFAULT_PP_PREFILL_CUDA_GRAPH_MAX_TOKENS = 8192
+
 
 def parse_dflash_dcut(value: Union[str, float, int]) -> Union[float, Literal["auto"]]:
     """Parse ``--speculative-dflash-dcut`` without accepting arbitrary strings."""
@@ -4558,6 +4560,21 @@ class ServerArgs:
         if (Phase.PREFILL, "backend") in self._cuda_graph_config_locked:
             return
 
+        # PP prefill graph replay is opt-in. Capturing the default large
+        # breakable buckets can be slower than eager and consumes a graph pool
+        # on every pipeline stage. An explicit backend selection bypasses this
+        # default policy.
+        if (
+            self.pp_size > 1
+            and self.cuda_graph_config.prefill.backend == Backend.BREAKABLE
+        ):
+            logger.info(
+                "Disabling breakable prefill CUDA graph by default for pipeline "
+                "parallelism. Set --cuda-graph-backend-prefill=breakable to opt in."
+            )
+            self.cuda_graph_config.prefill.backend = Backend.DISABLED
+            return
+
         # Breakable is the CUDA default but not multimodal-compatible;
         # piecewise-allowlisted archs run their validated decoder prefill
         # there instead. Archs also on the breakable allowlist keep it --
@@ -4940,6 +4957,20 @@ class ServerArgs:
                 prefill_cuda_graph_config.max_bs = min(
                     prefill_cuda_graph_config.max_bs, 4096
                 )
+
+        # Opt-in PP breakable graphs default to small aggregate-token buckets.
+        # Explicit max_bs/bs settings retain their requested capture shapes.
+        if (
+            self.pp_size > 1
+            and prefill_cuda_graph_config.backend == Backend.BREAKABLE
+            and (Phase.PREFILL, "max_bs") not in self._cuda_graph_config_locked
+            and (Phase.PREFILL, "bs") not in self._cuda_graph_config_locked
+            and prefill_cuda_graph_config.max_bs
+            > _DEFAULT_PP_PREFILL_CUDA_GRAPH_MAX_TOKENS
+        ):
+            prefill_cuda_graph_config.max_bs = (
+                _DEFAULT_PP_PREFILL_CUDA_GRAPH_MAX_TOKENS
+            )
 
         if prefill_cuda_graph_config.bs is None:
             prefill_cuda_graph_config.bs = (

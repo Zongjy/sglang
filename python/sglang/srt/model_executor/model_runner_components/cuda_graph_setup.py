@@ -66,6 +66,8 @@ def _align_pipeline_layers(layers: list, layer_model) -> list:
         f"invalid pipeline layer range [{start_layer}, {end_layer}) for "
         f"{len(layer_model.layers)} layers"
     )
+    if len(layers) == len(layer_model.layers):
+        return layers
     assert (
         len(layers) <= end_layer - start_layer
     ), f"found {len(layers)} layers in PP range [{start_layer}, {end_layer})"
@@ -322,6 +324,16 @@ def capture_prefill_graph(
 
     prefill_config = model_runner.server_args.cuda_graph_config.prefill
     prefill_backend = prefill_config.backend
+    if (
+        prefill_backend == Backend.BREAKABLE
+        and getattr(model_runner.server_args, "enable_prefill_cp", False)
+        and getattr(model_runner.server_args, "pp_size", 1) > 1
+    ):
+        logger.warning(
+            "Disable prefill CUDA graph because pipeline parallelism combined "
+            "with prefill context parallelism is not validated."
+        )
+        return result(eager_runner)
     context_length = model_runner.model_config.context_len
     if prefill_backend == Backend.FULL:
         max_capture_requests = prefill_config.full_prefill_max_req

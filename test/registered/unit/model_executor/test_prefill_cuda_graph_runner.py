@@ -102,6 +102,8 @@ class TestPrefillCudaGraphRunnerChunkedPrefix(CustomTestCase):
             spec_algorithm=SimpleNamespace(is_eagle=lambda: False),
             server_args=SimpleNamespace(
                 enable_lora=False,
+                enable_prefill_cp=False,
+                pp_size=1,
                 cuda_graph_config=SimpleNamespace(
                     prefill=SimpleNamespace(bs=[1], backend=Backend.BREAKABLE)
                 ),

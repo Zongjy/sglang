@@ -1597,6 +1597,55 @@ class TestCudaGraphConfigDataclassAccess(CustomTestCase):
         self.assertEqual(config.compiler, "eager")
 
 
+class TestPipelineParallelPrefillCudaGraphPolicy(CustomTestCase):
+    def test_pp_prefill_graph_is_opt_in(self):
+        cases = (
+            (set(), Backend.DISABLED),
+            ({(Phase.PREFILL, "backend")}, Backend.BREAKABLE),
+        )
+        for locked, expected in cases:
+            with self.subTest(locked=locked):
+                args = ServerArgs(
+                    model_path="dummy",
+                    pp_size=4,
+                    cuda_graph_config=CudaGraphConfig(
+                        prefill=PhaseConfig(backend=Backend.BREAKABLE)
+                    ),
+                )
+                args._cuda_graph_config_locked = locked
+                args._apply_cuda_graph_compatibility()
+                self.assertEqual(
+                    args.cuda_graph_config.prefill.backend,
+                    expected,
+                )
+
+    def test_pp_prefill_capture_limit_policy(self):
+        cases = (
+            (4096, None, 4096),
+            (32768, None, 8192),
+            (32768, 16384, 16384),
+        )
+        for chunked_prefill_size, max_bs, expected in cases:
+            with self.subTest(chunked_prefill_size=chunked_prefill_size, max_bs=max_bs):
+                args = ServerArgs(
+                    model_path="dummy",
+                    pp_size=4,
+                    chunked_prefill_size=chunked_prefill_size,
+                    mem_fraction_static=0.8,
+                    cuda_graph_config=CudaGraphConfig(
+                        decode=PhaseConfig(backend=Backend.DISABLED, max_bs=1, bs=[1]),
+                        prefill=PhaseConfig(backend=Backend.BREAKABLE, max_bs=max_bs),
+                    ),
+                )
+                args._cuda_graph_config_locked = {(Phase.PREFILL, "backend")} | (
+                    {(Phase.PREFILL, "max_bs")} if max_bs is not None else set()
+                )
+                with patch.object(ServerArgs, "use_mla_backend", return_value=False):
+                    args._handle_gpu_memory_settings(gpu_mem=None)
+                prefill = args.cuda_graph_config.prefill
+                self.assertEqual((prefill.max_bs, prefill.bs[-1]), (expected, expected))
+
+
 class TestCudaGraphDisaggregationRoles(CustomTestCase):
     def _handled_args(self, **overrides):
         args = ServerArgs(model_path="dummy", **overrides)
