@@ -601,6 +601,9 @@ class DFlashWorkerV2(BaseSpecWorker):
             capture_decode_cuda_graph=capture_decode_cuda_graph
         )
 
+        if self._dcut_planner is not None:
+            self._dcut_planner.profile_dcut_cost_table()
+
     def _maybe_build_draft_sampler(self):
         def _eager(reason):
             if self.ps.tp_rank == 0:
@@ -2294,11 +2297,6 @@ class DFlashWorkerV2(BaseSpecWorker):
         # --- 1) Draft a fixed block with the draft model (non-PP / last PP
         # rank), or rebuild it from the raw relayed through the PP ring.
         prefix_lens = batch.seq_lens
-        dcut_timing_start = (
-            self._dcut_planner.start_step_timing()
-            if self._dcut_planner is not None
-            else None
-        )
         if pp_raw is not None:
             block_ids, positions_2d, verify_out_cache_loc_2d, draft_tokens = (
                 self._rebuild_block_from_pp_raw(pp_raw=pp_raw, batch=batch, bs=bs)
@@ -2411,8 +2409,6 @@ class DFlashWorkerV2(BaseSpecWorker):
                 skip_attn_backend_init=True,
                 pp_proxy_tensors=pp_proxy_tensors,
             )
-        if self._dcut_planner is not None:
-            self._dcut_planner.finish_step_timing(bs=bs, start=dcut_timing_start)
         logits_output = target_out.logits_output
         can_run_cuda_graph = target_out.can_run_cuda_graph
 

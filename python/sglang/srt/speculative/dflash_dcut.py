@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import logging
 import math
-import statistics
 from dataclasses import dataclass
 from typing import Literal, Optional, Union
 
@@ -15,20 +14,32 @@ from sglang.kernels.ops.speculative.dspark.dspark_verify_window import (
     scatter_compact_to_strided_into,
 )
 from sglang.srt.distributed import get_tp_group
+from sglang.srt.layers.dp_attention import DpPaddingMode
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
+from sglang.srt.model_executor.forward_batch_info import (
+    CaptureHiddenMode,
+    ForwardBatch,
+    ForwardMode,
+)
+from sglang.srt.speculative.dflash_info import DFlashVerifyInput
 from sglang.srt.speculative.dspark_components.dspark_planner import (
     DSparkScheduleConfig,
 )
-from sglang.srt.speculative.ragged_verify import RaggedVerifyLayout, round_up_grid
+from sglang.srt.speculative.ragged_verify import (
+    RaggedVerifyLayout,
+    build_capture_verify_lens,
+    round_up_grid,
+)
 
 logger = logging.getLogger(__name__)
 
 DFlashDcutValue = Union[float, Literal["auto"]]
 
 _AUTO_RATIOS = (0.25, 0.5, 0.75, 1.0)
-_AUTO_EXPLORATION_ORDER = (2, 0, 1, 3)
-_AUTO_MIN_PROFILE_SAMPLES = 3
-_AUTO_PROFILE_WINDOW = 5
+
+_OFFLINE_PROFILE_WARMUPS = 3
+_OFFLINE_PROFILE_STEPS = 5
+_OFFLINE_PROFILE_SEQ_LEN = 2048
 
 
 def dflash_dcut_enabled(value: DFlashDcutValue) -> bool:
@@ -84,24 +95,18 @@ class DFlashDcutPlan:
     candidate_index: Optional[int]
 
 
-@dataclass
-class _PendingCostMeasurement:
-    bs: int
-    candidate_index: int
-    start: torch.cuda.Event
-    end: torch.cuda.Event
-
-
 class DFlashDcutPlanner:
-    """Cross-request D-Cut selector plus a non-blocking online cost model.
+    """Cross-request D-Cut selector using an offline-only cost table.
 
     Fixed-ratio mode is entirely device-side after the host-known keep count.
-    Auto mode profiles the real draft+target step with CUDA events. It first
-    explores the four public-PR ratios and then maximizes expected accepted
-    draft prefixes / measured step time. The mandatory anchors are handled by
-    the keep-count formula, but (matching the public implementation) are not
-    added to the selector numerator; this avoids over-favoring very shallow
-    cuts when raw DFlash softmax confidence is under-calibrated.
+    Auto mode builds a hardware-specific cost table at startup by running dummy
+    target-verify forwards for a small grid of (batch_size, ratio) points. The
+    table is used for all subsequent real steps; if it is missing for a batch
+    size we fall back to the 0.75 ratio candidate.
+    The mandatory anchors are handled by the keep-count formula, but (matching
+    the public implementation) are not added to the selector numerator; this
+    avoids over-favoring very shallow cuts when raw DFlash softmax confidence
+    is under-calibrated.
     """
 
     def __init__(
@@ -131,10 +136,10 @@ class DFlashDcutPlanner:
         self.schedule_cfg.validate()
         self.last_candidate_index: Optional[int] = None
         self._costs_by_bs: dict[int, list[Optional[float]]] = {}
-        self._cost_samples_by_bs: dict[int, list[list[float]]] = {}
-        self._pending_measurements: list[_PendingCostMeasurement] = []
         self._auto_index_device = torch.zeros((), dtype=torch.int64, device=device)
-        self._logged_auto_ready: set[int] = set()
+        self._offline_profiled = False
+        self._offline_keep_counts: dict[int, tuple[int, ...]] = {}
+        self._warned_missing_profile_bs: set[int] = set()
 
     @property
     def is_auto(self) -> bool:
@@ -150,67 +155,6 @@ class DFlashDcutPlanner:
             for ratio in _AUTO_RATIOS
         )
 
-    def start_step_timing(self) -> Optional[torch.cuda.Event]:
-        if not self.is_auto or self.tp_rank != 0:
-            return None
-        self._poll_measurements()
-        start = torch.cuda.Event(enable_timing=True)
-        start.record()
-        return start
-
-    def finish_step_timing(self, *, bs: int, start: Optional[torch.cuda.Event]) -> None:
-        if start is None or self.last_candidate_index is None:
-            return
-        end = torch.cuda.Event(enable_timing=True)
-        end.record()
-        self._pending_measurements.append(
-            _PendingCostMeasurement(
-                bs=int(bs),
-                candidate_index=int(self.last_candidate_index),
-                start=start,
-                end=end,
-            )
-        )
-
-    def _poll_measurements(self) -> None:
-        if self.tp_rank != 0 or not self._pending_measurements:
-            return
-        remaining: list[_PendingCostMeasurement] = []
-        for measurement in self._pending_measurements:
-            if not measurement.end.query():
-                remaining.append(measurement)
-                continue
-            elapsed_ms = measurement.start.elapsed_time(measurement.end)
-            costs = self._costs_by_bs.setdefault(
-                measurement.bs, [None] * len(_AUTO_RATIOS)
-            )
-            samples = self._cost_samples_by_bs.setdefault(
-                measurement.bs, [[] for _ in _AUTO_RATIOS]
-            )
-            candidate_samples = samples[measurement.candidate_index]
-            candidate_samples.append(float(elapsed_ms))
-            if len(candidate_samples) > _AUTO_PROFILE_WINDOW:
-                del candidate_samples[:-_AUTO_PROFILE_WINDOW]
-            if len(candidate_samples) >= _AUTO_MIN_PROFILE_SAMPLES:
-                # The first invocation can include Triton JIT work. Requiring
-                # repeated observations and using a median prevents that one-off
-                # warmup from permanently poisoning auto selection.
-                costs[measurement.candidate_index] = statistics.median(
-                    candidate_samples
-                )
-            if (
-                all(cost is not None for cost in costs)
-                and measurement.bs not in self._logged_auto_ready
-            ):
-                logger.info(
-                    "DFLASH D-Cut auto cost model ready for bs=%d: ratios=%s costs_ms=%s",
-                    measurement.bs,
-                    _AUTO_RATIOS,
-                    [round(float(cost), 4) for cost in costs],
-                )
-                self._logged_auto_ready.add(measurement.bs)
-        self._pending_measurements = remaining
-
     def _profile_costs_for_bs(self, bs: int) -> Optional[list[float]]:
         exact = self._costs_by_bs.get(bs)
         if exact is not None and all(cost is not None for cost in exact):
@@ -225,15 +169,15 @@ class DFlashDcutPlanner:
         return None
 
     def _select_auto_candidate_local(self, *, confidence: torch.Tensor, bs: int) -> int:
-        self._poll_measurements()
-        exact = self._costs_by_bs.setdefault(bs, [None] * len(_AUTO_RATIOS))
         costs = self._profile_costs_for_bs(bs)
         if costs is None:
-            for candidate_index in _AUTO_EXPLORATION_ORDER:
-                if exact[candidate_index] is None:
-                    return candidate_index
-            # Events for all candidates may still be in flight. Preserve the
-            # PR's safe fallback while they complete.
+            if bs not in self._warned_missing_profile_bs and self.tp_rank == 0:
+                logger.warning(
+                    "DFLASH D-Cut offline cost table missing for bs=%d; "
+                    "falling back to ratio 0.75.",
+                    bs,
+                )
+                self._warned_missing_profile_bs.add(bs)
             return 2
 
         survival = torch.cumprod(confidence.to(torch.float32), dim=1).flatten()
@@ -268,6 +212,175 @@ class DFlashDcutPlanner:
         ):
             return total_verify_tokens
         return round_up_grid(total_verify_tokens, runner.capture_num_tokens)
+
+    def _build_profile_verify_layout(
+        self, *, bs: int, keep_count: int
+    ) -> RaggedVerifyLayout:
+        """Build a ragged verify layout that fits the captured graph buckets."""
+        total_verify_tokens = bs + keep_count
+        graph_num_tokens = self._graph_num_tokens(total_verify_tokens)
+        max_bs = (
+            self.model_runner.req_to_token_pool.size
+            if self.model_runner.req_to_token_pool is not None
+            else total_verify_tokens
+        )
+        num_slots = min(total_verify_tokens, max_bs)
+        verify_lens_cpu = build_capture_verify_lens(
+            num_tokens=total_verify_tokens,
+            num_slots=num_slots,
+            num_draft_tokens=self.block_size,
+        )
+        return RaggedVerifyLayout.from_verify_lens(
+            verify_lens_cpu=verify_lens_cpu,
+            device=self.device,
+            grid=(
+                self.model_runner.decode_cuda_graph_runner.capture_num_tokens
+                if self.model_runner.decode_cuda_graph_runner is not None
+                and self.model_runner.decode_cuda_graph_runner.capture_num_tokens
+                is not None
+                else [graph_num_tokens]
+            ),
+            graph_num_tokens_floor=graph_num_tokens,
+        )
+
+    def _build_profile_forward_batch(
+        self,
+        *,
+        bs: int,
+        keep_count: int,
+    ) -> ForwardBatch:
+        """Construct a minimal TARGET_VERIFY batch for offline profiling."""
+        total_verify_tokens = bs + keep_count
+        graph_num_tokens = self._graph_num_tokens(total_verify_tokens)
+        layout = self._build_profile_verify_layout(bs=bs, keep_count=keep_count)
+
+        seq_lens = torch.full(
+            (bs,), _OFFLINE_PROFILE_SEQ_LEN, dtype=torch.int64, device=self.device
+        )
+        seq_lens_cpu = torch.full(
+            (bs,), _OFFLINE_PROFILE_SEQ_LEN, dtype=torch.int32, device="cpu"
+        )
+        positions = torch.arange(
+            graph_num_tokens, dtype=torch.int64, device=self.device
+        )
+        mrope_positions = positions.unsqueeze(0).repeat(3, 1)
+        input_ids = torch.zeros(
+            (graph_num_tokens,), dtype=torch.int64, device=self.device
+        )
+        out_cache_loc = torch.arange(
+            graph_num_tokens, dtype=torch.int64, device=self.device
+        )
+        req_pool_indices = torch.arange(bs, dtype=torch.int64, device=self.device)
+
+        spec_info = DFlashVerifyInput(
+            draft_token=input_ids,
+            positions=positions,
+            draft_token_num=self.block_size,
+            custom_mask=None,
+            capture_hidden_mode=CaptureHiddenMode.FULL,
+            ragged_verify_layout=layout,
+        )
+
+        return ForwardBatch(
+            forward_mode=ForwardMode.TARGET_VERIFY,
+            batch_size=bs,
+            input_ids=input_ids,
+            req_pool_indices=req_pool_indices,
+            seq_lens=seq_lens,
+            seq_lens_cpu=seq_lens_cpu,
+            orig_seq_lens=seq_lens,
+            out_cache_loc=out_cache_loc,
+            seq_lens_sum=int(seq_lens.sum().item()),
+            positions=positions,
+            mrope_positions=mrope_positions,
+            spec_algorithm=self.model_runner.spec_algorithm,
+            spec_info=spec_info,
+            capture_hidden_mode=CaptureHiddenMode.FULL,
+            global_forward_mode=ForwardMode.TARGET_VERIFY,
+            dp_padding_mode=DpPaddingMode.get_default_mode_in_cuda_graph(),
+            num_token_non_padded=torch.tensor(
+                graph_num_tokens, dtype=torch.int64, device=self.device
+            ),
+        )
+
+    def _profile_dcut_cost_ms(self, *, bs: int, keep_count: int) -> float:
+        """Average target-verify latency for one (bs, keep_count) point."""
+        forward_batch = self._build_profile_forward_batch(
+            bs=bs, keep_count=keep_count
+        )
+        torch.get_device_module(self.device).synchronize()
+        self.tp_group.barrier()
+        for _ in range(_OFFLINE_PROFILE_WARMUPS):
+            self.model_runner.forward(forward_batch)
+        torch.get_device_module(self.device).synchronize()
+        self.tp_group.barrier()
+        start = torch.cuda.Event(enable_timing=True)
+        end = torch.cuda.Event(enable_timing=True)
+        start.record()
+        for _ in range(_OFFLINE_PROFILE_STEPS):
+            self.model_runner.forward(forward_batch)
+        end.record()
+        torch.cuda.synchronize()
+        self.tp_group.barrier()
+        return start.elapsed_time(end) / _OFFLINE_PROFILE_STEPS
+
+    def _get_dcut_profile_batch_sizes(self) -> tuple[int, ...]:
+        """Batch sizes to profile, derived from captured graph token buckets."""
+        runner = self.model_runner.decode_cuda_graph_runner
+        max_bs = (
+            self.model_runner.req_to_token_pool.size
+            if self.model_runner.req_to_token_pool is not None
+            else 1
+        )
+        if runner is None or runner.capture_num_tokens is None:
+            return (max_bs,)
+        sizes = []
+        for num_tokens in runner.capture_num_tokens:
+            if num_tokens % self.block_size == 0:
+                bs = num_tokens // self.block_size
+                if 0 < bs <= max_bs:
+                    sizes.append(bs)
+        sizes.append(max_bs)
+        return tuple(sorted(set(sizes)))
+
+    def profile_dcut_cost_table(self) -> None:
+        """Offline warm-up: build the auto-mode cost table."""
+        if not self.is_auto or self._offline_profiled:
+            return
+
+        try:
+            profile_bs_list = self._get_dcut_profile_batch_sizes()
+            costs_by_bs: dict[int, list[tuple[int, float]]] = {}
+            for bs in profile_bs_list:
+                keep_counts = self.candidate_keep_counts(bs)
+                self._offline_keep_counts[bs] = keep_counts
+                entries: list[tuple[int, float]] = []
+                for keep_count in keep_counts:
+                    cost = self._profile_dcut_cost_ms(bs=bs, keep_count=keep_count)
+                    entries.append((keep_count, cost))
+                costs_by_bs[bs] = entries
+                self._costs_by_bs[bs] = [cost for _, cost in entries]
+
+            self._offline_profiled = True
+            if self.tp_rank == 0 and costs_by_bs:
+                logger.info(
+                    "DFLASH D-Cut offline cost table ready: block_size=%d %s",
+                    self.block_size,
+                    {
+                        bs: [
+                            (keep, round(cost, 4)) for keep, cost in costs_by_bs[bs]
+                        ]
+                        for bs in sorted(costs_by_bs)
+                    },
+                )
+        except Exception as e:
+            if self.tp_rank == 0:
+                logger.warning(
+                    "DFLASH D-Cut offline profiling failed (%s); "
+                    "auto mode will fall back to ratio 0.75.",
+                    e,
+                )
+            self._offline_profiled = True
 
     def plan(
         self,
