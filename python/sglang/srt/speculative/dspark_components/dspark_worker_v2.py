@@ -345,7 +345,16 @@ class DSparkWorkerV2(BaseSpecWorker):
             simulate_acc_len=self._simulate_acc_len,
         )
 
-        if self._is_pd_prefill and not self._draft_is_moe:
+        self._maybe_prune_dense_draft_for_pd_prefill()
+
+    def _maybe_prune_dense_draft_for_pd_prefill(self) -> None:
+        # Only the last PP stage owns the draft model. Non-last stages still
+        # construct this worker to relay target proxies and must not dereference it.
+        if (
+            self._is_pd_prefill
+            and not self._draft_is_moe
+            and self.draft_model is not None
+        ):
             self.draft_model.prune_to_ctx_kv_injection()
 
     def _resolve_target_embed_tokens(self, target_model):

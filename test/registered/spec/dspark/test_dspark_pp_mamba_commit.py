@@ -51,6 +51,24 @@ def _worker(*, pp_is_last_rank=False, need_commit=True, request_indexed=True):
 
 
 class TestDSparkPPMambaCommit(CustomTestCase):
+    def test_pd_prefill_non_last_rank_skips_missing_draft_prune(self):
+        worker = object.__new__(DSparkWorkerV2)
+        worker._is_pd_prefill = True
+        worker._draft_is_moe = False
+        worker.draft_model = None
+
+        worker._maybe_prune_dense_draft_for_pd_prefill()
+
+    def test_pd_prefill_last_rank_prunes_dense_draft(self):
+        worker = object.__new__(DSparkWorkerV2)
+        worker._is_pd_prefill = True
+        worker._draft_is_moe = False
+        worker.draft_model = Mock()
+
+        worker._maybe_prune_dense_draft_for_pd_prefill()
+
+        worker.draft_model.prune_to_ctx_kv_injection.assert_called_once_with()
+
     def test_non_last_rank_commits_with_explicit_state_indices(self):
         worker, pool = _worker()
         batch = _batch()
