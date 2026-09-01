@@ -137,17 +137,24 @@ class DFlashDecodePrepareMixin:
         uniform_top_k = True
         for i, req in enumerate(batch.reqs):
             committed_len = int(req.kv_committed_len)
-            # Read the allocation watermark from the req object like EAGLE.
-            cur_alloc_len = int(req.kv.kv_allocated_len)
-            reserved_len = max(cur_alloc_len, committed_len + 2 * block_size)
+            cur = int(req.kv.kv_allocated_len)
+            # Whole-page accounting (same as eagle_prepare_for_decode): the
+            # paged allocator hands out full pages, so an unaligned reserve
+            # strands the tail of the last page -- allocated but never recorded.
+            nxt = max(
+                cur,
+                (committed_len + 2 * block_size + page_size - 1)
+                // page_size
+                * page_size,
+            )
 
             batch_seq_lens_cpu_t[i] = committed_len
-            cur_kv_lens_cpu_t[i] = cur_alloc_len
-            nxt_kv_lens_cpu_t[i] = reserved_len
+            cur_kv_lens_cpu_t[i] = cur
+            nxt_kv_lens_cpu_t[i] = nxt
 
             committed_seq_lens_sum += committed_len
-            reserved_seq_lens_sum += reserved_len
-            num_needed_tokens += reserved_len - cur_alloc_len
+            reserved_seq_lens_sum += nxt
+            num_needed_tokens += nxt - cur
 
             if track_top_k:
                 top_k = int(req.sampling_params.top_k)
