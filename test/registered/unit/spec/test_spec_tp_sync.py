@@ -42,10 +42,13 @@ class TestSpecTpSync(unittest.TestCase):
         group.broadcast.assert_called_once_with(values, src=0)
 
     def test_memory_probe_uses_group_min_only_when_enabled(self):
-        group = SimpleNamespace(
-            world_size=2,
+        sync_group = SimpleNamespace(
+            world_size=1,
             rank_in_group=0,
             broadcast=MagicMock(),
+        )
+        memory_group = SimpleNamespace(
+            world_size=2,
             cpu_group=object(),
         )
         with patch(
@@ -53,18 +56,31 @@ class TestSpecTpSync(unittest.TestCase):
             return_value=3.5,
         ) as get_memory:
             with envs.SGLANG_SPEC_TP_SYNC.override("init"):
-                sync = SpecTpSync(group)
+                sync = SpecTpSync(sync_group)
                 self.assertEqual(
                     sync.available_memory_gb(
                         SpecTpSyncSite.DSPARK_MEM,
                         "cuda",
                         0,
-                        group=group,
+                        group=memory_group,
                     ),
                     3.5,
                 )
             get_memory.assert_called_once_with(
-                "cuda", 0, distributed=True, cpu_group=group.cpu_group
+                "cuda", 0, distributed=True, cpu_group=memory_group.cpu_group
+            )
+
+            get_memory.reset_mock()
+            with envs.SGLANG_SPEC_TP_SYNC.override("off"):
+                sync = SpecTpSync(sync_group)
+                sync.available_memory_gb(
+                    SpecTpSyncSite.DSPARK_MEM,
+                    "cuda",
+                    0,
+                    group=memory_group,
+                )
+            get_memory.assert_called_once_with(
+                "cuda", 0, distributed=False, cpu_group=None
             )
 
 

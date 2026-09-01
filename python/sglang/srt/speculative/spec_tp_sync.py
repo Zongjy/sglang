@@ -103,6 +103,7 @@ class SpecTpSync:
         self._tp_group = tp_group
         # Parsed even on a single rank so a typo fails on every deployment.
         sites = parse_spec_tp_sync(envs.SGLANG_SPEC_TP_SYNC.get())
+        self._configured_sites = sites
         self._sites = sites if tp_group.world_size > 1 else frozenset()
         if sites != _ALL and tp_group.world_size > 1 and tp_group.rank_in_group == 0:
             logger.warning(
@@ -120,7 +121,11 @@ class SpecTpSync:
 
     def available_memory_gb(self, site: SpecTpSyncSite, device, gpu_id, *, group):
         """Free GPU memory, reduced to the group minimum when ``site`` is on."""
-        distributed = self.enabled(site) and group.world_size > 1
+        # The draft graph can use a different collective group than decision
+        # synchronization (for example MoE + DP uses TP for graph capture but
+        # attn-TP for sampled-token decisions). Honor the configured memory site
+        # against the group supplied by the caller even when _tp_group is size 1.
+        distributed = site in self._configured_sites and group.world_size > 1
         return get_available_gpu_memory(
             device,
             gpu_id,
