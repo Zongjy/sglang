@@ -6,6 +6,16 @@ from sglang.srt.runtime_context import get_server_args
 from sglang.srt.server_args import ServerArgs
 
 
+def get_alloc_page_size(server_args: ServerArgs) -> int:
+    """Upper bound for the allocator's logical page width.
+
+    CUDA/HIP DCP widens allocator locations by the decode-context parallel
+    width. Platforms that keep ordinary pages merely receive conservative
+    speculative headroom.
+    """
+    return server_args.page_size * max(int(getattr(server_args, "dcp_size", 1)), 1)
+
+
 def get_alloc_len_per_decode(
     server_args: ServerArgs, *, max_draft_tokens: Optional[int] = None
 ) -> int:
@@ -23,7 +33,7 @@ def get_alloc_len_per_decode(
         if max_draft_tokens is not None
         else server_args.max_speculative_num_draft_tokens
     )
-    page_size = server_args.page_size
+    page_size = get_alloc_page_size(server_args)
 
     from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 
@@ -100,14 +110,15 @@ def get_req_to_token_extra_context_len(
         max_draft_tokens = server_args.max_speculative_num_draft_tokens
     # FIXME(lsyin): temporary fix for the context length issue under spec decoding
     extra = 4 + (max_draft_tokens or 0)
-    if server_args.speculative_algorithm is not None and server_args.page_size > 1:
+    page_size = get_alloc_page_size(server_args)
+    if server_args.speculative_algorithm is not None and page_size > 1:
         # kv_allocated_len is page-aligned (eagle_prepare_for_decode), so near
         # the context limit the aligned reserve can overshoot by page_size - 1;
         # without the headroom the row write silently lands in the neighbor row.
         extra = max(
             extra,
             get_alloc_reserve_per_decode(server_args, max_draft_tokens=max_draft_tokens)
-            + server_args.page_size
+            + page_size
             - 1,
         )
     return extra

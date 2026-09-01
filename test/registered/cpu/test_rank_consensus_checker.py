@@ -135,7 +135,9 @@ class RankConsensusCheckerTestCase(CustomTestCase):
         master_port = find_available_port(23456)
 
         old_env = os.getenv("SGLANG_ENABLE_RANK_CONSENSUS_CHECKER")
+        old_cuda_visible_devices = os.getenv("CUDA_VISIBLE_DEVICES")
         os.environ["SGLANG_ENABLE_RANK_CONSENSUS_CHECKER"] = str(enable_env)
+        os.environ["CUDA_VISIBLE_DEVICES"] = "99"
 
         world_size = pp_size * tp_size
         processes = []
@@ -161,6 +163,10 @@ class RankConsensusCheckerTestCase(CustomTestCase):
             os.environ.pop("SGLANG_ENABLE_RANK_CONSENSUS_CHECKER")
         else:
             os.environ["SGLANG_ENABLE_RANK_CONSENSUS_CHECKER"] = old_env
+        if old_cuda_visible_devices is None:
+            os.environ.pop("CUDA_VISIBLE_DEVICES")
+        else:
+            os.environ["CUDA_VISIBLE_DEVICES"] = old_cuda_visible_devices
 
         return all(p.exitcode == 0 for p in processes)
 

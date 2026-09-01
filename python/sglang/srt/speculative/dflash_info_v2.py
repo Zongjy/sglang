@@ -235,7 +235,7 @@ class DFlashPPVerifyInputRaw(DFlashDecodePrepareMixin, SpecInput):
     # Optional placeholders mirroring DFlashDraftInputV2 so that the verify
     # seq_lens planning bound (read when batch.seq_lens_cpu is None) never
     # AttributeErrors under PP. Written by prepare_for_decode (the mixin).
-    reserved_seq_lens_cpu: Optional[List] = None
+    reserved_seq_lens_cpu: Optional[torch.Tensor] = None
     reserved_seq_lens_sum: Optional[int] = None
 
     # Linear verify: always None so batch_result_processor skips the token move.

@@ -6,7 +6,12 @@ from unittest.mock import patch
 import torch
 
 from sglang.srt.mem_cache.allocation import alloc_for_spec_decode
-from sglang.srt.mem_cache.allocation_sizing import page_aligned_decode_alloc_lens
+from sglang.srt.mem_cache.allocation_sizing import (
+    get_alloc_len_per_decode,
+    get_alloc_page_size,
+    get_req_to_token_extra_context_len,
+    page_aligned_decode_alloc_lens,
+)
 from sglang.srt.speculative.dflash_info_v2 import DFlashPPVerifyInputRaw
 from sglang.srt.speculative.dspark_components.dspark_verify import (
     DSparkPPVerifyInputRaw,
@@ -25,6 +30,20 @@ def _req(*, committed: int, allocated: int):
 
 
 class TestPageAlignedDecodeAllocation(CustomTestCase):
+    def test_dcp_uses_effective_allocator_page_for_reserve_and_headroom(self):
+        server_args = SimpleNamespace(
+            speculative_algorithm="EAGLE",
+            speculative_num_steps=3,
+            speculative_eagle_topk=2,
+            max_speculative_num_draft_tokens=4,
+            page_size=1,
+            dcp_size=4,
+        )
+
+        self.assertEqual(get_alloc_page_size(server_args), 4)
+        self.assertEqual(get_alloc_len_per_decode(server_args), 16)
+        self.assertEqual(get_req_to_token_extra_context_len(server_args), 35)
+
     def test_spec_allocation_updates_watermarks_without_scalar_indexing(self):
         class NoScalarReads:
             def __init__(self, values):
