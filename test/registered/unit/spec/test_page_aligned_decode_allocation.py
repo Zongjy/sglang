@@ -87,6 +87,35 @@ class TestPageAlignedDecodeAllocation(CustomTestCase):
             self.assertEqual(pp_input.reserved_seq_lens_sum, 320)
             self.assertEqual(alloc.call_args.kwargs["num_needed_tokens"], 64)
 
+            pp_input.filter_batch(torch.tensor([1]), new_indices_cpu=[1])
+            torch.testing.assert_close(
+                pp_input.reserved_seq_lens_cpu,
+                torch.tensor([192], dtype=torch.int32),
+            )
+            self.assertEqual(pp_input.reserved_seq_lens_sum, 192)
+
+    def test_dspark_pp_merge_preserves_reserved_lengths(self):
+        def make(token: int, reserved_len: int):
+            return DSparkPPVerifyInputRaw(
+                bonus_tokens=torch.tensor([token]),
+                draft_tokens=torch.full((1, 7), token, dtype=torch.int64),
+                new_seq_lens=[token],
+                accept_lens=torch.ones(1, dtype=torch.int64),
+                reserved_seq_lens_cpu=torch.tensor(
+                    [reserved_len], dtype=torch.int32
+                ),
+                reserved_seq_lens_sum=reserved_len,
+            )
+
+        pp_input = make(1, 128)
+        pp_input.merge_batch(make(2, 192))
+
+        torch.testing.assert_close(
+            pp_input.reserved_seq_lens_cpu,
+            torch.tensor([128, 192], dtype=torch.int32),
+        )
+        self.assertEqual(pp_input.reserved_seq_lens_sum, 320)
+
 
 if __name__ == "__main__":
     unittest.main()

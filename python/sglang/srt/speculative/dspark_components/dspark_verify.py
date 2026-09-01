@@ -192,7 +192,7 @@ class DSparkPPVerifyInputRaw(DFlashDecodePrepareMixin, SpecInput):
     # Optional placeholders mirroring DFlashDraftInputV2 so that run_non_compact's
     # elif branch (reading reserved_seq_lens_cpu when batch.seq_lens_cpu is None)
     # never AttributeErrors under PP. Steady-state decode does not trigger it.
-    reserved_seq_lens_cpu: Optional[List] = None
+    reserved_seq_lens_cpu: Optional[torch.Tensor] = None
     reserved_seq_lens_sum: Optional[int] = None
 
     # Confidence produced by last rank's propose; all ranks recompute an
@@ -249,6 +249,16 @@ class DSparkPPVerifyInputRaw(DFlashDecodePrepareMixin, SpecInput):
     def filter_batch(
         self, new_indices, new_indices_cpu: Optional[List[int]] = None
     ):
+        if self.reserved_seq_lens_cpu is not None:
+            if new_indices_cpu is not None:
+                host_indices = new_indices_cpu
+            elif torch.is_tensor(new_indices):
+                host_indices = new_indices.to(device="cpu")
+            else:
+                host_indices = list(new_indices)
+            self.reserved_seq_lens_cpu = self.reserved_seq_lens_cpu[host_indices]
+            self.reserved_seq_lens_sum = int(self.reserved_seq_lens_cpu.sum().item())
+
         self.bonus_tokens = self.bonus_tokens[new_indices]
         if self.draft_tokens is not None:
             self.draft_tokens = self.draft_tokens[new_indices]
@@ -282,12 +292,23 @@ class DSparkPPVerifyInputRaw(DFlashDecodePrepareMixin, SpecInput):
             self.bonus_tokens = other.bonus_tokens
             self.draft_tokens = other.draft_tokens
             self.new_seq_lens = other.new_seq_lens
+            self.reserved_seq_lens_cpu = other.reserved_seq_lens_cpu
+            self.reserved_seq_lens_sum = other.reserved_seq_lens_sum
             self.confidence = other.confidence
             self.accept_lens = other.accept_lens
             self.cap_trim_lens = other.cap_trim_lens
             self.verify_lens = other.verify_lens
             self.accept_index = other.accept_index
             return
+        if self.reserved_seq_lens_cpu is not None:
+            assert other.reserved_seq_lens_cpu is not None
+            self.reserved_seq_lens_cpu = torch.cat(
+                [self.reserved_seq_lens_cpu, other.reserved_seq_lens_cpu]
+            )
+            self.reserved_seq_lens_sum = int(self.reserved_seq_lens_cpu.sum().item())
+        elif other.reserved_seq_lens_cpu is not None:
+            self.reserved_seq_lens_cpu = other.reserved_seq_lens_cpu
+            self.reserved_seq_lens_sum = other.reserved_seq_lens_sum
         self.bonus_tokens = torch.cat([self.bonus_tokens, other.bonus_tokens])
         if other.draft_tokens is not None:
             self.draft_tokens = torch.cat([self.draft_tokens, other.draft_tokens])
