@@ -10,7 +10,7 @@ Typical workflow::
 
     python benchmark/pp_spec/adaptive_pp_tuner.py profile \
       --output-dir /shared/pp-profile-bs32 --nnodes 2 --tp-size 1 --pp-size 4 \
-      --current-partition 16,16,16,16 --batch-size 32
+      --batch-size 32
 
     python benchmark/pp_spec/adaptive_pp_tuner.py analyze \
       --profile-dir /shared/pp-profile-bs32
@@ -38,6 +38,11 @@ DEFAULT_MODEL = "Qwen/Qwen3.5-9B"
 DEFAULT_DRAFT_MODEL = "z-lab/Qwen3.5-9B-DFlash"
 PROFILE_CONFIG = "profile.json"
 
+try:
+    from benchmark.pp_spec.model_layout import LayerLayout, LayoutError
+except ImportError:  # pragma: no cover - flat script execution
+    from model_layout import LayerLayout, LayoutError
+
 
 class TuningError(RuntimeError):
     pass
@@ -60,6 +65,35 @@ def parse_partition(value: str, pp_size: int) -> tuple[int, ...]:
             f"partition must contain exactly {pp_size} positive layer counts"
         )
     return partition
+
+
+def uniform_partition(model_path: str, pp_size: int) -> tuple[int, ...]:
+    """Total model layers split evenly across PP stages (remainder up front)."""
+
+    def _layout() -> LayerLayout:
+        try:
+            return LayerLayout.from_model_path(model_path)  # local cache first
+        except LayoutError:
+            from huggingface_hub import hf_hub_download
+
+            config_path = Path(hf_hub_download(model_path, "config.json"))
+            return LayerLayout.from_config(json.loads(config_path.read_text()))
+
+    layout = _layout()
+    base, rem = divmod(layout.num_layers, pp_size)
+    return tuple(base + (rank < rem) for rank in range(pp_size))
+
+
+def resolve_partition(args: argparse.Namespace) -> tuple[int, ...]:
+    if args.baseline_partition is None:
+        try:
+            return uniform_partition(args.model_path, args.pp_size)
+        except Exception as exc:
+            raise TuningError(
+                f"cannot derive uniform partition for {args.model_path!r}; "
+                "pass --baseline-partition explicitly"
+            ) from exc
+    return parse_partition(args.baseline_partition, args.pp_size)
 
 
 def parse_int_list(value: str | None, option: str) -> tuple[int, ...] | None:
@@ -105,7 +139,7 @@ def _execution_bucket(args: argparse.Namespace) -> int:
 def build_profile_command(args: argparse.Namespace, profile_dir: Path) -> list[str]:
     if args.tp_size <= 0 or args.pp_size <= 0 or args.nnodes <= 0:
         raise TuningError("--tp-size, --pp-size, and --nnodes must be positive")
-    partition = parse_partition(args.current_partition, args.pp_size)
+    partition = resolve_partition(args)
     world_size = args.tp_size * args.pp_size
     if world_size % args.nnodes != 0:
         raise TuningError(
@@ -223,7 +257,7 @@ def run_profile(args: argparse.Namespace) -> Path:
         )
     profile_dir.mkdir(parents=True, exist_ok=True)
     command = build_profile_command(args, profile_dir)
-    partition = parse_partition(args.current_partition, args.pp_size)
+    partition = resolve_partition(args)
     execution_bucket = _execution_bucket(args)
     if execution_bucket <= 0:
         raise TuningError("--execution-bucket must be positive")
@@ -264,7 +298,7 @@ def run_profile(args: argparse.Namespace) -> Path:
             "model_path": args.model_path,
             "tp_size": args.tp_size,
             "pp_size": args.pp_size,
-            "current_partition": list(partition),
+            "baseline_partition": list(partition),
             "execution_bucket": execution_bucket,
         },
     )
@@ -386,7 +420,7 @@ def run_analysis(args: argparse.Namespace) -> Path:
     pp_size = int(profile["pp_size"])
     tp_size = int(profile["tp_size"])
     try:
-        partition = tuple(int(value) for value in profile["current_partition"])
+        partition = tuple(int(value) for value in profile["baseline_partition"])
     except (KeyError, TypeError, ValueError) as exc:
         raise TuningError("baseline profile has an invalid partition") from exc
     if len(partition) != pp_size or any(value <= 0 for value in partition):
@@ -432,7 +466,7 @@ def run_analysis(args: argparse.Namespace) -> Path:
             profiles,
             num_layers=sum(partition),
             pp_size=pp_size,
-            current_partition=partition,
+            baseline_partition=partition,
             layout=layout,
         )
     except stage_model.StageModelError as exc:
@@ -495,7 +529,13 @@ def build_parser() -> argparse.ArgumentParser:
     profile.add_argument("--tp-size", type=int, default=1)
     profile.add_argument("--pp-size", type=int, required=True)
     profile.add_argument("--nnodes", type=int, default=1)
-    profile.add_argument("--current-partition", required=True)
+    profile.add_argument(
+        "--baseline-partition",
+        help=(
+            "comma-separated PP layer counts to profile; default: uniform, "
+            "i.e. total model layers split evenly across PP stages"
+        ),
+    )
     profile.add_argument("--batch-size", type=int, default=32)
     profile.add_argument(
         "--execution-bucket",

@@ -4,138 +4,58 @@ set -euo pipefail
 SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 REPO_ROOT=$(cd -- "$SCRIPT_DIR/../.." && pwd)
 
-MODEL=${MODEL:-Qwen/Qwen3-8B}
-DRAFT_MODEL=${DRAFT_MODEL:-z-lab/Qwen3-8B-DFlash-b16}
-MODEL_REVISION=${MODEL_REVISION:-main}
-DRAFT_MODEL_REVISION=${DRAFT_MODEL_REVISION:-main}
-DATASET=${DATASET:-$SCRIPT_DIR/data/sharegpt.json}
-GPUS=${GPUS:-0,1}
-NUM_GPUS=${NUM_GPUS:-}
-MODES=${MODES:-tp,dp,pp_uniform,pp_auto}
-UNIFORM_PARTITION=${UNIFORM_PARTITION:-18,18}
-AUTO_PARTITION=${AUTO_PARTITION:-22,14}
-ENABLE_REPLAY_SSM=${ENABLE_REPLAY_SSM:-0}
-PORT=${PORT:-31000}
-RAGGED_VERIFY_MODE=${RAGGED_VERIFY_MODE:-static}
-LOAD_POINTS=${LOAD_POINTS:-8:2:32,16:4:64,32:8:128,64:16:256,96:24:384,128:32:512}
-MAX_TOKENS=${MAX_TOKENS:-1024}
-PROMPT_MAX_TOKENS=${PROMPT_MAX_TOKENS:-2000}
-DFLASH_BLOCK_SIZE=${DFLASH_BLOCK_SIZE:-16}
-MEM_FRACTION_STATIC=${MEM_FRACTION_STATIC:-0.75}
-STARTUP_TIMEOUT=${STARTUP_TIMEOUT:-600}
-REQUEST_TIMEOUT_S=${REQUEST_TIMEOUT_S:-1800}
-COOLDOWN_S=${COOLDOWN_S:-10}
-MODEL_TAG=${MODEL//\//_}
-OUTPUT_ROOT=${OUTPUT_ROOT:-$SCRIPT_DIR/results/${MODEL_TAG}_$(date -u +%Y%m%d_%H%M%S)}
-
-GPUS=${GPUS//[[:space:]]/}
-IFS=',' read -r -a GPU_LIST <<<"$GPUS"
-if ((${#GPU_LIST[@]} == 0)); then
-  echo "GPUS must contain at least one GPU id" >&2
-  exit 2
-fi
-for gpu in "${GPU_LIST[@]}"; do
-  if [[ ! $gpu =~ ^[0-9]+$ ]]; then
-    echo "GPUS must contain non-negative integer ids; got '$GPUS'" >&2
-    exit 2
-  fi
-done
-if [[ -z $NUM_GPUS ]]; then
-  NUM_GPUS=${#GPU_LIST[@]}
-fi
-if [[ ! $NUM_GPUS =~ ^[1-9][0-9]*$ ]]; then
-  echo "NUM_GPUS must be a positive integer; got $NUM_GPUS" >&2
-  exit 2
-fi
-if ((${#GPU_LIST[@]} != NUM_GPUS)); then
-  echo "NUM_GPUS=$NUM_GPUS does not match GPUS=$GPUS (${#GPU_LIST[@]} ids)" >&2
-  exit 2
-fi
-if [[ $ENABLE_REPLAY_SSM != 0 && $ENABLE_REPLAY_SSM != 1 ]]; then
-  echo "ENABLE_REPLAY_SSM must be 0 or 1; got $ENABLE_REPLAY_SSM" >&2
-  exit 2
-fi
-IFS=',' read -r -a raw_mode_list <<<"$MODES"
-MODE_LIST=()
-for raw_mode in "${raw_mode_list[@]}"; do
-  mode=${raw_mode//[[:space:]]/}
-  case "$mode" in
-    tp | dp | pp_uniform | pp_auto) ;;
-    *)
-      echo "Unsupported mode '$raw_mode'; expected tp,dp,pp_uniform,pp_auto" >&2
-      exit 2
-      ;;
-  esac
-  already_selected=0
-  for selected_mode in "${MODE_LIST[@]}"; do
-    if [[ $selected_mode == "$mode" ]]; then
-      already_selected=1
-      break
-    fi
-  done
-  if ((already_selected == 0)); then
-    MODE_LIST+=("$mode")
-  fi
-done
-if ((${#MODE_LIST[@]} == 0)); then
-  echo "MODES must select at least one mode" >&2
-  exit 2
-fi
-
-UNIFORM_PARTITION=${UNIFORM_PARTITION//[[:space:]]/}
-AUTO_PARTITION=${AUTO_PARTITION//[[:space:]]/}
+# Shared config. ReplaySSM is always on (hybrid linear-attention models).
+MODEL_REVISION=main
+DRAFT_MODEL_REVISION=main
+DATASET=$SCRIPT_DIR/data/sharegpt.json
+GPUS=0,1
+NUM_GPUS=2
+PORT=31000
+RAGGED_VERIFY_MODE=static
+MAX_TOKENS=1024
+PROMPT_MAX_TOKENS=2000
+DFLASH_BLOCK_SIZE=16
+STARTUP_TIMEOUT=600
+REQUEST_TIMEOUT_S=1800
+COOLDOWN_S=10
 BASE_URL="http://127.0.0.1:$PORT"
 SERVER_PID=
+FAILED_RUNS=()
 
-mode_enabled() {
-  local expected=$1
-  local mode
-  for mode in "${MODE_LIST[@]}"; do
-    [[ $mode == "$expected" ]] && return 0
-  done
-  return 1
-}
-
-validate_partition() {
-  local name=$1
-  local partition=$2
-  local layer_count
-  local -a layers
-  IFS=',' read -r -a layers <<<"$partition"
-  if ((${#layers[@]} != NUM_GPUS)); then
-    echo "$name must contain $NUM_GPUS layer counts; got '$partition'" >&2
-    exit 2
-  fi
-  for layer_count in "${layers[@]}"; do
-    if [[ ! $layer_count =~ ^[1-9][0-9]*$ ]]; then
-      echo "$name must contain positive integers; got '$partition'" >&2
-      exit 2
-    fi
-  done
-}
-
-mode_enabled pp_uniform && validate_partition UNIFORM_PARTITION "$UNIFORM_PARTITION"
-mode_enabled pp_auto && validate_partition AUTO_PARTITION "$AUTO_PARTITION"
+# ---------------------------------------------------------------------------
+# Part 1: helpers
+# ---------------------------------------------------------------------------
 
 cleanup() {
-  if [[ -n ${SERVER_PID:-} ]] && kill -0 "$SERVER_PID" 2>/dev/null; then
-    kill -INT -- "-$SERVER_PID" 2>/dev/null || true
+  local pid=${SERVER_PID:-}
+  SERVER_PID=
+  [[ -n $pid ]] || return 0
+
+  if kill -0 -- "-$pid" 2>/dev/null; then
+    kill -INT -- "-$pid" 2>/dev/null || true
     for _ in {1..60}; do
-      kill -0 "$SERVER_PID" 2>/dev/null || break
+      kill -0 -- "-$pid" 2>/dev/null || break
       sleep 1
     done
-    if kill -0 "$SERVER_PID" 2>/dev/null; then
-      kill -TERM -- "-$SERVER_PID" 2>/dev/null || true
+    if kill -0 -- "-$pid" 2>/dev/null; then
+      kill -TERM -- "-$pid" 2>/dev/null || true
       sleep 5
     fi
-    if kill -0 "$SERVER_PID" 2>/dev/null; then
-      kill -KILL -- "-$SERVER_PID" 2>/dev/null || true
+    if kill -0 -- "-$pid" 2>/dev/null; then
+      kill -KILL -- "-$pid" 2>/dev/null || true
     fi
-    wait "$SERVER_PID" 2>/dev/null || true
   fi
-  SERVER_PID=
+  wait "$pid" 2>/dev/null || true
 }
-trap cleanup EXIT INT TERM
+
+on_signal() {
+  local status=$1
+  trap - INT TERM
+  exit "$status"
+}
+trap cleanup EXIT
+trap 'on_signal 130' INT
+trap 'on_signal 143' TERM
 
 wait_for_server() {
   local log_file=$1
@@ -155,6 +75,16 @@ wait_for_server() {
   done
 }
 
+record_failure() {
+  local target=$1
+  local phase=$2
+  local status=$3
+
+  FAILED_RUNS+=("$target: $phase (exit $status)")
+  printf '%s\n' "$phase (exit $status)" >"$target/FAILED"
+  echo "[$target] $phase failed with exit code $status; continuing." >&2
+}
+
 run_config() {
   local name=$1
   local tp_size=$2
@@ -172,6 +102,7 @@ run_config() {
   local cuda_graph_bs
   local max_running_requests=$active_bs
   local output_dir="$OUTPUT_ROOT/$name/$point_tag"
+  local status=0
   local -a server_args
 
   if ((tp_size <= 0 || pp_size <= 0 || dp_size <= 0)); then
@@ -198,6 +129,7 @@ run_config() {
     exit 1
   fi
   cuda_graph_bs=$((active_bs / batch_divisor))
+  cuda_graph_bs=$((cuda_graph_bs < 64 ? cuda_graph_bs : 64))
   if ((dp_size > 1)); then
     max_running_requests=$cuda_graph_bs
   fi
@@ -218,23 +150,20 @@ run_config() {
     --attention-backend flashinfer
     --max-running-requests "$max_running_requests"
     --load-balance-method round_robin
+    --disable-prefill-cuda-graph
     --cuda-graph-max-bs-decode "$cuda_graph_bs"
     --mem-fraction-static "$MEM_FRACTION_STATIC"
     --page-size 1
     --random-seed 1
     --disable-radix-cache
     --trust-remote-code
+    --linear-attn-backend triton
+    --mamba-ssm-dtype float32
+    --mamba-full-memory-ratio 0.9
+    --enable-linear-replayssm-spec
     --host 127.0.0.1
     --port "$PORT"
   )
-  if [[ $ENABLE_REPLAY_SSM == 1 ]]; then
-    server_args+=(
-      --linear-attn-backend triton
-      --mamba-ssm-dtype float32
-      --mamba-full-memory-ratio 0.9
-      --enable-linear-replayssm-spec
-    )
-  fi
   if [[ -n $partition ]]; then
     server_args+=(--pp-layer-partition "$partition")
   fi
@@ -243,13 +172,20 @@ run_config() {
   fi
   server_args+=("${extra_server_args[@]}")
 
-  echo "[$name][$load_point] starting: tp=$tp_size pp=$pp_size dp=$dp_size max_running=$max_running_requests cuda_graph_bs=$cuda_graph_bs replay_ssm=$ENABLE_REPLAY_SSM mem_fraction=$MEM_FRACTION_STATIC"
+  echo "[$name][$load_point] starting: tp=$tp_size pp=$pp_size dp=$dp_size max_running=$max_running_requests cuda_graph_bs=$cuda_graph_bs mem_fraction=$MEM_FRACTION_STATIC"
   CUDA_VISIBLE_DEVICES="$GPUS" \
     SGLANG_RAGGED_VERIFY_MODE="$RAGGED_VERIFY_MODE" \
     SGL_FORCE_SHUTDOWN=1 \
     setsid sglang "${server_args[@]}" >"$output_dir/server.log" 2>&1 &
   SERVER_PID=$!
-  wait_for_server "$output_dir/server.log"
+  if wait_for_server "$output_dir/server.log"; then
+    :
+  else
+    status=$?
+    cleanup
+    record_failure "$output_dir" "server startup" "$status"
+    return 0
+  fi
 
   python "$SCRIPT_DIR/bench_spectre.py" \
     --url "$BASE_URL" \
@@ -264,46 +200,124 @@ run_config() {
     --seed 1 \
     --request-timeout-s "$REQUEST_TIMEOUT_S" \
     --cooldown-s "$COOLDOWN_S" \
-    --output-dir "$output_dir"
+    --output-dir "$output_dir" || status=$?
 
   cleanup
+  if ((status != 0)); then
+    record_failure "$output_dir" "benchmark" "$status"
+    return 0
+  fi
   echo "[$name][$load_point] complete"
 }
 
-mkdir -p "$OUTPUT_ROOT"
+summarize_run() {
+  local run_dir=$1
+  local status=0
+
+  python "$SCRIPT_DIR/summarize_spectre.py" "$run_dir" || status=$?
+  if ((status != 0)); then
+    record_failure "$run_dir" "summary" "$status"
+    return 0
+  fi
+
+  python "$SCRIPT_DIR/plot_performance.py" "$run_dir/summary.csv" || status=$?
+  if ((status != 0)); then
+    record_failure "$run_dir" "plotting" "$status"
+  fi
+}
+
+# ---------------------------------------------------------------------------
+# Part 2: the runs
+# ---------------------------------------------------------------------------
+
 cd "$REPO_ROOT"
+
+# # ===== Qwen3.5-9B (32 layers; uniform 16,16 / auto 20,12) =====
+# MODEL=Qwen/Qwen3.5-9B
+# DRAFT_MODEL=z-lab/Qwen3.5-9B-DFlash
+# MEM_FRACTION_STATIC=0.75
+# OUTPUT_ROOT=$SCRIPT_DIR/results/Qwen_Qwen3.5-9B_$(date -u +%Y%m%d_%H%M%S)
+# mkdir -p "$OUTPUT_ROOT"
+# echo "Results: $OUTPUT_ROOT"
+
+# # run_config name <tp size> <pp_size> <dp_size> <load_point:并发:QPS:请求数> <active_bs:全局并发> <num_requests:总请求数> <point_tag:结果目录后缀c{C}_qps{Q}_n{N}>
+# run_config tp2 2 1 1 "" 8:2:32 8 32 c8_qps2_n32
+# run_config dp2 1 1 2 "" 8:2:32 8 32 c8_qps2_n32
+# run_config pp2_uniform 1 2 1 16,16 8:2:32 8 32 c8_qps2_n32
+# run_config pp2_auto 1 2 1 20,12 8:2:32 8 32 c8_qps2_n32
+
+# run_config tp2 2 1 1 "" 16:4:64 16 64 c16_qps4_n64
+# run_config dp2 1 1 2 "" 16:4:64 16 64 c16_qps4_n64
+# run_config pp2_uniform 1 2 1 16,16 16:4:64 16 64 c16_qps4_n64
+# run_config pp2_auto 1 2 1 20,12 16:4:64 16 64 c16_qps4_n64
+
+# run_config tp2 2 1 1 "" 32:8:128 32 128 c32_qps8_n128
+# run_config dp2 1 1 2 "" 32:8:128 32 128 c32_qps8_n128
+# run_config pp2_uniform 1 2 1 16,16 32:8:128 32 128 c32_qps8_n128
+# run_config pp2_auto 1 2 1 20,12 32:8:128 32 128 c32_qps8_n128
+
+# run_config tp2 2 1 1 "" 64:16:256 64 256 c64_qps16_n256
+# run_config dp2 1 1 2 "" 64:16:256 64 256 c64_qps16_n256
+# run_config pp2_uniform 1 2 1 16,16 64:16:256 64 256 c64_qps16_n256
+# run_config pp2_auto 1 2 1 20,12 64:16:256 64 256 c64_qps16_n256
+
+# run_config tp2 2 1 1 "" 96:24:384 96 384 c96_qps24_n384
+# run_config dp2 1 1 2 "" 96:24:384 96 384 c96_qps24_n384
+# run_config pp2_uniform 1 2 1 16,16 96:24:384 96 384 c96_qps24_n384
+# run_config pp2_auto 1 2 1 20,12 96:24:384 96 384 c96_qps24_n384
+
+# run_config tp2 2 1 1 "" 128:32:512 128 512 c128_qps32_n512
+# run_config dp2 1 1 2 "" 128:32:512 128 512 c128_qps32_n512
+# run_config pp2_uniform 1 2 1 16,16 128:32:512 128 512 c128_qps32_n512
+# run_config pp2_auto 1 2 1 20,12 128:32:512 128 512 c128_qps32_n512
+
+# summarize_run "$OUTPUT_ROOT"
+
+# ===== Qwen3.5-27B-FP8 (64 layers; uniform 32,32 / auto 38,26) =====
+MODEL=Qwen/Qwen3.5-27B-FP8
+DRAFT_MODEL=z-lab/Qwen3.5-27B-DFlash
+MEM_FRACTION_STATIC=0.8
+OUTPUT_ROOT=$SCRIPT_DIR/results/Qwen_Qwen3.5-27B-FP8_$(date -u +%Y%m%d_%H%M%S)
+mkdir -p "$OUTPUT_ROOT"
 echo "Results: $OUTPUT_ROOT"
 
-IFS=',' read -r -a load_point_list <<<"$LOAD_POINTS"
-for raw_load_point in "${load_point_list[@]}"; do
-  load_point=${raw_load_point//[[:space:]]/}
-  if [[ ! $load_point =~ ^([1-9][0-9]*):([0-9]+([.][0-9]*)?):([1-9][0-9]*)$ ]]; then
-    echo "Invalid load point '$raw_load_point'; expected C:QPS:N" >&2
-    exit 1
-  fi
+# run_config <name:结果子目录> <tp> <pp> <dp> <partition:PP分层,空=非PP> <load_point:并发:QPS:请求数> <active_bs:全局并发> <num_requests:总请求数> <point_tag:结果目录后缀c{C}_qps{Q}_n{N}>
+run_config tp2 2 1 1 "" 8:2:32 8 32 c8_qps2_n32
+run_config dp2 1 1 2 "" 8:2:32 8 32 c8_qps2_n32
+run_config pp2_uniform 1 2 1 32,32 8:2:32 8 32 c8_qps2_n32
+run_config pp2_auto 1 2 1 38,26 8:2:32 8 32 c8_qps2_n32
 
-  active_bs=${BASH_REMATCH[1]}
-  num_requests=${BASH_REMATCH[4]}
-  point_tag="c${active_bs}_qps${BASH_REMATCH[2]}_n${num_requests}"
+run_config tp2 2 1 1 "" 16:4:64 16 64 c16_qps4_n64
+run_config dp2 1 1 2 "" 16:4:64 16 64 c16_qps4_n64
+run_config pp2_uniform 1 2 1 32,32 16:4:64 16 64 c16_qps4_n64
+run_config pp2_auto 1 2 1 38,26 16:4:64 16 64 c16_qps4_n64
 
-  if mode_enabled tp; then
-    run_config "tp${NUM_GPUS}" "$NUM_GPUS" 1 1 "" \
-      "$load_point" "$active_bs" "$num_requests" "$point_tag"
-  fi
-  if mode_enabled dp; then
-    run_config "dp${NUM_GPUS}" 1 1 "$NUM_GPUS" "" \
-      "$load_point" "$active_bs" "$num_requests" "$point_tag"
-  fi
-  if mode_enabled pp_uniform; then
-    run_config "pp${NUM_GPUS}_uniform" 1 "$NUM_GPUS" 1 "$UNIFORM_PARTITION" \
-      "$load_point" "$active_bs" "$num_requests" "$point_tag"
-  fi
-  if mode_enabled pp_auto; then
-    run_config "pp${NUM_GPUS}_auto" 1 "$NUM_GPUS" 1 "$AUTO_PARTITION" \
-      "$load_point" "$active_bs" "$num_requests" "$point_tag"
-  fi
-done
+run_config tp2 2 1 1 "" 32:8:128 32 128 c32_qps8_n128
+run_config dp2 1 1 2 "" 32:8:128 32 128 c32_qps8_n128
+run_config pp2_uniform 1 2 1 32,32 32:8:128 32 128 c32_qps8_n128
+run_config pp2_auto 1 2 1 38,26 32:8:128 32 128 c32_qps8_n128
 
-python "$SCRIPT_DIR/summarize_spectre.py" "$OUTPUT_ROOT"
-python "$SCRIPT_DIR/plot_performance.py" "$OUTPUT_ROOT/summary.csv"
-echo "All benchmark points complete: $OUTPUT_ROOT"
+run_config tp2 2 1 1 "" 64:16:256 64 256 c64_qps16_n256
+run_config dp2 1 1 2 "" 64:16:256 64 256 c64_qps16_n256
+run_config pp2_uniform 1 2 1 32,32 64:16:256 64 256 c64_qps16_n256
+run_config pp2_auto 1 2 1 38,26 64:16:256 64 256 c64_qps16_n256
+
+run_config tp2 2 1 1 "" 96:24:384 96 384 c96_qps24_n384
+run_config dp2 1 1 2 "" 96:24:384 96 384 c96_qps24_n384
+run_config pp2_uniform 1 2 1 32,32 96:24:384 96 384 c96_qps24_n384
+run_config pp2_auto 1 2 1 38,26 96:24:384 96 384 c96_qps24_n384
+
+run_config tp2 2 1 1 "" 128:32:512 128 512 c128_qps32_n512
+run_config dp2 1 1 2 "" 128:32:512 128 512 c128_qps32_n512
+run_config pp2_uniform 1 2 1 32,32 128:32:512 128 512 c128_qps32_n512
+run_config pp2_auto 1 2 1 38,26 128:32:512 128 512 c128_qps32_n512
+
+summarize_run "$OUTPUT_ROOT"
+
+if ((${#FAILED_RUNS[@]} > 0)); then
+  printf 'Benchmark sweep completed with %d failure(s):\n' "${#FAILED_RUNS[@]}" >&2
+  printf '  - %s\n' "${FAILED_RUNS[@]}" >&2
+  exit 1
+fi
+
+echo "All benchmark points complete."

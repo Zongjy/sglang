@@ -35,7 +35,7 @@ class StageCostModel:
 
     num_layers: int
     pp_size: int
-    current_partition: tuple[int, ...]
+    baseline_partition: tuple[int, ...]
     buckets: dict[int, BucketEstimate]
     layout: LayerLayout | None = None
 
@@ -55,18 +55,18 @@ class StageCostModel:
         *,
         num_layers: int,
         pp_size: int,
-        current_partition: Sequence[int],
+        baseline_partition: Sequence[int],
         layout: LayerLayout | None = None,
     ) -> StageCostModel:
         """Build a strict single-bucket model from adaptive profiler output."""
 
-        partition = tuple(int(value) for value in current_partition)
+        partition = tuple(int(value) for value in baseline_partition)
         if pp_size <= 0 or num_layers <= 0:
             raise StageModelError("num_layers and pp_size must be positive")
         if len(partition) != pp_size or any(value <= 0 for value in partition):
-            raise StageModelError(f"invalid current partition: {partition!r}")
+            raise StageModelError(f"invalid baseline partition: {partition!r}")
         if sum(partition) != num_layers:
-            raise StageModelError("current partition does not sum to num_layers")
+            raise StageModelError("baseline partition does not sum to num_layers")
         if layout is not None and layout.num_layers != num_layers:
             raise StageModelError(
                 "layout and offline profile have different layer counts"
@@ -110,7 +110,7 @@ class StageCostModel:
         return cls(
             num_layers=num_layers,
             pp_size=pp_size,
-            current_partition=partition,
+            baseline_partition=partition,
             buckets={bucket: estimate},
             layout=layout,
         )

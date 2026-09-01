@@ -45,6 +45,12 @@ def series_style(label: str):
 
 def load_rows():
     by_label = defaultdict(list)
+    required_metrics = {
+        "max_concurrency",
+        "output_throughput_tok_s",
+        "tpot_p99_s",
+        "ttft_p50_s",
+    }
     with open(CSV_PATH, newline="") as f:
         for row in csv.DictReader(f):
             if not row.get("label"):
@@ -55,6 +61,16 @@ def load_rows():
                 if key and key != "label" and value and value.strip()
             }
             r["label"] = row["label"]
+            if (
+                r.get("completed") != r.get("num_requests")
+                or not required_metrics.issubset(r)
+            ):
+                print(
+                    f"skipping incomplete result: {r['label']} "
+                    f"C={r.get('max_concurrency', 'unknown')}",
+                    file=sys.stderr,
+                )
+                continue
             by_label[r["label"]].append(r)
     for series in by_label.values():
         series.sort(key=lambda r: r["max_concurrency"])

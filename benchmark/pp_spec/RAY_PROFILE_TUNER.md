@@ -21,7 +21,6 @@ python benchmark/pp_spec/adaptive_pp_tuner.py profile \
   --model-path Qwen/Qwen3.5-27B \
   --draft-model-path z-lab/Qwen3.5-27B-DFlash \
   --nnodes 2 --tp-size 1 --pp-size 4 \
-  --current-partition 16,16,16,16 \
   --batch-size 128 --execution-bucket 32 \
   --block-size 16 --mem-fraction-static 0.75 \
   --mamba-ssm-dtype float32 --mamba-full-memory-ratio 0.9 \

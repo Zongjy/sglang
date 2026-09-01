@@ -4,8 +4,8 @@ set -euo pipefail
 SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 REPO_ROOT=$(cd -- "$SCRIPT_DIR/../.." && pwd)
 
-MODEL=${MODEL:-Qwen/Qwen3.5-9B}
-DRAFT_MODEL=${DRAFT_MODEL:-z-lab/Qwen3.5-9B-DFlash}
+MODEL=${MODEL:-Qwen/Qwen3.5-27B-FP8}
+DRAFT_MODEL=${DRAFT_MODEL:-z-lab/Qwen3.5-27B-DFlash}
 PP_SIZE=${PP_SIZE:-2}
 TP_SIZE=${TP_SIZE:-1}
 NNODES=${NNODES:-1}
@@ -15,7 +15,7 @@ OUTPUT_TOKENS=${OUTPUT_TOKENS:-128}
 PROFILE_STEPS=${PROFILE_STEPS:-32}
 BLOCK_SIZE=${BLOCK_SIZE:-16}
 PAGE_SIZE=${PAGE_SIZE:-1}
-MEM_FRACTION_STATIC=${MEM_FRACTION_STATIC:-0.75}
+MEM_FRACTION_STATIC=${MEM_FRACTION_STATIC:-0.8}
 MAMBA_SSM_DTYPE=${MAMBA_SSM_DTYPE:-float32}
 MAMBA_FULL_MEMORY_RATIO=${MAMBA_FULL_MEMORY_RATIO:-0.9}
 ENABLE_REPLAY_SSM=${ENABLE_REPLAY_SSM:-1}
@@ -25,10 +25,6 @@ ATTENTION_BACKEND=${ATTENTION_BACKEND:-flashinfer}
 DRAFT_ATTENTION_BACKEND=${DRAFT_ATTENTION_BACKEND:-flashinfer}
 DTYPE=${DTYPE:-bfloat16}
 
-if [[ -z ${CURRENT_PARTITION:-} ]]; then
-  echo "CURRENT_PARTITION is required (for example: CURRENT_PARTITION=16,16)" >&2
-  exit 2
-fi
 if [[ $ENABLE_REPLAY_SSM != 0 && $ENABLE_REPLAY_SSM != 1 ]]; then
   echo "ENABLE_REPLAY_SSM must be 0 or 1" >&2
   exit 2
@@ -42,7 +38,6 @@ profile_args=(
   --pp-size "$PP_SIZE"
   --tp-size "$TP_SIZE"
   --nnodes "$NNODES"
-  --current-partition "$CURRENT_PARTITION"
   --batch-size "$BATCH_SIZE"
   --input-tokens "$INPUT_TOKENS"
   --output-tokens "$OUTPUT_TOKENS"

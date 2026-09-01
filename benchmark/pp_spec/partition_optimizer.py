@@ -49,7 +49,7 @@ class OptimizationResult:
     stage_comm_ms: tuple[float, ...]
     best: OptimizerCandidate
     candidates: list[OptimizerCandidate]
-    current_partition: tuple[int, ...]
+    baseline_partition: tuple[int, ...]
     current: OptimizerCandidate
 
     @property
@@ -63,14 +63,14 @@ class OptimizationResult:
     @property
     def recommendation(self) -> str:
         best_text = ",".join(map(str, self.best.partition))
-        if self.best.partition == self.current_partition:
+        if self.best.partition == self.baseline_partition:
             return (
-                f"keep current {best_text}; predicted objective cycle "
+                f"keep baseline {best_text}; predicted objective cycle "
                 f"{self.best.cycle_time_ms:.3f} ms"
             )
         return (
             f"switch to {best_text}; predicted objective cycle "
-            f"{self.best.cycle_time_ms:.3f} ms vs current "
+            f"{self.best.cycle_time_ms:.3f} ms vs baseline "
             f"{self.current.cycle_time_ms:.3f} ms"
         )
 
@@ -90,7 +90,7 @@ class OptimizationResult:
             "stage_comm_ms": list(self.stage_comm_ms),
             "selected": self._candidate_dict(self.best),
             "candidates": [self._candidate_dict(item) for item in self.candidates],
-            "current_partition": list(self.current_partition),
+            "baseline_partition": list(self.baseline_partition),
             "current": self._candidate_dict(self.current),
             "recommendation": self.recommendation,
         }
@@ -102,7 +102,7 @@ class OptimizationResult:
             f"target execution bucket = {self.target_bucket} (bs={self.target_bs:g})",
             f"selected = {','.join(map(str, self.best.partition))}, "
             f"predicted objective cycle = {self.best.cycle_time_ms:.3f} ms",
-            f"current = {','.join(map(str, self.current_partition))}, "
+            f"baseline = {','.join(map(str, self.baseline_partition))}, "
             f"predicted objective cycle = {self.current.cycle_time_ms:.3f} ms",
             "",
             f"{'partition':<22} {'pred_ms':>10} {'bottleneck':>10}  stages (ms)",
@@ -248,7 +248,7 @@ def optimize(
     current = _candidate_from_model(
         model,
         estimate,
-        model.current_partition,
+        model.baseline_partition,
         resolved_stage_comm,
         active_layout,
     )
@@ -258,6 +258,6 @@ def optimize(
         stage_comm_ms=resolved_stage_comm,
         best=candidates[0],
         candidates=candidates[:k_best],
-        current_partition=model.current_partition,
+        baseline_partition=model.baseline_partition,
         current=current,
     )
