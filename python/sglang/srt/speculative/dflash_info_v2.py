@@ -10,6 +10,7 @@ import torch
 from sglang.srt.environ import envs
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.mem_cache.allocation import alloc_for_spec_decode
+from sglang.srt.mem_cache.allocation_sizing import page_aligned_decode_alloc_lens
 from sglang.srt.runtime_context import get_spec
 from sglang.srt.speculative.spec_info import SpecInput, SpecInputType
 from sglang.srt.utils.common import is_pin_memory_available
@@ -117,6 +118,7 @@ class DFlashDecodePrepareMixin:
         assert self._prepare_nxt_kv_lens_gpu_buf is not None
         batch_seq_lens_cpu_t = self._prepare_batch_seq_lens_cpu_buf[:bs]
         cur_kv_lens_cpu_t = self._prepare_cur_kv_lens_cpu_buf[:bs]
+        nxt_kv_lens_cpu_t = self._prepare_nxt_kv_lens_cpu_buf[:bs]
 
         # For DFLASH, each decode step needs a fixed-size verify block.
         block_size = int(get_spec().speculative_num_draft_tokens)
@@ -124,29 +126,27 @@ class DFlashDecodePrepareMixin:
             raise ValueError(
                 f"DFLASH invalid speculative_num_draft_tokens={block_size}."
             )
+        reserve = 2 * block_size
         page_size = batch.token_to_kv_pool_allocator.page_size
-        nxt_kv_lens_cpu_t = self._prepare_nxt_kv_lens_cpu_buf[:bs]
+
+        cur_kv_lens, nxt_kv_lens, num_needed_tokens = page_aligned_decode_alloc_lens(
+            batch.reqs,
+            reserve=reserve,
+            page_size=page_size,
+        )
+
         committed_seq_lens_sum = 0
         reserved_seq_lens_sum = 0
-        num_needed_tokens = 0
         # top_k tracking is only used by DFlashDraftInputV2's accept path; PP raw
         # does not carry these fields, so gate the write-back on attribute presence.
         track_top_k = hasattr(self, "max_top_k")
         max_top_k = 1
         uniform_top_k_value = None
         uniform_top_k = True
-        for i, req in enumerate(batch.reqs):
+        for i, (req, cur, nxt) in enumerate(
+            zip(batch.reqs, cur_kv_lens, nxt_kv_lens, strict=True)
+        ):
             committed_len = int(req.kv_committed_len)
-            cur = int(req.kv.kv_allocated_len)
-            # Whole-page accounting (same as eagle_prepare_for_decode): the
-            # paged allocator hands out full pages, so an unaligned reserve
-            # strands the tail of the last page -- allocated but never recorded.
-            nxt = max(
-                cur,
-                (committed_len + 2 * block_size + page_size - 1)
-                // page_size
-                * page_size,
-            )
 
             batch_seq_lens_cpu_t[i] = committed_len
             cur_kv_lens_cpu_t[i] = cur
@@ -154,7 +154,6 @@ class DFlashDecodePrepareMixin:
 
             committed_seq_lens_sum += committed_len
             reserved_seq_lens_sum += nxt
-            num_needed_tokens += nxt - cur
 
             if track_top_k:
                 top_k = int(req.sampling_params.top_k)
