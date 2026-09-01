@@ -5,6 +5,7 @@ from unittest.mock import patch
 
 import torch
 
+from sglang.srt.mem_cache.allocation import alloc_for_spec_decode
 from sglang.srt.mem_cache.allocation_sizing import page_aligned_decode_alloc_lens
 from sglang.srt.speculative.dflash_info_v2 import DFlashPPVerifyInputRaw
 from sglang.srt.speculative.dspark_components.dspark_verify import (
@@ -24,6 +25,40 @@ def _req(*, committed: int, allocated: int):
 
 
 class TestPageAlignedDecodeAllocation(CustomTestCase):
+    def test_spec_allocation_updates_watermarks_without_scalar_indexing(self):
+        class NoScalarReads:
+            def __init__(self, values):
+                self.values = values
+                self.tolist_calls = 0
+
+            def tolist(self):
+                self.tolist_calls += 1
+                return self.values
+
+            def __getitem__(self, index):
+                raise AssertionError(f"unexpected scalar read at index {index}")
+
+        reqs = [
+            SimpleNamespace(kv=SimpleNamespace(kv_allocated_len=5)),
+            SimpleNamespace(kv=SimpleNamespace(kv_allocated_len=2)),
+        ]
+        nxt_kv_lens_cpu = NoScalarReads([4, 8])
+
+        alloc_for_spec_decode(
+            tree_cache=None,
+            req_to_token_pool=None,
+            reqs=reqs,
+            req_pool_indices=None,
+            cur_kv_lens=None,
+            cur_kv_lens_cpu=None,
+            nxt_kv_lens=None,
+            nxt_kv_lens_cpu=nxt_kv_lens_cpu,
+            num_needed_tokens=0,
+        )
+
+        self.assertEqual(nxt_kv_lens_cpu.tolist_calls, 1)
+        self.assertEqual([req.kv.kv_allocated_len for req in reqs], [5, 8])
+
     def test_rounds_up_and_never_shrinks_existing_watermark(self):
         reqs = [
             _req(committed=65, allocated=64),
