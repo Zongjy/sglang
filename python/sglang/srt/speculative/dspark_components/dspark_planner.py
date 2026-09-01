@@ -41,6 +41,7 @@ from sglang.srt.speculative.ragged_verify import (
     read_ragged_verify_mode,
     round_up_grid,
 )
+from sglang.srt.speculative.spec_tp_sync import SpecTpSync, SpecTpSyncSite
 from sglang.srt.utils.common import require_mlp_tp_gather
 from sglang.srt.utils.invariants import (
     Bucket,
@@ -78,6 +79,7 @@ class DSparkVerifyPlanner:
         tp_rank: int,
         server_args: ServerArgs,
         verify_num_draft_tokens: int,
+        tp_sync: SpecTpSync,
         pp_enabled: bool = False,
     ) -> None:
         self.draft_model = draft_model
@@ -86,6 +88,7 @@ class DSparkVerifyPlanner:
         self.device = device
         self.server_args = server_args
         self.verify_num_draft_tokens = verify_num_draft_tokens
+        self._tp_sync = tp_sync
         self._align_verify_tokens_to_graph_tier = (
             server_args.speculative_dspark_align_verify_tokens_to_graph_tier
         )
@@ -400,6 +403,10 @@ class DSparkVerifyPlanner:
                 draft_input, DFlashDraftInputV2
             ), "overlap path reads draft_input.verify_token_budget; expected DFlashDraftInputV2, not PP raw"
             return draft_input.verify_token_budget
+
+        # Under PP this may be DSparkPPVerifyInputRaw, which intentionally has no
+        # verify_token_budget field. The budget is deterministic from the relayed
+        # confidence and replicated request generations, so return it directly.
         return self.compute_budget_sync(
             confidence=confidence,
             prefix_lens=prefix_lens,
@@ -606,6 +613,7 @@ class DSparkVerifyPlanner:
             budget=budget,
             cfg=self._schedule_cfg,
         ).to(device=device, dtype=torch.int32)
+        self._tp_sync.sync(SpecTpSyncSite.DSPARK_PLAN, verify_lens)
 
         if resolve_level() >= InvariantCheckLevel.WARN:
             verify_lens_64 = verify_lens.to(torch.int64)
@@ -624,12 +632,6 @@ class DSparkVerifyPlanner:
                 sort_survival=compute_sort_survival(confidence),
                 verify_lens=verify_lens,
             )
-
-        broadcast_group, group_size = verify_lens_broadcast_group(
-            tp_size=get_parallel().tp_size
-        )
-        if group_size > 1:
-            broadcast_group.broadcast(verify_lens, src=0)
 
         return verify_lens
 
@@ -781,12 +783,6 @@ def uniform_ragged_layout(
         grid=grid,
         graph_num_tokens_floor=graph_num_tokens_floor,
     )
-
-
-def verify_lens_broadcast_group(*, tp_size: int) -> tuple:
-    if is_dp_attention_enabled():
-        return get_parallel().attn_tp_group, get_parallel().attn_tp_size
-    return get_tp_group(), tp_size
 
 
 def verify_layout_grid(
