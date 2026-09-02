@@ -45,11 +45,11 @@ from sglang.srt.mem_cache.allocator.swa import (
     SWATokenToKVPoolAllocator,
 )
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
+from sglang.srt.mem_cache.hisparse_memory_pool import HiSparseDSATokenToKVPool
 from sglang.srt.mem_cache.hybrid_capacity_planner import (
     calculate_mamba_slots_per_request,
     solve_auto_mamba_slots,
 )
-from sglang.srt.mem_cache.hisparse_memory_pool import HiSparseDSATokenToKVPool
 from sglang.srt.mem_cache.memory_pool import (
     DSATokenToKVPool,
     HybridLinearKVPool,
@@ -291,33 +291,6 @@ class KVCacheConfigurator:
             raise ValueError(
                 "ReplaySSM with direct target verification is not supported with "
                 "--enable-unified-memory yet."
-            )
-
-        if self.spec_algorithm.is_dflash():
-            dcut = get_spec().speculative_dflash_dcut
-            dcut_enabled = dcut == "auto" or (
-                not isinstance(dcut, str) and float(dcut) != 0.0
-            )
-            if dcut_enabled:
-                raise ValueError(
-                    "--enable-linear-replayssm-spec does not support "
-                    f"--speculative-dflash-dcut={dcut!r} yet. Use "
-                    "--speculative-dflash-dcut 0."
-                )
-
-        if not is_gdn:
-            return
-
-        from sglang.srt.speculative.ragged_verify import (
-            RaggedVerifyMode,
-            read_ragged_verify_mode,
-        )
-
-        ragged_mode = read_ragged_verify_mode()
-        if ragged_mode is not RaggedVerifyMode.STATIC:
-            raise ValueError(
-                "GDN ReplaySSM requires SGLANG_RAGGED_VERIFY_MODE=static; "
-                f"got {ragged_mode.value!r}."
             )
 
     def configure(self, *, pre_model_load_memory: int) -> KVCacheConfigResult:

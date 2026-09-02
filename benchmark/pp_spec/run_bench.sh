@@ -15,6 +15,16 @@ RAGGED_VERIFY_MODE=static
 MAX_TOKENS=1024
 PROMPT_MAX_TOKENS=2000
 DFLASH_BLOCK_SIZE=16
+# Pin the target attention backend for every topology in this sweep.  The
+# DFLASH draft runner has its own backend selector and remains on FlashInfer
+# until a separate draft-backend comparison is requested.
+TARGET_ATTENTION_BACKEND=${TARGET_ATTENTION_BACKEND:-triton}
+DRAFT_ATTENTION_BACKEND=${DRAFT_ATTENTION_BACKEND:-flashinfer}
+
+# PP requires non-overlap; default to the same schedule for TP so topology
+# comparisons do not grant TP an extra overlap advantage. Set to 0 only for a
+# separate TP-only throughput run.
+DISABLE_OVERLAP_SCHEDULE=${DISABLE_OVERLAP_SCHEDULE:-1}
 STARTUP_TIMEOUT=600
 REQUEST_TIMEOUT_S=1800
 COOLDOWN_S=10
@@ -100,23 +110,12 @@ run_config() {
   local batch_divisor=1
   local divisor_name=world_size
   local cuda_graph_bs
+  local local_active_bs
   local max_running_requests=$active_bs
   local output_dir="$OUTPUT_ROOT/$name/$point_tag"
   local status=0
   local -a server_args
 
-  if ((tp_size <= 0 || pp_size <= 0 || dp_size <= 0)); then
-    echo "[$name] tp_size, pp_size, and dp_size must be positive" >&2
-    exit 1
-  fi
-  if ((tp_size * pp_size * dp_size != NUM_GPUS)); then
-    echo "[$name] TP${tp_size} x PP${pp_size} x DP${dp_size} must use NUM_GPUS=$NUM_GPUS" >&2
-    exit 1
-  fi
-  if ((pp_size > 1 && dp_size > 1)); then
-    echo "[$name] this runner supports pure DP or pure PP, not both together" >&2
-    exit 1
-  fi
   if ((dp_size > 1)); then
     batch_divisor=$dp_size
     divisor_name=dp_size
@@ -124,12 +123,9 @@ run_config() {
     batch_divisor=$pp_size
     divisor_name=pp_size
   fi
-  if ((active_bs % batch_divisor != 0)); then
-    echo "[$name] active_bs=$active_bs must be divisible by $divisor_name=$batch_divisor" >&2
-    exit 1
-  fi
+
   cuda_graph_bs=$((active_bs / batch_divisor))
-  cuda_graph_bs=$((cuda_graph_bs < 64 ? cuda_graph_bs : 64))
+  cuda_graph_bs=$((cuda_graph_bs < 32 ? cuda_graph_bs : 32))
   if ((dp_size > 1)); then
     max_running_requests=$cuda_graph_bs
   fi
@@ -145,9 +141,11 @@ run_config() {
     --speculative-algorithm DFLASH
     --speculative-draft-model-path "$DRAFT_MODEL"
     --speculative-draft-model-revision "$DRAFT_MODEL_REVISION"
-    --speculative-draft-attention-backend flashinfer
+    --speculative-draft-attention-backend "$DRAFT_ATTENTION_BACKEND"
     --speculative-dflash-block-size "$DFLASH_BLOCK_SIZE"
-    --attention-backend flashinfer
+    --attention-backend "$TARGET_ATTENTION_BACKEND"
+    --decode-attention-backend "$TARGET_ATTENTION_BACKEND"
+    --prefill-attention-backend "$TARGET_ATTENTION_BACKEND"
     --max-running-requests "$max_running_requests"
     --load-balance-method round_robin
     --disable-prefill-cuda-graph
@@ -158,6 +156,9 @@ run_config() {
     --disable-radix-cache
     --trust-remote-code
     --linear-attn-backend triton
+    --linear-attn-decode-backend triton
+    --linear-attn-prefill-backend triton
+    --linear-attn-verify-backend triton
     --mamba-ssm-dtype float32
     --mamba-full-memory-ratio 0.9
     --enable-linear-replayssm-spec
@@ -167,12 +168,16 @@ run_config() {
   if [[ -n $partition ]]; then
     server_args+=(--pp-layer-partition "$partition")
   fi
-  if ((pp_size > 1)); then
+  if ((pp_size > 1 || DISABLE_OVERLAP_SCHEDULE)); then
     server_args+=(--disable-overlap-schedule)
+  fi
+  if ((pp_size > 1)); then
+    local_active_bs=$((active_bs / batch_divisor))
+    server_args+=(--pp-max-micro-batch-size "$local_active_bs")
   fi
   server_args+=("${extra_server_args[@]}")
 
-  echo "[$name][$load_point] starting: tp=$tp_size pp=$pp_size dp=$dp_size max_running=$max_running_requests cuda_graph_bs=$cuda_graph_bs mem_fraction=$MEM_FRACTION_STATIC"
+  echo "[$name][$load_point] starting: tp=$tp_size pp=$pp_size dp=$dp_size attention=$TARGET_ATTENTION_BACKEND cuda_graph_max_bs=$cuda_graph_bs max_running=$max_running_requests mem_fraction=$MEM_FRACTION_STATIC"
   CUDA_VISIBLE_DEVICES="$GPUS" \
     SGLANG_RAGGED_VERIFY_MODE="$RAGGED_VERIFY_MODE" \
     SGL_FORCE_SHUTDOWN=1 \
@@ -282,35 +287,41 @@ mkdir -p "$OUTPUT_ROOT"
 echo "Results: $OUTPUT_ROOT"
 
 # run_config <name:结果子目录> <tp> <pp> <dp> <partition:PP分层,空=非PP> <load_point:并发:QPS:请求数> <active_bs:全局并发> <num_requests:总请求数> <point_tag:结果目录后缀c{C}_qps{Q}_n{N}>
-run_config tp2 2 1 1 "" 8:2:32 8 32 c8_qps2_n32
-run_config dp2 1 1 2 "" 8:2:32 8 32 c8_qps2_n32
-run_config pp2_uniform 1 2 1 32,32 8:2:32 8 32 c8_qps2_n32
-run_config pp2_auto 1 2 1 38,26 8:2:32 8 32 c8_qps2_n32
+run_config tp2 2 1 1 "" 8:2:32 8 32 c8_qps2_n32 --speculative-dflash-dcut 0
+run_config tp2_dcut_auto 2 1 1 "" 8:2:32 8 32 c8_qps2_n32 --speculative-dflash-dcut auto
+# run_config dp2 1 1 2 "" 8:2:32 8 32 c8_qps2_n32
+# run_config pp2_uniform 1 2 1 32,32 8:2:32 8 32 c8_qps2_n32
+run_config pp2_auto 1 2 1 38,26 8:2:32 8 32 c8_qps2_n32 --speculative-dflash-dcut 0
 
-run_config tp2 2 1 1 "" 16:4:64 16 64 c16_qps4_n64
-run_config dp2 1 1 2 "" 16:4:64 16 64 c16_qps4_n64
-run_config pp2_uniform 1 2 1 32,32 16:4:64 16 64 c16_qps4_n64
-run_config pp2_auto 1 2 1 38,26 16:4:64 16 64 c16_qps4_n64
+run_config tp2 2 1 1 "" 16:4:64 16 64 c16_qps4_n64 --speculative-dflash-dcut 0
+run_config tp2_dcut_auto 2 1 1 "" 16:4:64 16 64 c16_qps4_n64 --speculative-dflash-dcut auto
+# run_config dp2 1 1 2 "" 16:4:64 16 64 c16_qps4_n64
+# run_config pp2_uniform 1 2 1 32,32 16:4:64 16 64 c16_qps4_n64
+run_config pp2_auto 1 2 1 38,26 16:4:64 16 64 c16_qps4_n64 --speculative-dflash-dcut 0
 
-run_config tp2 2 1 1 "" 32:8:128 32 128 c32_qps8_n128
-run_config dp2 1 1 2 "" 32:8:128 32 128 c32_qps8_n128
-run_config pp2_uniform 1 2 1 32,32 32:8:128 32 128 c32_qps8_n128
-run_config pp2_auto 1 2 1 38,26 32:8:128 32 128 c32_qps8_n128
+run_config tp2 2 1 1 "" 32:8:128 32 128 c32_qps8_n128 --speculative-dflash-dcut 0
+run_config tp2_dcut_auto 2 1 1 "" 32:8:128 32 128 c32_qps8_n128 --speculative-dflash-dcut auto
+# run_config dp2 1 1 2 "" 32:8:128 32 128 c32_qps8_n128
+# run_config pp2_uniform 1 2 1 32,32 32:8:128 32 128 c32_qps8_n128
+run_config pp2_auto 1 2 1 38,26 32:8:128 32 128 c32_qps8_n128 --speculative-dflash-dcut 0
 
-run_config tp2 2 1 1 "" 64:16:256 64 256 c64_qps16_n256
-run_config dp2 1 1 2 "" 64:16:256 64 256 c64_qps16_n256
-run_config pp2_uniform 1 2 1 32,32 64:16:256 64 256 c64_qps16_n256
-run_config pp2_auto 1 2 1 38,26 64:16:256 64 256 c64_qps16_n256
+run_config tp2 2 1 1 "" 64:16:256 64 256 c64_qps16_n256 --speculative-dflash-dcut 0
+run_config tp2_dcut_auto 2 1 1 "" 64:16:256 64 256 c64_qps16_n256 --speculative-dflash-dcut auto
+# run_config dp2 1 1 2 "" 64:16:256 64 256 c64_qps16_n256
+# run_config pp2_uniform 1 2 1 32,32 64:16:256 64 256 c64_qps16_n256
+run_config pp2_auto 1 2 1 38,26 64:16:256 64 256 c64_qps16_n256 --speculative-dflash-dcut 0
 
-run_config tp2 2 1 1 "" 96:24:384 96 384 c96_qps24_n384
-run_config dp2 1 1 2 "" 96:24:384 96 384 c96_qps24_n384
-run_config pp2_uniform 1 2 1 32,32 96:24:384 96 384 c96_qps24_n384
-run_config pp2_auto 1 2 1 38,26 96:24:384 96 384 c96_qps24_n384
+run_config tp2 2 1 1 "" 96:24:384 96 384 c96_qps24_n384 --speculative-dflash-dcut 0
+run_config tp2_dcut_auto 2 1 1 "" 96:24:384 96 384 c96_qps24_n384 --speculative-dflash-dcut auto
+# run_config dp2 1 1 2 "" 96:24:384 96 384 c96_qps24_n384
+# run_config pp2_uniform 1 2 1 32,32 96:24:384 96 384 c96_qps24_n384
+run_config pp2_auto 1 2 1 38,26 96:24:384 96 384 c96_qps24_n384 --speculative-dflash-dcut 0
 
-run_config tp2 2 1 1 "" 128:32:512 128 512 c128_qps32_n512
-run_config dp2 1 1 2 "" 128:32:512 128 512 c128_qps32_n512
-run_config pp2_uniform 1 2 1 32,32 128:32:512 128 512 c128_qps32_n512
-run_config pp2_auto 1 2 1 38,26 128:32:512 128 512 c128_qps32_n512
+run_config tp2 2 1 1 "" 128:32:512 128 512 c128_qps32_n512 --speculative-dflash-dcut 0
+run_config tp2_dcut_auto 2 1 1 "" 128:32:512 128 512 c128_qps32_n512 --speculative-dflash-dcut auto
+# run_config dp2 1 1 2 "" 128:32:512 128 512 c128_qps32_n512
+# run_config pp2_uniform 1 2 1 32,32 128:32:512 128 512 c128_qps32_n512
+run_config pp2_auto 1 2 1 38,26 128:32:512 128 512 c128_qps32_n512 --speculative-dflash-dcut 0
 
 summarize_run "$OUTPUT_ROOT"
 

@@ -410,6 +410,8 @@ def _compact_verify_ids_gather_kernel(
     out_ptr,
     bs,
     gamma,
+    draft_block_row_stride,
+    draft_token_row_stride,
     n,
     BLOCK: tl.constexpr,
 ):
@@ -420,9 +422,21 @@ def _compact_verify_ids_gather_kernel(
     within = tl.load(within_ptr + offs, mask=mask, other=0)
     valid = req < bs
     safe_req = tl.minimum(req, bs - 1)
-    anchor = tl.load(draft_block_ids_ptr + safe_req * gamma, mask=mask, other=0)
+    # ``draft_block_ids`` is [bs, block_size], whereas ``draft_tokens`` is
+    # [bs, block_size - 1].  Their row strides therefore differ by one.  The
+    # old kernel used ``gamma`` for both and read the previous row's last token
+    # as the next row's anchor whenever bs > 1.
+    anchor = tl.load(
+        draft_block_ids_ptr + safe_req * draft_block_row_stride,
+        mask=mask,
+        other=0,
+    )
     wcol = tl.maximum(within - 1, 0)
-    draft = tl.load(draft_tokens_ptr + safe_req * gamma + wcol, mask=mask, other=0)
+    draft = tl.load(
+        draft_tokens_ptr + safe_req * draft_token_row_stride + wcol,
+        mask=mask,
+        other=0,
+    )
     v = tl.where(within == 0, anchor, draft)
     v = tl.where(valid, v, 0)
     tl.store(out_ptr + offs, v.to(tl.int64), mask=mask)
@@ -441,15 +455,45 @@ def compact_verify_ids_triton(
         device=device,
     )
     bs = layout.verify_lens.shape[0]
-    gamma = draft_tokens.shape[1]
     draft_block_ids = draft_block_ids.to(device=device, dtype=torch.int64).contiguous()
     draft_tokens = draft_tokens.to(device=device, dtype=torch.int64).contiguous()
+    if draft_block_ids.ndim != 2 or draft_tokens.ndim != 2:
+        raise ValueError(
+            "draft_block_ids and draft_tokens must be rank-2 tensors; "
+            f"got {tuple(draft_block_ids.shape)} and {tuple(draft_tokens.shape)}."
+        )
+    # The first column of block_ids is the anchor.  DFLASH stores the remaining
+    # block tokens separately, while DSpark may use a different block shape;
+    # only the anchor column and the row counts are common to both callers.
+    gamma = draft_tokens.shape[1]
+    if (
+        draft_block_ids.shape[0] < bs
+        or draft_tokens.shape[0] < bs
+        or draft_block_ids.shape[1] < 1
+        or gamma < 1
+    ):
+        raise ValueError(
+            "draft_block_ids must have shape [batch, block_size] with enough "
+            "rows/columns; "
+            f"got block_ids={tuple(draft_block_ids.shape)}, "
+            f"draft_tokens={tuple(draft_tokens.shape)} for bs={bs}."
+        )
     n = layout.graph_num_tokens
     out = torch.empty(n, dtype=torch.int64, device=device)
     BLOCK = 256
     grid = (triton.cdiv(n, BLOCK),)
     _compact_verify_ids_gather_kernel[grid](
-        req, within, draft_block_ids, draft_tokens, out, bs, gamma, n, BLOCK=BLOCK
+        req,
+        within,
+        draft_block_ids,
+        draft_tokens,
+        out,
+        bs,
+        gamma,
+        draft_block_ids.stride(0),
+        draft_tokens.stride(0),
+        n,
+        BLOCK=BLOCK,
     )
     return out
 

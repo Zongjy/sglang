@@ -688,6 +688,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
                     cache_indices=cache_indices,
                     query_start_loc=query_start_loc,
                     retrieve_parent_token=retrieve_parent_token,
+                    draft_token_num=draft_token_num,
                     ragged_verify=ragged_layout is not None,
                 )
             elif use_replayssm_spec:
@@ -787,6 +788,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
         cache_indices: torch.Tensor,
         query_start_loc: torch.Tensor,
         retrieve_parent_token: Optional[torch.Tensor],
+        draft_token_num: int,
         ragged_verify: bool = False,
     ) -> torch.Tensor:
         """Ring-writing verify; the commit fold replays the accepted prefix
@@ -803,7 +805,6 @@ class GDNAttnBackend(MambaAttnBackendBase):
         )
         seq_len = query.shape[1]
         batch_size = query_start_loc.shape[0] - 1
-        draft_token_num = seq_len // batch_size
         if (
             self.kernel_dispatcher.verify_kernel_is_flashinfer
             and not ragged_verify
