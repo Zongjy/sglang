@@ -401,7 +401,7 @@ class MultiNodeRunner:
             "--url",
             f"http://127.0.0.1:{self.args.port}",
             "--label",
-            f"{topology.name}_r1",
+            topology.name,
             "--dataset",
             str(self.dataset),
             "--tokenizer",

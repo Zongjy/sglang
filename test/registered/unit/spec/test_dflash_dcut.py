@@ -1,11 +1,13 @@
 """Unit tests for DFLASH D-Cut dense-skip, graph-bucket fill, and scoring."""
 
 import unittest
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import torch
 
 from sglang.srt.speculative.dflash_dcut import (
+    DFlashDcutEpilogue,
     DFlashDcutPlanner,
     dcut_cost_curve_is_flat,
     fill_dcut_keep_count_to_graph_bucket,
@@ -158,6 +160,136 @@ class TestDcutRelayPlan(CustomTestCase):
         planner._profile_costs_for_bs = lambda bs: None
 
         self.assertFalse(planner._should_use_dense(11))
+
+
+class TestAcceptedPrefixMaterialization(CustomTestCase):
+    def test_graph_epilogue_only_scatter_top1(self):
+        epilogue = DFlashDcutEpilogue(
+            max_bs=2, block_size=4, device=torch.device("cpu")
+        )
+        epilogue.begin_step(torch.tensor([2, 4], dtype=torch.int32))
+        logits = torch.randn(6, 8)
+
+        with patch(
+            "sglang.srt.speculative.dflash_dcut.scatter_compact_to_strided_into"
+        ) as scatter:
+            epilogue(compact_logits=logits, bs=2)
+
+        self.assertEqual(scatter.call_count, 1)
+        self.assertEqual(tuple(scatter.call_args.kwargs["compact"].shape), (6, 1))
+
+    def test_pack_preserves_row_major_prefix_order(self):
+        from sglang.srt.speculative.dflash_worker_v2 import (
+            _pack_accepted_compact_rows,
+        )
+
+        bs, block_size, hidden_size = 3, 4, 2
+        verify_lens = torch.tensor([2, 4, 3], dtype=torch.int32)
+        compact_hidden = torch.arange(
+            verify_lens.sum().item() * hidden_size, dtype=torch.float32
+        ).view(-1, hidden_size)
+        positions = torch.arange(100, 100 + bs * block_size, dtype=torch.int64)
+        cache_loc_2d = torch.arange(200, 200 + bs * block_size, dtype=torch.int64).view(
+            bs, block_size
+        )
+        commit_lens = torch.tensor([1, 3, 2], dtype=torch.int32)
+
+        packed_hidden, packed_locs, packed_positions = _pack_accepted_compact_rows(
+            compact_hidden=compact_hidden,
+            positions=positions,
+            cache_loc_2d=cache_loc_2d,
+            verify_lens=verify_lens,
+            commit_lens=commit_lens,
+            block_size=block_size,
+        )
+
+        expected_compact_rows = torch.tensor([0, 2, 3, 4, 6, 7], dtype=torch.int64)
+        expected_dense_rows = torch.tensor([0, 4, 5, 6, 8, 9], dtype=torch.int64)
+        torch.testing.assert_close(
+            packed_hidden,
+            compact_hidden.index_select(0, expected_compact_rows),
+            rtol=0,
+            atol=0,
+        )
+        torch.testing.assert_close(
+            packed_locs,
+            cache_loc_2d.reshape(-1).index_select(0, expected_dense_rows),
+            rtol=0,
+            atol=0,
+        )
+        torch.testing.assert_close(
+            packed_positions,
+            positions.index_select(0, expected_dense_rows),
+            rtol=0,
+            atol=0,
+        )
+
+    def test_worker_projects_only_packed_rows(self):
+        from sglang.srt.speculative.dflash_worker_v2 import DFlashWorkerV2
+
+        class RecordingDraft:
+            def __init__(self):
+                self.projected = None
+
+            def project_target_hidden(self, hidden):
+                self.projected = hidden.clone()
+                return hidden
+
+        class RecordingMaterializer:
+            def __init__(self):
+                self.hidden = None
+                self.positions = None
+
+            def materialize(self, *, ctx_hidden, positions, write_layer_kv):
+                del write_layer_kv
+                self.hidden = ctx_hidden.clone()
+                self.positions = positions.clone()
+
+        draft = RecordingDraft()
+        materializer = RecordingMaterializer()
+        worker = object.__new__(DFlashWorkerV2)
+        worker.model_runner = SimpleNamespace(device=torch.device("cpu"))
+        worker.draft_model = draft
+        worker.draft_model_runner = SimpleNamespace(token_to_kv_pool=None)
+        worker.block_size = 4
+        worker._block_pos_offsets = torch.arange(4, dtype=torch.int64)
+        worker._use_fused_kv_materialize = True
+        worker._fused_kv_helper = materializer
+
+        bs, block_size, hidden_size = 2, 4, 3
+        verify_lens = torch.tensor([2, 3], dtype=torch.int32)
+        compact_hidden = torch.arange(
+            verify_lens.sum().item() * hidden_size, dtype=torch.float32
+        ).view(-1, hidden_size)
+        positions = torch.arange(bs * block_size, dtype=torch.int64)
+        cache_loc_2d = torch.arange(50, 50 + bs * block_size, dtype=torch.int64).view(
+            bs, block_size
+        )
+        commit_lens = torch.tensor([1, 2], dtype=torch.int32)
+
+        DFlashWorkerV2._append_compact_target_hidden_to_draft_kv_by_loc(
+            worker,
+            compact_hidden=compact_hidden,
+            positions=positions,
+            cache_loc_2d=cache_loc_2d,
+            verify_lens=verify_lens,
+            commit_lens=commit_lens,
+        )
+
+        expected_compact_rows = torch.tensor([0, 2, 3], dtype=torch.int64)
+        self.assertEqual(tuple(draft.projected.shape), (3, hidden_size))
+        torch.testing.assert_close(
+            draft.projected,
+            compact_hidden.index_select(0, expected_compact_rows),
+            rtol=0,
+            atol=0,
+        )
+        torch.testing.assert_close(
+            materializer.positions,
+            positions.index_select(0, torch.tensor([0, 4, 5])),
+            rtol=0,
+            atol=0,
+        )
 
 
 if __name__ == "__main__":

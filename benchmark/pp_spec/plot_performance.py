@@ -27,26 +27,40 @@ plt.rcParams.update({
 })
 
 
-def series_style(label: str):
-    """Return a stable style for a result label.
+# Map each ``label`` in summary.csv to the Matplotlib style used for that
+# series.  Edit this dictionary when adding a new benchmark or changing the
+# appearance of an existing one.  Any keyword accepted by ``Axes.plot`` can
+# be used here (for example, ``color``, ``linestyle``, ``marker``, and
+# ``dashes``).
+SERIES_STYLE = {
+    "tp": dict(color="tab:green", linestyle="-", marker="s"),
+    "tp_dcut": dict(color="tab:green", linestyle="--", marker="s"),
 
-    Check D-Cut before the generic TP / PP-auto checks: ``tp2_dcut_auto`` and
-    ``pp2_auto_dcut_auto`` contain those substrings as well, but should stay
-    visually distinguishable in the aggregate plots.
+    "tp_dpattn": dict(color="tab:purple", linestyle="-", marker="^"),
+    "tp_dpattn_dcut": dict(color="tab:purple", linestyle="--", marker="^"),
+
+    "pp_asym": dict(color="tab:orange", linestyle="-", marker="o"),
+    "pp_asym_dcut": dict(color="tab:orange", linestyle="--", marker="o"),
+}
+
+DEFAULT_SERIES_STYLE = dict(color="tab:gray", linestyle="-", marker="x")
+
+
+def series_style(label: str):
+    """Return the configured Matplotlib style for a CSV ``label``.
+
+    Unknown labels use ``DEFAULT_SERIES_STYLE``.
     """
 
-    normalized = label.lower()
-    if "dcut" in normalized:
-        return dict(color="tab:purple", linestyle="--", marker="^")
-    if "tp" in normalized:
-        return dict(color="tab:green", linestyle="-", marker="s")
-    if "dp" in normalized:
-        return dict(color="tab:red", linestyle="-.", marker="D")
-    if "uniform" in normalized:
-        return dict(color="tab:blue", linestyle="-.", marker="^")
-    if "auto" in normalized:
-        return dict(color="tab:blue", linestyle="-", marker="s")
-    return dict(color="tab:orange", linestyle="-", marker="o")
+    return SERIES_STYLE.get(label, DEFAULT_SERIES_STYLE).copy()
+
+
+def ordered_labels(by_label):
+    """Return labels in configured order, followed by unconfigured labels."""
+
+    configured = [label for label in SERIES_STYLE if label in by_label]
+    unconfigured = [label for label in by_label if label not in SERIES_STYLE]
+    return configured + unconfigured
 
 
 def load_rows():
@@ -91,7 +105,8 @@ def plot_metric(by_label, col: str, ylabel: str, output_path: Path):
 
     fig, ax = plt.subplots(figsize=(7, 5), dpi=300)
     scale = 1.0 if col == "output_throughput_tok_s" else 1000.0
-    for label, series in by_label.items():
+    for label in ordered_labels(by_label):
+        series = by_label[label]
         ax.plot(
             [r["max_concurrency"] for r in series],
             [r[col] * scale for r in series],

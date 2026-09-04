@@ -164,6 +164,104 @@ def _is_dense_head_weight(weight) -> bool:
     return weight is not None and weight.dtype in _DENSE_HEAD_DTYPES
 
 
+def _pack_accepted_compact_rows(
+    *,
+    compact_hidden: torch.Tensor,
+    positions: torch.Tensor,
+    cache_loc_2d: torch.Tensor,
+    verify_lens: torch.Tensor,
+    commit_lens: torch.Tensor,
+    block_size: int,
+    block_pos_offsets: Optional[torch.Tensor] = None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Gather committed rows from a ragged verify output into row-major order.
+
+    The target verify output is concatenated by request, with ``verify_lens[i]``
+    rows for request ``i``.  Only the first ``commit_lens[i]`` rows are needed
+    by the draft KV cache.  Positions and cache locations still use the dense
+    ``[batch, block_size]`` layout, so gather their matching prefix rows at the
+    same time.  The result is row-major by request, which is the order expected
+    by the regular KV-cache writer.
+    """
+    if compact_hidden.ndim != 2:
+        raise ValueError(
+            "DFLASH compact accepted-prefix packing expects compact_hidden to be 2D, "
+            f"got shape={tuple(compact_hidden.shape)}."
+        )
+    if cache_loc_2d.ndim != 2:
+        raise ValueError(
+            "DFLASH compact accepted-prefix packing expects cache_loc_2d to be 2D, "
+            f"got shape={tuple(cache_loc_2d.shape)}."
+        )
+    if verify_lens.ndim != 1 or verify_lens.shape[0] != cache_loc_2d.shape[0]:
+        raise ValueError(
+            "DFLASH compact verify_lens must match cache_loc_2d rows: "
+            f"verify_lens={tuple(verify_lens.shape)}, "
+            f"cache_loc_2d={tuple(cache_loc_2d.shape)}."
+        )
+    if commit_lens.ndim != 1 or commit_lens.shape[0] != cache_loc_2d.shape[0]:
+        raise ValueError(
+            "DFLASH compact commit_lens must match cache_loc_2d rows: "
+            f"commit_lens={tuple(commit_lens.shape)}, "
+            f"cache_loc_2d={tuple(cache_loc_2d.shape)}."
+        )
+
+    bs = int(cache_loc_2d.shape[0])
+    if int(cache_loc_2d.shape[1]) != int(block_size):
+        raise ValueError(
+            "DFLASH compact cache_loc_2d width must match block size: "
+            f"width={int(cache_loc_2d.shape[1])}, block_size={int(block_size)}."
+        )
+    expected_rows = bs * int(block_size)
+    if int(positions.numel()) != expected_rows:
+        raise ValueError(
+            "DFLASH compact accepted-prefix positions must match the full "
+            "decode block: "
+            f"numel={int(positions.numel())}, expected={expected_rows}."
+        )
+
+    # The compact output may include graph-bucket padding after all live rows,
+    # hence only require enough rows for the mandatory anchor of each request.
+    if int(compact_hidden.shape[0]) < bs:
+        raise ValueError(
+            "DFLASH compact hidden output is shorter than the request anchors: "
+            f"rows={int(compact_hidden.shape[0])}, batch={bs}."
+        )
+
+    device = compact_hidden.device
+    cache_loc_2d = cache_loc_2d.to(device=device)
+    positions = positions.to(device=device)
+    verify_lens = verify_lens.to(device=device, dtype=torch.int64)
+    commit_lens = commit_lens.to(device=device, dtype=torch.int64)
+
+    if block_pos_offsets is None:
+        token_offsets = torch.arange(int(block_size), dtype=torch.int64, device=device)
+    else:
+        if block_pos_offsets.ndim != 1 or int(block_pos_offsets.numel()) != int(
+            block_size
+        ):
+            raise ValueError(
+                "DFLASH compact block_pos_offsets must have block_size entries: "
+                f"shape={tuple(block_pos_offsets.shape)}, block_size={block_size}."
+            )
+        token_offsets = block_pos_offsets.to(device=device, dtype=torch.int64)
+    token_offsets = token_offsets.unsqueeze(0)
+    starts = torch.cumsum(verify_lens, dim=0) - verify_lens
+    accepted = token_offsets < commit_lens.unsqueeze(1)
+
+    # Compute the dynamic row list once. Reusing these coordinates avoids three
+    # independent boolean-index compactions for hidden, cache locations, and
+    # positions on CUDA.
+    accepted_req, accepted_offset = torch.where(accepted)
+    compact_rows = starts.index_select(0, accepted_req) + accepted_offset
+    dense_rows = accepted_req * int(block_size) + accepted_offset
+    return (
+        compact_hidden.index_select(0, compact_rows),
+        cache_loc_2d.reshape(-1).index_select(0, dense_rows),
+        positions.reshape(-1).index_select(0, dense_rows),
+    )
+
+
 class _DflashDraftSampler:
     """Capture-safe greedy argmax over the target LM head, run inside the draft
     cuda graph so the draft sampling is captured and counted in fwd_occupancy.
@@ -1520,7 +1618,7 @@ class DFlashWorkerV2(BaseSpecWorker):
 
         For the spec-v2 overlap path, callers can pass dense `[bs, block_size]`
         `cache_loc_2d` plus `commit_lens`; the prefix-valid writer then commits
-        only the live prefix rows without constructing masked/packed index tensors.
+        only the live prefix rows.
         """
         if target_hidden is None:
             raise RuntimeError("DFLASH missing target hidden context features.")
@@ -1663,6 +1761,33 @@ class DFlashWorkerV2(BaseSpecWorker):
                 ctx_positions=positions,
                 ctx_cache_loc=cache_loc,
             )
+
+    def _append_compact_target_hidden_to_draft_kv_by_loc(
+        self,
+        *,
+        compact_hidden: torch.Tensor,
+        positions: torch.Tensor,
+        cache_loc_2d: torch.Tensor,
+        verify_lens: torch.Tensor,
+        commit_lens: torch.Tensor,
+    ) -> None:
+        """Gather live ragged rows before projecting them into draft KV."""
+        packed_hidden, packed_cache_loc, packed_positions = (
+            _pack_accepted_compact_rows(
+                compact_hidden=compact_hidden,
+                positions=positions,
+                cache_loc_2d=cache_loc_2d,
+                verify_lens=verify_lens,
+                commit_lens=commit_lens,
+                block_size=int(self.block_size),
+                block_pos_offsets=self._block_pos_offsets,
+            )
+        )
+        self._append_target_hidden_to_draft_kv_by_loc(
+            target_hidden=packed_hidden,
+            cache_loc=packed_cache_loc,
+            positions=packed_positions,
+        )
 
     def _append_target_hidden_sequential(
         self,
@@ -2474,8 +2599,8 @@ class DFlashWorkerV2(BaseSpecWorker):
                 int(idle_layout.verify_lens.numel()) if idle_layout is not None else 0
             )
         if self._dcut_epilogue is not None and idle_layout is not None:
-            # Arm the graph-folded epilogue with the dummy lens so the replayed
-            # in-graph scatter reads a valid (discarded) distribution.
+            # Arm the graph-folded top-1 scatter with dummy lens; its output is
+            # discarded for idle participation.
             self._dcut_epilogue.begin_step(idle_layout.verify_lens)
         verify_forward_batch, _ = verify_input.prepare_for_verify(
             batch, self.target_worker
@@ -2759,12 +2884,22 @@ class DFlashWorkerV2(BaseSpecWorker):
 
         target_predict = None
         hidden_strided = None
+        compact_hidden = None
         if dcut_plan is not None:
             dense_rows = bs * int(self.block_size)
             if dcut_plan.is_compact:
+                if logits_output.hidden_states is None:
+                    raise RuntimeError(
+                        "DFLASH D-Cut verify requires target hidden states."
+                    )
+                # Keep the ragged hidden output in its native compact layout.
+                # Only the accepted prefix is gathered after acceptance; making
+                # a dense [bs, block_size] hidden buffer here would reintroduce
+                # the projection cost D-Cut is meant to remove.
+                compact_hidden = logits_output.hidden_states
                 if can_run_cuda_graph:
                     assert self._dcut_epilogue is not None
-                    target_predict, hidden_strided = self._dcut_epilogue.read(bs)
+                    target_predict = self._dcut_epilogue.read(bs)
                 else:
                     compact_top1 = torch.argmax(
                         logits_output.next_token_logits, dim=-1
@@ -2775,16 +2910,6 @@ class DFlashWorkerV2(BaseSpecWorker):
                         fill_value=-1,
                         verify_num_draft_tokens=int(self.block_size),
                     ).view(bs, int(self.block_size))
-                    if logits_output.hidden_states is None:
-                        raise RuntimeError(
-                            "DFLASH D-Cut verify requires target hidden states."
-                        )
-                    hidden_strided = ScatterCompactToStrided.execute(
-                        compact=logits_output.hidden_states,
-                        layout=dcut_plan.layout,
-                        fill_value=0.0,
-                        verify_num_draft_tokens=int(self.block_size),
-                    )
             else:
                 # Full-width D-Cut still rides the token-keyed graph. Padding,
                 # when present, is a suffix after the B dense request rows.
@@ -2973,24 +3098,33 @@ class DFlashWorkerV2(BaseSpecWorker):
             )
 
         # --- 3) Materialize committed verify-input tokens into draft KV cache.
-        hidden = (
-            hidden_strided
-            if hidden_strided is not None
-            else logits_output.hidden_states
-        )
-        if hidden is None:
-            raise RuntimeError(
-                "DFLASH verify requires target hidden states, but got None."
+        if dcut_compact:
+            assert dcut_plan is not None and compact_hidden is not None
+            self._append_compact_target_hidden_to_draft_kv_by_loc(
+                compact_hidden=compact_hidden,
+                cache_loc_2d=verify_out_cache_loc_2d,
+                positions=positions,
+                verify_lens=dcut_plan.layout.verify_lens,
+                commit_lens=commit_lens,
             )
-        hidden = hidden.view(bs, int(self.block_size), -1)
-
-        self._append_target_hidden_to_draft_kv_by_loc(
-            target_hidden=hidden.reshape(-1, hidden.shape[-1]),
-            cache_loc=verify_out_cache_loc,
-            cache_loc_2d=verify_out_cache_loc_2d,
-            positions=positions,
-            commit_lens=commit_lens,
-        )
+        else:
+            hidden = (
+                hidden_strided
+                if hidden_strided is not None
+                else logits_output.hidden_states
+            )
+            if hidden is None:
+                raise RuntimeError(
+                    "DFLASH verify requires target hidden states, but got None."
+                )
+            hidden = hidden.view(bs, int(self.block_size), -1)
+            self._append_target_hidden_to_draft_kv_by_loc(
+                target_hidden=hidden.reshape(-1, hidden.shape[-1]),
+                cache_loc=verify_out_cache_loc,
+                cache_loc_2d=verify_out_cache_loc_2d,
+                positions=positions,
+                commit_lens=commit_lens,
+            )
 
         # Avoid copying large hidden-state buffers to CPU in overlap scheduling.
         logits_output.hidden_states = None

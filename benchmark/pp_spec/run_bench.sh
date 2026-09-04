@@ -186,7 +186,7 @@ run_config() {
   CUDA_VISIBLE_DEVICES="$GPUS" \
     PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
     SGLANG_RAGGED_VERIFY_MODE="$RAGGED_VERIFY_MODE" \
-    SGL_FORCE_SHUTDOWN=1 \
+    SGLANG_FORCE_SHUTDOWN=1 \
     HF_HUB_OFFLINE=1 \
     setsid sglang "${server_args[@]}" >"$output_dir/server.log" 2>&1 &
   SERVER_PID=$!
@@ -209,7 +209,7 @@ run_config() {
   HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 \
   python "$SCRIPT_DIR/bench_spectre.py" \
     --url "$BASE_URL" \
-    --label "${name}_r1" \
+    --label "$name" \
     --dataset "$DATASET" \
     --tokenizer "$MODEL" \
     --tokenizer-revision "$MODEL_REVISION" \
@@ -253,59 +253,64 @@ summarize_run() {
 cd "$REPO_ROOT"
 
 # ===== Qwen3.5-27B-FP8 (64 layers; uniform 32,32 / auto 38,26) =====
-MODEL=Qwen/Qwen3.5-27B-FP8
-DRAFT_MODEL=z-lab/qwen3.5-27b-dflash
-MEM_FRACTION_STATIC=0.75
-OUTPUT_ROOT=$SCRIPT_DIR/results/Qwen_Qwen3.5-27B-FP8_$(date -u +%Y%m%d_%H%M%S)
+# MODEL=Qwen/Qwen3.5-27B-FP8
+# DRAFT_MODEL=z-lab/Qwen3.5-27B-DFlash
+# MEM_FRACTION_STATIC=0.75
+# OUTPUT_ROOT=$SCRIPT_DIR/results/Qwen_Qwen3.5-27B-FP8_$(date -u +%Y%m%d_%H%M%S)
+
+MODEL=Qwen/Qwen3.5-9B
+DRAFT_MODEL=z-lab/Qwen3.5-9B-DFlash
+MEM_FRACTION_STATIC=0.7
+OUTPUT_ROOT=$SCRIPT_DIR/results/Qwen_Qwen3.5-9B_$(date -u +%Y%m%d_%H%M%S)
+
 mkdir -p "$OUTPUT_ROOT"
 echo "Results: $OUTPUT_ROOT"
 
 # run_config <name:结果子目录> <tp> <pp> <dp> <partition:PP分层,空=非PP> <load_point:并发:QPS:请求数> <active_bs:全局并发> <num_requests:总请求数> <point_tag:结果目录后缀c{C}_qps{Q}_n{N}>
-# run_config pp2_uniform 1 2 1 32,32 8:2:32 8 32 c8_qps2_n32
-run_config tp2 2 1 1 "" 8:2:32 8 32 c8_qps2_n32 --speculative-dflash-dcut 0
-run_config tp2_dcut_auto 2 1 1 "" 8:2:32 8 32 c8_qps2_n32 --speculative-dflash-dcut auto
-run_config tp2dp_dcut 2 1 2 "" 8:2:32 8 32 c8_qps2_n32 --enable-dp-attention --enable-dp-lm-head --speculative-dflash-dcut auto
-run_config tp2dp 2 1 2 "" 8:2:32 8 32 c8_qps2_n32 --enable-dp-attention --enable-dp-lm-head --speculative-dflash-dcut 0
-run_config pp2_auto 1 2 1 38,26 8:2:32 8 32 c8_qps2_n32 --speculative-dflash-dcut 0
-run_config pp2_auto_dcut_auto 1 2 1 38,26 8:2:32 8 32 c8_qps2_n32 --speculative-dflash-dcut auto
+run_config tp 2 1 1 "" 8:2:32 8 32 c8_qps2_n32 --speculative-dflash-dcut 0
+run_config tp_dpattn 2 1 2 "" 8:2:32 8 32 c8_qps2_n32 --enable-dp-attention --enable-dp-lm-head --speculative-dflash-dcut 0
+run_config pp_asym 1 2 1 21,11 8:2:32 8 32 c8_qps2_n32 --speculative-dflash-dcut 0
+# run_config pp_asym 1 2 1 38,26 8:2:32 8 32 c8_qps2_n32 --speculative-dflash-dcut 0
+run_config tp_dcut 2 1 1 "" 8:2:32 8 32 c8_qps2_n32 --speculative-dflash-dcut auto
+run_config tp_dpattn_dcut 2 1 2 "" 8:2:32 8 32 c8_qps2_n32 --enable-dp-attention --enable-dp-lm-head --speculative-dflash-dcut auto
+run_config pp_asym_dcut 1 2 1 21,11 8:2:32 8 32 c8_qps2_n32 --speculative-dflash-dcut auto
+# run_config pp_asym_dcut 1 2 1 38,26 8:2:32 8 32 c8_qps2_n32 --speculative-dflash-dcut auto
 
-# run_config pp2_uniform 1 2 1 32,32 16:4:64 16 64 c16_qps4_n64
-run_config tp2 2 1 1 "" 16:4:64 16 64 c16_qps4_n64 --speculative-dflash-dcut 0
-run_config tp2_dcut_auto 2 1 1 "" 16:4:64 16 64 c16_qps4_n64 --speculative-dflash-dcut auto
-run_config tp2dp_dcut 2 1 2 "" 16:4:64 16 64 c16_qps4_n64 --enable-dp-attention --enable-dp-lm-head --speculative-dflash-dcut auto
-run_config tp2dp 2 1 2 "" 16:4:64 16 64 c16_qps4_n64 --enable-dp-attention --enable-dp-lm-head --speculative-dflash-dcut 0
-run_config pp2_auto 1 2 1 38,26 16:4:64 16 64 c16_qps4_n64 --speculative-dflash-dcut 0
-run_config pp2_auto_dcut_auto 1 2 1 38,26 16:4:64 16 64 c16_qps4_n64 --speculative-dflash-dcut auto
+run_config tp 2 1 1 "" 16:4:64 16 64 c16_qps4_n64 --speculative-dflash-dcut 0
+run_config tp_dpattn 2 1 2 "" 16:4:64 16 64 c16_qps4_n64 --enable-dp-attention --enable-dp-lm-head --speculative-dflash-dcut 0
+run_config pp_asym 1 2 1 21,11 16:4:64 16 64 c16_qps4_n64 --speculative-dflash-dcut 0
+# run_config pp_asym 1 2 1 38,26 16:4:64 16 64 c16_qps4_n64 --speculative-dflash-dcut 0
+run_config tp_dcut 2 1 1 "" 16:4:64 16 64 c16_qps4_n64 --speculative-dflash-dcut auto
+run_config tp_dpattn_dcut 2 1 2 "" 16:4:64 16 64 c16_qps4_n64 --enable-dp-attention --enable-dp-lm-head --speculative-dflash-dcut auto
+run_config pp_asym_dcut 1 2 1 21,11 16:4:64 16 64 c16_qps4_n64 --speculative-dflash-dcut auto
+# run_config pp_asym_dcut 1 2 1 38,26 16:4:64 16 64 c16_qps4_n64 --speculative-dflash-dcut auto
 
-# run_config pp2_uniform 1 2 1 32,32 32:8:128 32 128 c32_qps8_n128
-run_config tp2 2 1 1 "" 32:8:128 32 128 c32_qps8_n128 --speculative-dflash-dcut 0
-run_config tp2_dcut_auto 2 1 1 "" 32:8:128 32 128 c32_qps8_n128 --speculative-dflash-dcut auto
-run_config tp2dp_dcut 2 1 2 "" 32:8:128 32 128 c32_qps8_n128 --enable-dp-attention --enable-dp-lm-head --speculative-dflash-dcut auto
-run_config tp2dp 2 1 2 "" 32:8:128 32 128 c32_qps8_n128 --enable-dp-attention --enable-dp-lm-head --speculative-dflash-dcut 0
-run_config pp2_auto 1 2 1 38,26 32:8:128 32 128 c32_qps8_n128 --speculative-dflash-dcut 0
-run_config pp2_auto_dcut_auto 1 2 1 38,26 32:8:128 32 128 c32_qps8_n128 --speculative-dflash-dcut auto
+run_config tp 2 1 1 "" 32:8:128 32 128 c32_qps8_n128 --speculative-dflash-dcut 0
+run_config tp_dpattn 2 1 2 "" 32:8:128 32 128 c32_qps8_n128 --enable-dp-attention --enable-dp-lm-head --speculative-dflash-dcut 0
+run_config pp_asym 1 2 1 21,11 32:8:128 32 128 c32_qps8_n128 --speculative-dflash-dcut 0
+# run_config pp_asym 1 2 1 38,26 32:8:128 32 128 c32_qps8_n128 --speculative-dflash-dcut 0
+run_config tp_dcut 2 1 1 "" 32:8:128 32 128 c32_qps8_n128 --speculative-dflash-dcut auto
+run_config tp_dpattn_dcut 2 1 2 "" 32:8:128 32 128 c32_qps8_n128 --enable-dp-attention --enable-dp-lm-head --speculative-dflash-dcut auto
+run_config pp_asym_dcut 1 2 1 21,11 32:8:128 32 128 c32_qps8_n128 --speculative-dflash-dcut auto
+# run_config pp_asym_dcut 1 2 1 38,26 32:8:128 32 128 c32_qps8_n128 --speculative-dflash-dcut auto
 
-# run_config pp2_uniform 1 2 1 32,32 64:16:256 64 256 c64_qps16_n256
-run_config tp2 2 1 1 "" 64:16:256 64 256 c64_qps16_n256 --speculative-dflash-dcut 0
-run_config tp2_dcut_auto 2 1 1 "" 64:16:256 64 256 c64_qps16_n256 --speculative-dflash-dcut auto
-run_config tp2dp_dcut 2 1 2 "" 64:16:256 64 256 c64_qps16_n256 --enable-dp-attention --enable-dp-lm-head --speculative-dflash-dcut auto
-run_config tp2dp 2 1 2 "" 64:16:256 64 256 c64_qps16_n256 --enable-dp-attention --enable-dp-lm-head --speculative-dflash-dcut 0
-run_config pp2_auto 1 2 1 38,26 64:16:256 64 256 c64_qps16_n256 --speculative-dflash-dcut 0
-run_config pp2_auto_dcut_auto 1 2 1 38,26 64:16:256 64 256 c64_qps16_n256 --speculative-dflash-dcut auto
+run_config tp 2 1 1 "" 64:16:256 64 256 c64_qps16_n256 --speculative-dflash-dcut 0
+run_config tp_dpattn 2 1 2 "" 64:16:256 64 256 c64_qps16_n256 --enable-dp-attention --enable-dp-lm-head --speculative-dflash-dcut 0
+run_config pp_asym 1 2 1 21,11 64:16:256 64 256 c64_qps16_n256 --speculative-dflash-dcut 0
+# run_config pp_asym 1 2 1 38,26 64:16:256 64 256 c64_qps16_n256 --speculative-dflash-dcut 0
+run_config tp_dcut 2 1 1 "" 64:16:256 64 256 c64_qps16_n256 --speculative-dflash-dcut auto
+run_config tp_dpattn_dcut 2 1 2 "" 64:16:256 64 256 c64_qps16_n256 --enable-dp-attention --enable-dp-lm-head --speculative-dflash-dcut auto
+run_config pp_asym_dcut 1 2 1 21,11 64:16:256 64 256 c64_qps16_n256 --speculative-dflash-dcut auto
+# run_config pp_asym_dcut 1 2 1 38,26 64:16:256 64 256 c64_qps16_n256 --speculative-dflash-dcut auto
 
-# run_config pp2_uniform 1 2 1 32,32 96:24:384 96 384 c96_qps24_n384
-# run_config tp2 2 1 1 "" 96:24:384 96 384 c96_qps24_n384 --speculative-dflash-dcut 0
-# run_config tp2_dcut_auto 2 1 1 "" 96:24:384 96 384 c96_qps24_n384 --speculative-dflash-dcut auto
-# run_config tp2_dpattn 2 1 2 "" 96:24:384 96 384 c96_qps24_n384 --speculative-dflash-dcut 0 --enable-dp-attention
-# run_config pp2_auto 1 2 1 38,26 96:24:384 96 384 c96_qps24_n384 --speculative-dflash-dcut 0
-
-# run_config pp2_uniform 1 2 1 32,32 128:32:512 128 512 c128_qps32_n512
-run_config tp2 2 1 1 "" 128:32:512 128 512 c128_qps32_n512 --speculative-dflash-dcut 0
-run_config tp2_dcut_auto 2 1 1 "" 128:32:512 128 512 c128_qps32_n512 --speculative-dflash-dcut auto
-run_config tp2dp_dcut 2 1 2 "" 128:32:512 128 512 c128_qps32_n512 --enable-dp-attention --enable-dp-lm-head --speculative-dflash-dcut auto
-run_config tp2dp 2 1 2 "" 128:32:512 128 512 c128_qps32_n512 --enable-dp-attention --enable-dp-lm-head --speculative-dflash-dcut 0
-run_config pp2_auto 1 2 1 38,26 128:32:512 128 512 c128_qps32_n512 --speculative-dflash-dcut 0
-run_config pp2_auto_dcut_auto 1 2 1 38,26 128:32:512 128 512 c128_qps32_n512 --speculative-dflash-dcut auto
+run_config tp 2 1 1 "" 128:32:512 128 512 c128_qps32_n512 --speculative-dflash-dcut 0
+run_config tp_dpattn 2 1 2 "" 128:32:512 128 512 c128_qps32_n512 --enable-dp-attention --enable-dp-lm-head --speculative-dflash-dcut 0
+run_config pp_asym 1 2 1 21,11 128:32:512 128 512 c128_qps32_n512 --speculative-dflash-dcut 0
+# run_config pp_asym 1 2 1 38,26 128:32:512 128 512 c128_qps32_n512 --speculative-dflash-dcut 0
+run_config tp_dcut 2 1 1 "" 128:32:512 128 512 c128_qps32_n512 --speculative-dflash-dcut auto
+run_config tp_dpattn_dcut 2 1 2 "" 128:32:512 128 512 c128_qps32_n512 --enable-dp-attention --enable-dp-lm-head --speculative-dflash-dcut auto
+run_config pp_asym_dcut 1 2 1 21,11 128:32:512 128 512 c128_qps32_n512 --speculative-dflash-dcut auto
+# run_config pp_asym_dcut 1 2 1 38,26 128:32:512 128 512 c128_qps32_n512 --speculative-dflash-dcut auto
 
 summarize_run "$OUTPUT_ROOT"
 

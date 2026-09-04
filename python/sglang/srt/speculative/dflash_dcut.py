@@ -1126,7 +1126,7 @@ class DFlashDcutPlanner:
 
 
 class DFlashDcutEpilogue:
-    """Graph-folded compact top1 + hidden-state scatter for DFlash D-Cut."""
+    """Graph-folded compact top1 scatter for DFlash D-Cut."""
 
     def __init__(self, *, max_bs: int, block_size: int, device: torch.device) -> None:
         self.max_bs = int(max_bs)
@@ -1139,7 +1139,6 @@ class DFlashDcutEpilogue:
         self.strided_top1 = torch.empty(
             (max_tokens, 1), dtype=torch.int64, device=device
         )
-        self.strided_hidden: Optional[torch.Tensor] = None
 
     def begin_step(self, verify_lens: torch.Tensor) -> None:
         bs = int(verify_lens.shape[0])
@@ -1153,35 +1152,16 @@ class DFlashDcutEpilogue:
         if bs < self.max_bs:
             self.verify_lens_buf[bs:].zero_()
 
-    def _ensure_hidden(self, compact_hidden: torch.Tensor) -> torch.Tensor:
-        if (
-            self.strided_hidden is not None
-            and self.strided_hidden.shape[1] == compact_hidden.shape[1]
-            and self.strided_hidden.dtype == compact_hidden.dtype
-        ):
-            return self.strided_hidden
-        assert (
-            not torch.cuda.is_current_stream_capturing()
-        ), "DFlashDcutEpilogue buffers must be allocated during graph warmup"
-        self.strided_hidden = torch.empty(
-            (self.max_bs * self.block_size, compact_hidden.shape[1]),
-            dtype=compact_hidden.dtype,
-            device=compact_hidden.device,
-        )
-        return self.strided_hidden
-
     def capture_hook(self, runner, out, forward_batch, num_tokens: int) -> None:
         if runner.model_runner.is_draft_worker or not runner.ragged_verify_mode:
             return
         if (
             not isinstance(out, LogitsProcessorOutput)
             or out.next_token_logits is None
-            or out.hidden_states is None
         ):
             return
         self(
             compact_logits=out.next_token_logits,
-            compact_hidden=out.hidden_states,
             bs=forward_batch.batch_size,
         )
 
@@ -1189,12 +1169,10 @@ class DFlashDcutEpilogue:
         self,
         *,
         compact_logits: torch.Tensor,
-        compact_hidden: torch.Tensor,
         bs: int,
     ) -> None:
         n = int(compact_logits.shape[0])
         torch.argmax(compact_logits, dim=-1, out=self.compact_top1[:n])
-        hidden_out = self._ensure_hidden(compact_hidden)
         verify_lens = self.verify_lens_buf[:bs]
         scatter_compact_to_strided_into(
             compact=self.compact_top1[:n].view(-1, 1),
@@ -1203,17 +1181,6 @@ class DFlashDcutEpilogue:
             stride=self.block_size,
             fill_value=-1,
         )
-        scatter_compact_to_strided_into(
-            compact=compact_hidden,
-            verify_lens=verify_lens,
-            out=hidden_out[: bs * self.block_size],
-            stride=self.block_size,
-            fill_value=0.0,
-        )
 
-    def read(self, bs: int) -> tuple[torch.Tensor, torch.Tensor]:
-        assert self.strided_hidden is not None
-        return (
-            self.strided_top1[: bs * self.block_size].view(bs, self.block_size),
-            self.strided_hidden[: bs * self.block_size],
-        )
+    def read(self, bs: int) -> torch.Tensor:
+        return self.strided_top1[: bs * self.block_size].view(bs, self.block_size)
