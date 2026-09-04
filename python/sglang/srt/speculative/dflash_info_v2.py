@@ -232,6 +232,21 @@ class DFlashPPVerifyInputRaw(DFlashDecodePrepareMixin, SpecInput):
     # [1]*bs).
     accept_lens: torch.Tensor  # [bs]
 
+    # The last PP rank is the sole D-Cut planner for an unchanged microbatch.
+    # It relays the next proposal's confidence and exact plan around the PP
+    # output ring. If scheduler-side filter/merge invalidates the exact plan,
+    # every stage deterministically replans it from the relayed confidence and
+    # shared bottleneck-cost table.
+    dcut_confidence: Optional[torch.Tensor] = None  # [bs, block_size - 1]
+    dcut_verify_lens: Optional[torch.Tensor] = None  # [bs] int32
+    dcut_keep_count: Optional[int] = None
+    dcut_graph_num_tokens: Optional[int] = None
+    dcut_candidate_index: Optional[int] = None
+
+    # Verify lengths consumed by the iteration that produced accept_lens. This
+    # is result accounting, distinct from dcut_verify_lens for the next round.
+    cap_lens: Optional[torch.Tensor] = None  # [bs] int32
+
     # Optional placeholders mirroring DFlashDraftInputV2 so that the verify
     # seq_lens planning bound (read when batch.seq_lens_cpu is None) never
     # AttributeErrors under PP. Written by prepare_for_decode (the mixin).
@@ -255,7 +270,9 @@ class DFlashPPVerifyInputRaw(DFlashDecodePrepareMixin, SpecInput):
         top_ks = [int(req.sampling_params.top_k) for req in reqs]
         self.max_top_k = max(max(top_ks, default=1), 1)
         self.uniform_top_k_value = (
-            top_ks[0] if top_ks and all(top_k == top_ks[0] for top_k in top_ks) else None
+            top_ks[0]
+            if top_ks and all(top_k == top_ks[0] for top_k in top_ks)
+            else None
         )
 
     def to_tensor_dict(self) -> dict:
@@ -298,9 +315,33 @@ class DFlashPPVerifyInputRaw(DFlashDecodePrepareMixin, SpecInput):
         self.bonus_tokens = self.bonus_tokens[new_indices]
         self.draft_tokens = self.draft_tokens[new_indices]
         self.accept_lens = self.accept_lens[new_indices]
+        if self.dcut_confidence is not None:
+            self.dcut_confidence = self.dcut_confidence[new_indices]
+        if self.cap_lens is not None:
+            self.cap_lens = self.cap_lens[new_indices]
+
+        # The batch-level keep count and graph bucket no longer describe the
+        # filtered rows. Preserve confidence and dynamically replan at use time.
+        self.dcut_verify_lens = None
+        self.dcut_keep_count = None
+        self.dcut_graph_num_tokens = None
+        self.dcut_candidate_index = None
 
     def merge_batch(self, spec_info: "DFlashPPVerifyInputRaw"):
         if spec_info.bonus_tokens.numel() == 0:
+            return
+        if self.bonus_tokens.numel() == 0:
+            self.bonus_tokens = spec_info.bonus_tokens
+            self.draft_tokens = spec_info.draft_tokens
+            self.accept_lens = spec_info.accept_lens
+            self.reserved_seq_lens_cpu = spec_info.reserved_seq_lens_cpu
+            self.reserved_seq_lens_sum = spec_info.reserved_seq_lens_sum
+            self.dcut_confidence = spec_info.dcut_confidence
+            self.dcut_verify_lens = spec_info.dcut_verify_lens
+            self.dcut_keep_count = spec_info.dcut_keep_count
+            self.dcut_graph_num_tokens = spec_info.dcut_graph_num_tokens
+            self.dcut_candidate_index = spec_info.dcut_candidate_index
+            self.cap_lens = spec_info.cap_lens
             return
         if self.reserved_seq_lens_cpu is not None:
             assert spec_info.reserved_seq_lens_cpu is not None
@@ -312,9 +353,32 @@ class DFlashPPVerifyInputRaw(DFlashDecodePrepareMixin, SpecInput):
             self.reserved_seq_lens_cpu = spec_info.reserved_seq_lens_cpu
             self.reserved_seq_lens_sum = spec_info.reserved_seq_lens_sum
 
-        self.bonus_tokens = torch.cat([self.bonus_tokens, spec_info.bonus_tokens], dim=0)
-        self.draft_tokens = torch.cat([self.draft_tokens, spec_info.draft_tokens], dim=0)
+        self.bonus_tokens = torch.cat(
+            [self.bonus_tokens, spec_info.bonus_tokens], dim=0
+        )
+        self.draft_tokens = torch.cat(
+            [self.draft_tokens, spec_info.draft_tokens], dim=0
+        )
         self.accept_lens = torch.cat([self.accept_lens, spec_info.accept_lens], dim=0)
+        if self.dcut_confidence is not None and spec_info.dcut_confidence is not None:
+            self.dcut_confidence = torch.cat(
+                [self.dcut_confidence, spec_info.dcut_confidence], dim=0
+            )
+        else:
+            # A first-decode dummy has no confidence. Verify the merged batch at
+            # full depth once rather than guessing confidence for its new rows.
+            self.dcut_confidence = None
+        if self.cap_lens is not None and spec_info.cap_lens is not None:
+            self.cap_lens = torch.cat([self.cap_lens, spec_info.cap_lens], dim=0)
+        else:
+            self.cap_lens = None
+
+        # The merged microbatch gets a fresh joint auto-mode ratio selection,
+        # then a global top-k allocation across all of its confidence rows.
+        self.dcut_candidate_index = None
+        self.dcut_verify_lens = None
+        self.dcut_keep_count = None
+        self.dcut_graph_num_tokens = None
 
 
 @dataclass

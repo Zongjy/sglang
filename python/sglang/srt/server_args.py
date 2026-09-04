@@ -7688,7 +7688,10 @@ class ServerArgs:
         except Exception:
             return False
 
-    LANGUAGE_MODEL_ONLY_ARCHITECTURES = ("MuseGlimmerForConditionalGeneration",)
+    LANGUAGE_MODEL_ONLY_ARCHITECTURES = (
+        "MuseGlimmerForConditionalGeneration",
+        "Qwen3_5ForConditionalGeneration",
+    )
 
     def _handle_language_model_only(self):
         if not self.language_model_only:

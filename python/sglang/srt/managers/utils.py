@@ -21,6 +21,7 @@ from sglang.srt.state_capturer.base import TopkCaptureOutput
 if TYPE_CHECKING:
     from sglang.srt.managers.scheduler import GenerationBatchResult
     from sglang.srt.server_args import ServerArgs
+    from sglang.srt.speculative.dflash_info_v2 import DFlashPPVerifyInputRaw
     from sglang.srt.speculative.dspark_components.dspark_verify import (
         DSparkPPVerifyInputRaw,
     )
@@ -116,9 +117,10 @@ class GenerationBatchResult:
 
     # PP + Spec: produced by Last Rank after draft/draft_extend_for_prefill,
     # consumed by _pp_prepare_tensor_dict for PP ring transmission. Eagle uses
-    # EaglePPVerifyInputRaw, DSpark uses DSparkPPVerifyInputRaw.
+    # EaglePPVerifyInputRaw, DSpark uses DSparkPPVerifyInputRaw, and DFlash
+    # uses DFlashPPVerifyInputRaw.
     pp_verify_input_raw: Optional[
-        Union[EaglePPVerifyInputRaw, DSparkPPVerifyInputRaw]
+        Union[EaglePPVerifyInputRaw, DSparkPPVerifyInputRaw, DFlashPPVerifyInputRaw]
     ] = None
 
     @property

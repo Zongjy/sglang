@@ -4,15 +4,9 @@ Usage: python plot_performance.py [path/to/summary.csv]
 
 Expected columns:
     label,max_concurrency,output_throughput_tok_s,ttft_p50_s,ttft_p99_s,tpot_p99_s
-
-In addition to the legacy aggregate figures, separate ``*_tp2.pdf`` and
-``*_tp2_dcut.pdf`` figures are written whenever those series are present.  The
-separate figures use their own y-axis, which keeps the low D-Cut throughput
-readable when PP/TP baselines are included in the aggregate figure.
 """
 
 import csv
-import re
 import sys
 from collections import defaultdict
 from pathlib import Path
@@ -36,9 +30,9 @@ plt.rcParams.update({
 def series_style(label: str):
     """Return a stable style for a result label.
 
-    Check D-Cut before the generic TP check: ``tp2_dcut_auto`` contains
-    ``tp`` as well, but should be visually distinguishable in the aggregate
-    plots.
+    Check D-Cut before the generic TP / PP-auto checks: ``tp2_dcut_auto`` and
+    ``pp2_auto_dcut_auto`` contain those substrings as well, but should stay
+    visually distinguishable in the aggregate plots.
     """
 
     normalized = label.lower()
@@ -53,23 +47,6 @@ def series_style(label: str):
     if "auto" in normalized:
         return dict(color="tab:blue", linestyle="-", marker="s")
     return dict(color="tab:orange", linestyle="-", marker="o")
-
-
-def _normalized_label(label: str) -> str:
-    """Normalize separators so labels from different runners group alike."""
-
-    return re.sub(r"[^a-z0-9]+", "_", label.lower()).strip("_")
-
-
-def tp_split_group(label: str) -> str | None:
-    """Classify TP2 labels for the optional per-mode figures."""
-
-    normalized = _normalized_label(label)
-    if re.search(r"(?:^|_)tp2_dcut(?:_|$)", normalized):
-        return "tp2_dcut"
-    if re.search(r"(?:^|_)tp2(?:_|$)", normalized):
-        return "tp2"
-    return None
 
 
 def load_rows():
@@ -106,14 +83,7 @@ def load_rows():
     return by_label
 
 
-def plot_metric(
-    by_label,
-    col: str,
-    ylabel: str,
-    output_path: Path,
-    *,
-    title: str | None = None,
-):
+def plot_metric(by_label, col: str, ylabel: str, output_path: Path):
     """Render one metric for a selected set of series."""
 
     if not by_label:
@@ -138,8 +108,6 @@ def plot_metric(
     ax.minorticks_off()
     ax.set_xlabel("Concurrency")
     ax.set_ylabel(ylabel)
-    if title:
-        ax.set_title(title)
     ax.grid(True, alpha=0.3)
     ax.legend(framealpha=1.0, edgecolor="black")
     fig.tight_layout()
@@ -159,21 +127,6 @@ def main():
     ]
     for col, ylabel, outfile in metrics:
         plot_metric(by_label, col, ylabel, OUT_DIR / outfile)
-
-    # Keep TP2 and TP2-Dcut on independent axes.  This is intentionally
-    # generated alongside the aggregate figures so existing consumers of the
-    # original filenames continue to work.
-    split_series = defaultdict(dict)
-    for label, series in by_label.items():
-        group = tp_split_group(label)
-        if group is not None:
-            split_series[group][label] = series
-    for group, grouped_rows in split_series.items():
-        for col, ylabel, outfile in metrics:
-            stem = Path(outfile).stem
-            split_path = OUT_DIR / f"{stem}_{group}.pdf"
-            title = "TP2-Dcut" if group == "tp2_dcut" else "TP2"
-            plot_metric(grouped_rows, col, ylabel, split_path, title=title)
 
 
 if __name__ == "__main__":

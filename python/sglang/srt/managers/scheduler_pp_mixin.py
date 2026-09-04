@@ -165,9 +165,7 @@ class SchedulerPPMixin:
                             )
                         )
                 if self.mbs[next_mb_id] is not None:
-                    with torch.profiler.record_function(
-                        "scheduler.pp.wait_result_d2h"
-                    ):
+                    with torch.profiler.record_function("scheduler.pp.wait_result_d2h"):
                         d2h_event.synchronize()
                     with torch.profiler.record_function("process_batch_result"):
                         self._pp_process_batch_result(
@@ -1258,6 +1256,9 @@ class SchedulerPPMixin:
             (EaglePPVerifyInputRaw, DSparkPPVerifyInputRaw, DFlashPPVerifyInputRaw),
         ):
             output_result.accept_lens = batch.spec_info.accept_lens.to(torch.int64)
+            cap_lens = getattr(batch.spec_info, "cap_lens", None)
+            if cap_lens is not None:
+                output_result.cap_lens = cap_lens.to(torch.int32)
             output_result.speculative_num_draft_tokens = (
                 self.server_args.speculative_num_draft_tokens
             )

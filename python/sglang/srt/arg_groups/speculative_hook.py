@@ -174,11 +174,6 @@ def _handle_dflash(server_args: ServerArgs) -> None:
             "--speculative-dflash-dcut must be in [0, 1], " f"got {dcut!r}."
         )
     if dcut_enabled:
-        if server_args.pp_size > 1:
-            raise ValueError(
-                "DFLASH D-Cut does not support pipeline parallelism yet. "
-                "Use --pp-size 1."
-            )
         if not server_args.device.startswith("cuda"):
             raise ValueError(
                 "DFLASH D-Cut currently requires a CUDA target because its compact "

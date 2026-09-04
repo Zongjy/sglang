@@ -37,6 +37,7 @@ from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.base_spec_worker import BaseSpecWorker
 from sglang.srt.speculative.dflash_dcut import (
     DFlashDcutEpilogue,
+    DFlashDcutPlan,
     DFlashDcutPlanner,
     dflash_dcut_batch_is_compactable,
     dflash_dcut_enabled,
@@ -576,31 +577,32 @@ class DFlashWorkerV2(BaseSpecWorker):
         )
 
     def init_cuda_graphs(self):
-        if self._draft_worker is None:
-            return
-        capture_decode_cuda_graph = (
-            get_exec().graph.cuda_graph_config.decode.backend != Backend.DISABLED
-        )
-        if is_cuda() and capture_decode_cuda_graph:
-            available_mem = get_available_gpu_memory(self.device, self.gpu_id)
-            if available_mem < 1.0:
-                capture_decode_cuda_graph = False
-                logger.warning(
-                    "Disable DFLASH draft cuda graph because only %.2f GB GPU "
-                    "memory is available after target backend initialization.",
-                    available_mem,
-                )
-        if capture_decode_cuda_graph:
-            # Must run before capture so the draft graph folds the head in.
-            self._draft_sampler = self._maybe_build_draft_sampler()
-            if self._draft_sampler is not None:
-                self.draft_model_runner.capture_tail_hooks.append(
-                    make_draft_sampler_capture_hook(self._draft_sampler)
-                )
-        self._draft_worker.init_cuda_graphs(
-            capture_decode_cuda_graph=capture_decode_cuda_graph
-        )
+        if self._draft_worker is not None:
+            capture_decode_cuda_graph = (
+                get_exec().graph.cuda_graph_config.decode.backend != Backend.DISABLED
+            )
+            if is_cuda() and capture_decode_cuda_graph:
+                available_mem = get_available_gpu_memory(self.device, self.gpu_id)
+                if available_mem < 1.0:
+                    capture_decode_cuda_graph = False
+                    logger.warning(
+                        "Disable DFLASH draft cuda graph because only %.2f GB GPU "
+                        "memory is available after target backend initialization.",
+                        available_mem,
+                    )
+            if capture_decode_cuda_graph:
+                # Must run before capture so the draft graph folds the head in.
+                self._draft_sampler = self._maybe_build_draft_sampler()
+                if self._draft_sampler is not None:
+                    self.draft_model_runner.capture_tail_hooks.append(
+                        make_draft_sampler_capture_hook(self._draft_sampler)
+                    )
+            self._draft_worker.init_cuda_graphs(
+                capture_decode_cuda_graph=capture_decode_cuda_graph
+            )
 
+        # PP auto profiling is collective across every target stage, including
+        # non-last ranks that intentionally have no draft worker.
         if self._dcut_planner is not None:
             self._dcut_planner.profile_dcut_cost_table()
 
@@ -2166,6 +2168,52 @@ class DFlashWorkerV2(BaseSpecWorker):
 
         return block_ids, positions_2d, verify_out_cache_loc_2d, draft_tokens
 
+    def _resolve_dcut_plan(
+        self,
+        *,
+        batch: ScheduleBatch,
+        pp_raw: Optional[DFlashPPVerifyInputRaw],
+    ) -> Optional[DFlashDcutPlan]:
+        planner = self._dcut_planner
+        if planner is None:
+            return None
+
+        bs = len(batch.seq_lens)
+        force_full = not dflash_dcut_batch_is_compactable(batch)
+        if force_full:
+            return planner.full_plan(bs=bs)
+
+        if pp_raw is None:
+            confidence = self._last_draft_confidence
+            if confidence is None:
+                raise RuntimeError(
+                    "DFLASH D-Cut draft proposal did not produce confidence."
+                )
+            return planner.plan(confidence=confidence)
+
+        exact_plan = (
+            pp_raw.dcut_verify_lens is not None
+            and pp_raw.dcut_keep_count is not None
+            and pp_raw.dcut_graph_num_tokens is not None
+            and int(pp_raw.dcut_verify_lens.shape[0]) == bs
+        )
+        if exact_plan:
+            return planner.plan_from_relay(
+                verify_lens=pp_raw.dcut_verify_lens,
+                keep_count=pp_raw.dcut_keep_count,
+                graph_num_tokens=pp_raw.dcut_graph_num_tokens,
+                candidate_index=pp_raw.dcut_candidate_index,
+            )
+
+        # The first decode after prefill carries a dummy draft with no
+        # confidence. A merge with such a row deliberately clears confidence as
+        # well. Verify the whole block once; the last stage publishes a real
+        # confidence/plan pair for the following round.
+        if pp_raw.dcut_confidence is None:
+            return planner.full_plan(bs=bs)
+
+        return planner.plan(confidence=pp_raw.dcut_confidence)
+
     def forward_batch_generation(
         self,
         batch: ScheduleBatch,
@@ -2315,17 +2363,13 @@ class DFlashWorkerV2(BaseSpecWorker):
         positions = positions_2d.reshape(-1)
         verify_out_cache_loc = verify_out_cache_loc_2d.reshape(-1)
 
-        dcut_plan = None
-        if self._dcut_planner is not None:
-            confidence = self._last_draft_confidence
-            if confidence is None:
-                raise RuntimeError(
-                    "DFLASH D-Cut draft proposal did not produce confidence."
-                )
-            dcut_plan = self._dcut_planner.plan(
-                confidence=confidence,
-                force_full=not dflash_dcut_batch_is_compactable(batch),
-            )
+        dcut_plan = self._resolve_dcut_plan(batch=batch, pp_raw=pp_raw)
+        dcut_compact = dcut_plan is not None and dcut_plan.is_compact
+        dcut_dense_exact = (
+            dcut_plan is not None
+            and not dcut_plan.is_compact
+            and int(dcut_plan.layout.graph_num_tokens) == bs * int(self.block_size)
+        )
 
         # Must stay ahead of the target verify launch below.
         grammar_tree = (
@@ -2336,7 +2380,7 @@ class DFlashWorkerV2(BaseSpecWorker):
         # TARGET_VERIFY uses standard causal masking; custom masks are unnecessary here.
         custom_mask = None
 
-        if dcut_plan is not None:
+        if dcut_plan is not None and not dcut_dense_exact:
             ragged_window = BuildRaggedVerifyWindow.execute(
                 batch=batch,
                 layout=dcut_plan.layout,
@@ -2351,6 +2395,8 @@ class DFlashWorkerV2(BaseSpecWorker):
             target_positions = ragged_window.positions
             target_out_cache_loc = ragged_window.verify_cache_loc
         else:
+            # Dense full-width: the tokens already sit in [bs, block] order.
+            # Skip the compact pack when the CUDA graph bucket is an exact fit.
             verify_input_ids = draft_tokens.reshape(-1)
             target_positions = positions
             target_out_cache_loc = verify_out_cache_loc
@@ -2366,7 +2412,7 @@ class DFlashWorkerV2(BaseSpecWorker):
         batch.out_cache_loc = target_out_cache_loc
         sampling_info = batch.sampling_info
 
-        if dcut_plan is not None:
+        if dcut_compact:
             assert self._dcut_epilogue is not None
             self._dcut_epilogue.begin_step(dcut_plan.layout.verify_lens)
 
@@ -2380,7 +2426,7 @@ class DFlashWorkerV2(BaseSpecWorker):
         )
         if backend_needs_cpu_lens:
             if seq_lens_cpu_backup is not None:
-                if dcut_plan is None:
+                if dcut_plan is None or not dcut_plan.is_compact:
                     verify_lens_cpu = torch.full_like(
                         seq_lens_cpu_backup, int(self.block_size)
                     )
@@ -2684,12 +2730,52 @@ class DFlashWorkerV2(BaseSpecWorker):
                 bonus_tokens=bonus,
                 prefix_lens=new_seq_lens,
             )
+            next_dcut_confidence = None
+            next_dcut_plan = None
+            if self._dcut_planner is not None:
+                next_dcut_confidence = self._last_draft_confidence
+                if next_dcut_confidence is None:
+                    raise RuntimeError(
+                        "DFLASH D-Cut next-block proposal did not produce confidence."
+                    )
+                next_dcut_plan = self._dcut_planner.plan(
+                    confidence=next_dcut_confidence,
+                    force_full=not dflash_dcut_batch_is_compactable(batch),
+                )
             pp_raw_out = DFlashPPVerifyInputRaw(
                 bonus_tokens=bonus.to(device=device, dtype=torch.int64),
                 draft_tokens=next_draft_tokens[:, 1:]
                 .to(device=device, dtype=torch.int64)
                 .clone(),
                 accept_lens=commit_lens.to(device=device, dtype=torch.int64),
+                dcut_confidence=(
+                    next_dcut_confidence.to(torch.float32).clone()
+                    if next_dcut_confidence is not None
+                    else None
+                ),
+                dcut_verify_lens=(
+                    next_dcut_plan.layout.verify_lens.to(torch.int32).clone()
+                    if next_dcut_plan is not None
+                    else None
+                ),
+                dcut_keep_count=(
+                    next_dcut_plan.keep_count if next_dcut_plan is not None else None
+                ),
+                dcut_graph_num_tokens=(
+                    next_dcut_plan.layout.graph_num_tokens
+                    if next_dcut_plan is not None
+                    else None
+                ),
+                dcut_candidate_index=(
+                    next_dcut_plan.candidate_index
+                    if next_dcut_plan is not None
+                    else None
+                ),
+                cap_lens=(
+                    dcut_plan.layout.verify_lens.to(torch.int32).clone()
+                    if dcut_plan is not None
+                    else None
+                ),
                 accept_index=None,
             )
 
