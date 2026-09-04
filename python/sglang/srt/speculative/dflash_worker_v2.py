@@ -1,6 +1,7 @@
+import contextlib
 import logging
 import math
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from typing import List, Optional
 
 import torch
@@ -18,9 +19,10 @@ from sglang.kernels.ops.speculative.dspark.dspark_verify_window import (
     ScatterCompactToStrided,
 )
 from sglang.srt.configs.hybrid_arch import mambaish_config
-from sglang.srt.distributed import get_tp_group
+from sglang.srt.distributed import get_attn_tp_group, get_tp_group
 from sglang.srt.distributed.parallel_state_wrapper import ParallelState
 from sglang.srt.environ import envs
+from sglang.srt.layers.dp_attention import is_dp_attention_enabled
 from sglang.srt.layers.logprob_processor import compute_spec_logprobs
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.managers.scheduler import GenerationBatchResult
@@ -63,6 +65,10 @@ from sglang.srt.speculative.draft_worker_common import (
     make_draft_input_v2,
     make_draft_sampler_capture_hook,
 )
+from sglang.srt.speculative.dspark_components.dspark_planner import (
+    idle_ragged_layout,
+)
+from sglang.srt.speculative.ragged_verify import round_up_grid
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.speculative.spec_utils import (
     SIMULATE_ACC_LEN,
@@ -71,6 +77,7 @@ from sglang.srt.speculative.spec_utils import (
     GrammarTree,
     assign_req_to_token_pool_func,
     build_grammar_vocab_mask,
+    draft_tp_context,
     get_mamba_verify_scratch_source_indices,
 )
 from sglang.srt.utils import get_available_gpu_memory, is_cuda, is_hip, is_npu
@@ -291,6 +298,26 @@ class _DflashDraftSampler:
             )
 
 
+@dataclass(frozen=True)
+class _DcutDpStepMeta:
+    """Per-step DP-attention alignment decision for the D-Cut verify forward.
+
+    Produced by a host-side all_gather at the top of forward_batch_generation
+    (exactly once per scheduler step on every TP rank) so every rank picks the
+    same ragged-verify graph tier — or uniformly falls back to eager.
+    """
+
+    # Max local decode batch size across TP ranks this step (0 = nobody decodes).
+    global_max_bs: int
+    # This rank's published keep budget (0 unless this rank decodes).
+    budget_local: int
+    # The shared graph tier; None means the step must run eagerly everywhere.
+    tier: Optional[int]
+    # plan()'s graph_num_tokens_floor: the tier, or the raw (over-grid) total
+    # so graph admission fails identically on every rank.
+    graph_num_tokens_floor: Optional[int]
+
+
 class DFlashWorkerV2(BaseSpecWorker):
     """DFLASH speculative decoding worker (spec-v2).
 
@@ -323,6 +350,21 @@ class DFlashWorkerV2(BaseSpecWorker):
         self.use_compact_draft_cache = self.draft_window_size is not None
         self.device = target_worker.device
 
+        # DP attention: the dense draft runs attn-TP-local. Building, backend
+        # init, graph capture and the draft forward all run inside
+        # _draft_context() so the draft's weights and collectives bind to the
+        # attention TP group (size 1 in the pure-DP case, i.e. a full local
+        # replica per rank). Mirrors DSpark's dense-draft wiring.
+        self._draft_dp_context_enabled = is_dp_attention_enabled()
+        # Under --enable-dp-lm-head (mandatory with DP attention) the borrowed
+        # target lm_head is sharded over the attention TP group, so the greedy
+        # samplers below must reduce over that group, not the full TP group.
+        self._sampler_group = (
+            get_attn_tp_group()
+            if self._draft_dp_context_enabled
+            else get_tp_group()
+        )
+
         self._pp_is_last_rank = target_worker.pp_group.is_last_rank
         self._pp_enabled = server_args.pp_size > 1
         if self._pp_enabled and self.use_compact_draft_cache:
@@ -335,6 +377,8 @@ class DFlashWorkerV2(BaseSpecWorker):
 
         self._warned_sampling_fallback = False
         self._logged_first_verify = False
+        self._warned_dcut_dp_eager = False
+        self._warned_pp_dp_idle = False
 
         self._draft_sampler = None
         # The draft model is only created on the last PP rank. Non-last ranks
@@ -342,17 +386,18 @@ class DFlashWorkerV2(BaseSpecWorker):
         # the block_size constant so the rebuilt verify window dims match the
         # last rank's allocation.
         if not self._pp_enabled or self._pp_is_last_rank:
-            bundle = build_draft_tp_worker(
-                server_args=server_args,
-                gpu_id=gpu_id,
-                ps=replace(ps, pp_rank=0),
-                nccl_port=nccl_port,
-                target_model_config=target_worker.model_runner.model_config,
-                algo_label="DFLASH",
-                pp_global_random_seed=(
-                    target_worker.random_seed if self._pp_enabled else None
-                ),
-            )
+            with self._draft_context():
+                bundle = build_draft_tp_worker(
+                    server_args=server_args,
+                    gpu_id=gpu_id,
+                    ps=replace(ps, pp_rank=0),
+                    nccl_port=nccl_port,
+                    target_model_config=target_worker.model_runner.model_config,
+                    algo_label="DFLASH",
+                    pp_global_random_seed=(
+                        target_worker.random_seed if self._pp_enabled else None
+                    ),
+                )
             self._draft_worker = bundle.draft_worker
             self.draft_model_runner = bundle.draft_model_runner
             self.draft_model = bundle.draft_model
@@ -533,6 +578,17 @@ class DFlashWorkerV2(BaseSpecWorker):
         # EagleDraftWorkerBase draft/draft_extend split to wrap it in.
         return self._draft_worker
 
+    def _draft_context(self):
+        """attn-TP-local context for the dense draft under DP attention.
+
+        The draft model performs no cross-DP-rank collectives, so with DP
+        attention it is built and run against the attention TP group (size 1
+        in the pure-DP case). No-op context outside DP attention.
+        """
+        if not self._draft_dp_context_enabled:
+            return contextlib.nullcontext()
+        return draft_tp_context(get_attn_tp_group())
+
     @property
     def spec_v2_attn_backends(self) -> tuple:
         # Every attn backend a spec_v2 forward touches; consumed by
@@ -568,7 +624,8 @@ class DFlashWorkerV2(BaseSpecWorker):
 
     def init_attention_backends(self):
         if self._draft_worker is not None:
-            self._draft_worker.init_attention_backends()
+            with self._draft_context():
+                self._draft_worker.init_attention_backends()
         self._need_mamba_verify_commit = mambaish_config(
             self.model_runner.model_config
         ) is not None and hasattr(
@@ -593,13 +650,17 @@ class DFlashWorkerV2(BaseSpecWorker):
             if capture_decode_cuda_graph:
                 # Must run before capture so the draft graph folds the head in.
                 self._draft_sampler = self._maybe_build_draft_sampler()
+            # Capture (and the sampler build above) must see the draft's
+            # attn-TP-local group so any in-graph collectives match the group the
+            # draft weights were built against.
+            with self._draft_context():
                 if self._draft_sampler is not None:
                     self.draft_model_runner.capture_tail_hooks.append(
                         make_draft_sampler_capture_hook(self._draft_sampler)
                     )
-            self._draft_worker.init_cuda_graphs(
-                capture_decode_cuda_graph=capture_decode_cuda_graph
-            )
+                self._draft_worker.init_cuda_graphs(
+                    capture_decode_cuda_graph=capture_decode_cuda_graph
+                )
 
         # PP auto profiling is collective across every target stage, including
         # non-last ranks that intentionally have no draft worker.
@@ -625,7 +686,9 @@ class DFlashWorkerV2(BaseSpecWorker):
         if not _is_dense_head_weight(lm_head.weight):
             # Quantized lm_head (FP8/INT) would break the static matmul.
             return _eager("quantized lm_head")
-        tp_group = get_tp_group()
+        # The head's vocab sharding group: the full TP group normally, the
+        # attention TP group under DP attention + dp-lm-head.
+        tp_group = self._sampler_group
         if not hasattr(lm_head, "shard_indices"):
             if tp_group.world_size != 1:
                 # No shard metadata to recover per-rank vocab offsets from.
@@ -1066,7 +1129,7 @@ class DFlashWorkerV2(BaseSpecWorker):
         makes for GGUF models. Padding rows are excluded so argmax cannot return
         an id outside the real vocabulary.
         """
-        tp_size = int(get_tp_group().world_size)
+        tp_size = int(self._sampler_group.world_size)
         if tp_size != 1:
             raise RuntimeError(
                 "DFLASH with a quantized target lm_head is only supported at "
@@ -1128,7 +1191,7 @@ class DFlashWorkerV2(BaseSpecWorker):
             return out_tokens
 
         shard = lm_head.shard_indices
-        tp_group = get_tp_group()
+        tp_group = self._sampler_group
         tp_size = int(tp_group.world_size)
 
         # Valid ranges in the local shard (excluding padding):
@@ -1329,7 +1392,7 @@ class DFlashWorkerV2(BaseSpecWorker):
 
         weight = getattr(lm_head, "weight", None)
         if not _is_dense_head_weight(weight):
-            if int(get_tp_group().world_size) != 1:
+            if int(self._sampler_group.world_size) != 1:
                 raise RuntimeError(
                     "DFLASH D-Cut quantized lm_head confidence is only supported "
                     "at tp=1."
@@ -1351,7 +1414,7 @@ class DFlashWorkerV2(BaseSpecWorker):
                 )
             return out_tokens, confidence
 
-        tp_group = get_tp_group()
+        tp_group = self._sampler_group
         tp_size = int(tp_group.world_size)
         weight_dtype = weight.dtype
 
@@ -2009,9 +2072,15 @@ class DFlashWorkerV2(BaseSpecWorker):
             spec_info=self._draft_block_spec_info,
             capture_hidden_mode=CaptureHiddenMode.NULL,
         )
+        if self._draft_dp_context_enabled:
+            # This hand-built batch skips ForwardBatch.init_new, so copy the
+            # scheduler-gathered graph eligibility over: the draft runner still
+            # has require_mlp_sync set under DP attention, and without the flag
+            # can_run_graph silently never admits the draft graph.
+            forward_batch.can_run_dp_cuda_graph = batch.can_run_dp_cuda_graph
 
         with torch.profiler.record_function("sglang.dflash.draft_model_forward"):
-            with torch.inference_mode():
+            with torch.inference_mode(), self._draft_context():
                 draft_out = self.draft_model_runner.forward(forward_batch)
         draft_logits_output = draft_out.logits_output
 
@@ -2173,6 +2242,7 @@ class DFlashWorkerV2(BaseSpecWorker):
         *,
         batch: ScheduleBatch,
         pp_raw: Optional[DFlashPPVerifyInputRaw],
+        dp_step: Optional[_DcutDpStepMeta] = None,
     ) -> Optional[DFlashDcutPlan]:
         planner = self._dcut_planner
         if planner is None:
@@ -2189,7 +2259,13 @@ class DFlashWorkerV2(BaseSpecWorker):
                 raise RuntimeError(
                     "DFLASH D-Cut draft proposal did not produce confidence."
                 )
-            return planner.plan(confidence=confidence)
+            return planner.plan(
+                confidence=confidence,
+                budget_cap=(dp_step.budget_local if dp_step is not None else None),
+                graph_num_tokens_floor=(
+                    dp_step.graph_num_tokens_floor if dp_step is not None else None
+                ),
+            )
 
         exact_plan = (
             pp_raw.dcut_verify_lens is not None
@@ -2212,7 +2288,204 @@ class DFlashWorkerV2(BaseSpecWorker):
         if pp_raw.dcut_confidence is None:
             return planner.full_plan(bs=bs)
 
-        return planner.plan(confidence=pp_raw.dcut_confidence)
+        return planner.plan(
+            confidence=pp_raw.dcut_confidence,
+            budget_cap=(dp_step.budget_local if dp_step is not None else None),
+            graph_num_tokens_floor=(
+                dp_step.graph_num_tokens_floor if dp_step is not None else None
+            ),
+        )
+
+    def _gather_dcut_dp_step_meta(
+        self, batch: ScheduleBatch
+    ) -> Optional[_DcutDpStepMeta]:
+        """Align the D-Cut verify graph tier across DP ranks for this step.
+
+        Runs exactly once per forward_batch_generation call (every scheduler
+        step on every TP rank, prefill and idle batches included), so the gloo
+        all_gather stays pairwise matched. Decode batches publish their real
+        (bs, keep budget); everything else publishes the (0, 0) sentinel.
+
+        The keep budget is the planner's *last* auto candidate's keep count:
+        the real keep depends on this step's draft confidence, which does not
+        exist yet at gather time, so the budget is an upper bound and plan()
+        clamps the realized keep back to it.
+        """
+        if self._dcut_planner is None or not self._draft_dp_context_enabled:
+            return None
+        if batch.forward_mode.is_decode():
+            bs_local = len(batch.seq_lens)
+            if dflash_dcut_batch_is_compactable(batch):
+                budget_local = self._dcut_planner.current_keep_budget(bs_local)
+            else:
+                # force_full batches keep the full block; publish that width
+                # so the shared tier covers it instead of forking the key.
+                budget_local = bs_local * (int(self.block_size) - 1)
+        else:
+            bs_local = 0
+            budget_local = 0
+
+        tp_group = get_tp_group()
+        local = torch.tensor([bs_local, budget_local], dtype=torch.int64)
+        gathered = [torch.zeros_like(local) for _ in range(tp_group.world_size)]
+        # Host-side gather (~10us); runs on every rank once per step.
+        torch.distributed.all_gather(gathered, local, group=tp_group.cpu_group)
+        global_max_bs = max(int(g[0]) for g in gathered)
+        tier_total = max(int(g[0]) + int(g[1]) for g in gathered)
+
+        tier = None
+        floor = None
+        if tier_total > 0:
+            runner = self.model_runner.decode_cuda_graph_runner
+            capture_num_tokens = (
+                runner.capture_num_tokens
+                if runner is not None and runner.ragged_verify_mode
+                else None
+            )
+            if capture_num_tokens is not None and tier_total <= capture_num_tokens[-1]:
+                tier = round_up_grid(tier_total, capture_num_tokens)
+                floor = tier
+            else:
+                # Over the captured grid (or ragged graphs unavailable): every
+                # rank must run this step eagerly. The raw total exceeds the
+                # grid, so as the floor it closes graph admission identically
+                # on all ranks; eager stays aligned via the dp MAX_LEN padding.
+                floor = tier_total
+                if capture_num_tokens is not None and not self._warned_dcut_dp_eager:
+                    self._warned_dcut_dp_eager = True
+                    logger.warning(
+                        "DFLASH D-Cut DP tier %d exceeds the captured ragged-verify "
+                        "grid (max %d); all DP ranks run such verify steps eagerly.",
+                        tier_total,
+                        capture_num_tokens[-1],
+                    )
+        return _DcutDpStepMeta(
+            global_max_bs=global_max_bs,
+            budget_local=budget_local,
+            tier=tier,
+            graph_num_tokens_floor=floor,
+        )
+
+    def _decode_idle_result(self, *, on_publish) -> GenerationBatchResult:
+        next_draft_input = self._make_next_draft_input_decode(
+            bonus_tokens=torch.empty((0,), device=self.device, dtype=torch.int64),
+            new_seq_lens=torch.empty((0,), device=self.device, dtype=torch.int64),
+        )
+        if on_publish is not None:
+            on_publish(next_draft_input.new_seq_lens)
+        return GenerationBatchResult(
+            logits_output=None,
+            next_token_ids=torch.empty((0,), dtype=torch.int64, device=self.device),
+            accept_lens=torch.empty((0,), dtype=torch.int32, device=self.device),
+            next_draft_input=next_draft_input,
+            can_run_cuda_graph=False,
+            speculative_num_draft_tokens=int(self.block_size),
+            new_seq_lens=next_draft_input.new_seq_lens,
+        )
+
+    def _run_idle_verify_participation(
+        self,
+        batch: ScheduleBatch,
+        dp_step: Optional[_DcutDpStepMeta],
+    ) -> None:
+        """Join the busy DP peers' verify forward with a dummy one.
+
+        Under DP attention the target verify forward contains MLP TP
+        collectives; an idle rank that skips it deadlocks the busy ranks.
+        The dummy's results are discarded. State isolation: all dummy rows
+        point at req_pool row 0 (the pool's reserved padding row) and KV slot
+        0, and the mamba verify-commit hook never runs here, so no real
+        request state is touched. Mirrors DSpark's run_idle_participation.
+        """
+        if self._pp_enabled:
+            # PP + DP attention has no verified idle-participation relay; a
+            # dummy forward without the PP proxy plumbing would hang the ring.
+            if not self._warned_pp_dp_idle:
+                self._warned_pp_dp_idle = True
+                logger.warning(
+                    "DFLASH DP-attention idle participation is not supported "
+                    "under pipeline parallelism; the idle rank skips the verify "
+                    "collective this step (PP+DP+DFLASH is not a supported "
+                    "combination)."
+                )
+            return
+        if dp_step is not None:
+            global_max_bs = dp_step.global_max_bs
+            tier = dp_step.tier
+        else:
+            # Non-D-Cut DP: the scheduler's mlp-sync gather already carries
+            # the per-rank decode batch sizes.
+            global_num_tokens = batch.global_num_tokens
+            global_max_bs = max(global_num_tokens) if global_num_tokens else 0
+            tier = None
+        if global_max_bs <= 0:
+            return
+
+        idle_layout = None
+        if tier is not None:
+            idle_layout = idle_ragged_layout(
+                tier_num_reqs=global_max_bs,
+                dp_tier_num_tokens=tier,
+                device=self.device,
+                verify_num_draft_tokens=int(self.block_size),
+                model_runner=self.model_runner,
+            )
+            # A None layout means the tier/slot count fell outside the
+            # captured grid; the busy ranks fail graph admission the same way
+            # and run eagerly, so the eager dummy below stays aligned.
+        if dp_step is not None and idle_layout is None:
+            # D-Cut eager step (tier overflow / no ragged graphs): the busy
+            # ranks run the verify eagerly, so this dummy must not be admitted
+            # to a bs-keyed graph keyed differently from their eager shape.
+            batch.can_run_dp_cuda_graph = False
+        num_dummy_tokens = (
+            idle_layout.graph_num_tokens if idle_layout is not None else 0
+        )
+        verify_input = DFlashVerifyInput(
+            draft_token=torch.zeros(
+                (num_dummy_tokens,), dtype=torch.int64, device=self.device
+            ),
+            positions=torch.zeros(
+                (num_dummy_tokens,), dtype=torch.int64, device=self.device
+            ),
+            draft_token_num=int(self.block_size),
+            custom_mask=None,
+            capture_hidden_mode=CaptureHiddenMode.FULL,
+            ragged_verify_layout=idle_layout,
+        )
+        batch.out_cache_loc = torch.zeros(
+            (num_dummy_tokens,), dtype=torch.int64, device=self.device
+        )
+        if idle_layout is not None:
+            num_dummy_slots = int(idle_layout.verify_lens.numel())
+            batch.seq_lens = torch.ones(
+                (num_dummy_slots,), dtype=torch.int64, device=self.device
+            )
+            batch.req_pool_indices = torch.zeros(
+                (num_dummy_slots,), dtype=torch.int64, device=self.device
+            )
+            batch.seq_lens_cpu = torch.ones((num_dummy_slots,), dtype=torch.int64)
+            batch.seq_lens_sum = num_dummy_slots
+            batch.forward_mode = ForwardMode.TARGET_VERIFY
+        # The scheduler's idle batch carries multimodal_inputs=None, but
+        # ForwardBatch.init_new -> compute_spec_mrope_positions iterates it.
+        if batch.multimodal_inputs is None:
+            batch.multimodal_inputs = [None] * (
+                int(idle_layout.verify_lens.numel()) if idle_layout is not None else 0
+            )
+        if self._dcut_epilogue is not None and idle_layout is not None:
+            # Arm the graph-folded epilogue with the dummy lens so the replayed
+            # in-graph scatter reads a valid (discarded) distribution.
+            self._dcut_epilogue.begin_step(idle_layout.verify_lens)
+        verify_forward_batch, _ = verify_input.prepare_for_verify(
+            batch, self.target_worker
+        )
+        self.target_worker.forward_batch_generation(
+            batch=None,
+            forward_batch=verify_forward_batch,
+            is_verify=True,
+            skip_attn_backend_init=True,
+        )
 
     def forward_batch_generation(
         self,
@@ -2221,9 +2494,28 @@ class DFlashWorkerV2(BaseSpecWorker):
         grammar_barrier=None,
         pp_proxy_tensors=None,
     ) -> GenerationBatchResult:
+        # DP-attention tier gather: exactly once per scheduler step per rank,
+        # ahead of every branch below (extend / idle / decode).
+        dp_step = self._gather_dcut_dp_step_meta(batch)
         self._validate_phase1_sampling_support(batch)
 
         if batch.forward_mode.is_extend() or batch.is_extend_in_batch:
+            if batch.forward_mode.is_idle():
+                # DP attention: a peer rank is prefilling this step. Join the
+                # target forward's MLP collectives with the plain idle batch
+                # and skip all draft-side work (no KV to inject, no extend
+                # metadata to assert). Mirrors DSpark's idle-prefill handling.
+                if self._draft_dp_context_enabled:
+                    self.target_worker.forward_batch_generation(
+                        batch,
+                        pp_proxy_tensors=pp_proxy_tensors,
+                        capture_hidden_mode=(
+                            CaptureHiddenMode.FULL
+                            if not self._pp_enabled or self._pp_is_last_rank
+                            else CaptureHiddenMode.NULL
+                        ),
+                    )
+                return self._decode_idle_result(on_publish=on_publish)
             # Target prefill: only the last PP rank needs the DFlash aux
             # hidden capture for draft KV materialization; non-last ranks
             # relay upstream without capture.
@@ -2315,23 +2607,11 @@ class DFlashWorkerV2(BaseSpecWorker):
         )
 
         if batch.forward_mode.is_idle():
-            empty_ids = torch.empty((0,), dtype=torch.int64, device=self.device)
-            empty_lens = torch.empty((0,), dtype=torch.int32, device=self.device)
-            next_draft_input = self._make_next_draft_input_decode(
-                bonus_tokens=torch.empty((0,), device=self.device, dtype=torch.int64),
-                new_seq_lens=torch.empty((0,), device=self.device, dtype=torch.int64),
-            )
-            if on_publish is not None:
-                on_publish(next_draft_input.new_seq_lens)
-            return GenerationBatchResult(
-                logits_output=None,
-                next_token_ids=empty_ids,
-                accept_lens=empty_lens,
-                next_draft_input=next_draft_input,
-                can_run_cuda_graph=False,
-                speculative_num_draft_tokens=int(self.block_size),
-                new_seq_lens=next_draft_input.new_seq_lens,
-            )
+            if self._draft_dp_context_enabled:
+                # DP attention: busy peers run their target verify this step;
+                # join its MLP collectives with a dummy verify forward.
+                self._run_idle_verify_participation(batch, dp_step)
+            return self._decode_idle_result(on_publish=on_publish)
 
         # `seq_lens` is carried over from the previous overlap iteration and may have been
         # produced on another stream.
@@ -2363,7 +2643,9 @@ class DFlashWorkerV2(BaseSpecWorker):
         positions = positions_2d.reshape(-1)
         verify_out_cache_loc = verify_out_cache_loc_2d.reshape(-1)
 
-        dcut_plan = self._resolve_dcut_plan(batch=batch, pp_raw=pp_raw)
+        dcut_plan = self._resolve_dcut_plan(
+            batch=batch, pp_raw=pp_raw, dp_step=dp_step
+        )
         dcut_compact = dcut_plan is not None and dcut_plan.is_compact
         dcut_dense_exact = (
             dcut_plan is not None

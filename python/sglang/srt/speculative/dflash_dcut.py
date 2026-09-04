@@ -14,8 +14,12 @@ from sglang.kernels.ops.speculative.dspark.dspark_schedule import (
 from sglang.kernels.ops.speculative.dspark.dspark_verify_window import (
     scatter_compact_to_strided_into,
 )
-from sglang.srt.distributed import get_pp_group, get_tp_group
-from sglang.srt.layers.dp_attention import DpPaddingMode
+from sglang.srt.distributed import get_attn_tp_group, get_pp_group, get_tp_group
+from sglang.srt.layers.dp_attention import (
+    DpPaddingMode,
+    get_attention_dp_size,
+    is_dp_attention_enabled,
+)
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
@@ -230,6 +234,15 @@ class DFlashDcutPlanner:
         self.tp_rank = int(tp_rank)
         self.tp_group = get_tp_group()
         self.pp_group = get_pp_group()
+        self._dp_attention = is_dp_attention_enabled()
+        # Under DP attention each rank owns an independent local batch, so the
+        # auto-candidate decision is coordinated only within the attention-TP
+        # group (size 1 in the pure-DP case, i.e. rank-local). The profiling
+        # collectives below keep the full TP group: profiled ranks run the
+        # same shapes in lockstep and step latency is the group max.
+        self._select_group = (
+            get_attn_tp_group() if self._dp_attention else self.tp_group
+        )
         self.schedule_cfg = DSparkScheduleConfig(
             gamma=self.gamma,
             min_verify_len=1,
@@ -264,6 +277,23 @@ class DFlashDcutPlanner:
             get_dflash_dcut_keep_count(bs=bs, block_size=self.block_size, ratio=ratio)
             for ratio in _AUTO_RATIOS
         )
+
+    def current_keep_budget(self, bs: int) -> int:
+        """Keep-count upper bound for the next decode step at this bs.
+
+        Uses the last selected candidate (or full width if none yet)."""
+        if bs <= 0:
+            return 0
+        if not self.is_auto:
+            return get_dflash_dcut_keep_count(
+                bs=bs,
+                block_size=self.block_size,
+                ratio=float(self.value),
+            )
+        candidate_index = self.last_candidate_index
+        if candidate_index is None:
+            candidate_index = len(_AUTO_RATIOS) - 1
+        return self.candidate_keep_counts(bs)[candidate_index]
 
     def _profile_metric_for_bs(
         self,
@@ -399,9 +429,10 @@ class DFlashDcutPlanner:
         self._auto_index_device.copy_(torch.argmax(scores).to(dtype=torch.int64))
 
     def _select_auto_candidate(self, *, confidence: torch.Tensor, bs: int) -> int:
-        if self.tp_rank == 0:
+        group = self._select_group
+        if group.rank_in_group == 0:
             self._write_auto_index_local(confidence=confidence, bs=bs)
-        self.tp_group.broadcast(self._auto_index_device, src=0)
+        group.broadcast(self._auto_index_device, src=0)
         # CUDA graph replay keys off a host bucket. This is the only hot-path
         # scalar sync on the compact path; the dense path never reaches here.
         return int(self._auto_index_device.item())
@@ -712,6 +743,29 @@ class DFlashDcutPlanner:
             ragged_verify_layout=layout,
         )
 
+        # Mirror ForwardBatch.init_mlp_sync_metadata: under DP attention the
+        # hand-built batch must carry the per-rank token counts the MLP-sync
+        # path (eager prepare_mlp_sync_batch) and graph admission
+        # (can_run_dp_cuda_graph) read. Every DP rank profiles the same
+        # (bs, keep_count) grid in lockstep, so all ranks report
+        # graph_num_tokens and sum/max padding agree cluster-wide.
+        dp_fields: dict = {}
+        if self._dp_attention:
+            dp_size = get_attention_dp_size()
+            global_num_tokens = [graph_num_tokens] * dp_size
+            dp_fields = dict(
+                original_global_num_tokens_cpu=[bs] * dp_size,
+                global_num_tokens_cpu=global_num_tokens,
+                global_num_tokens_gpu=torch.tensor(
+                    global_num_tokens, dtype=torch.int64, device=self.device
+                ),
+                global_num_tokens_for_logprob_cpu=list(global_num_tokens),
+                global_num_tokens_for_logprob_gpu=torch.tensor(
+                    global_num_tokens, dtype=torch.int64, device=self.device
+                ),
+                can_run_dp_cuda_graph=True,
+            )
+
         return ForwardBatch(
             forward_mode=ForwardMode.TARGET_VERIFY,
             batch_size=bs,
@@ -732,6 +786,7 @@ class DFlashDcutPlanner:
             num_token_non_padded=torch.tensor(
                 graph_num_tokens, dtype=torch.int64, device=self.device
             ),
+            **dp_fields,
         )
 
     def _profile_dcut_cost_ms(self, *, bs: int, keep_count: int) -> tuple[float, float]:
@@ -917,7 +972,18 @@ class DFlashDcutPlanner:
         *,
         confidence: torch.Tensor,
         force_full: bool = False,
+        budget_cap: Optional[int] = None,
+        graph_num_tokens_floor: Optional[int] = None,
     ) -> DFlashDcutPlan:
+        """Plan one decode step's D-Cut layout.
+
+        ``budget_cap`` clamps the selected keep count (force_full is exempt);
+        the DP-attention caller passes the budget it published in the
+        cross-rank tier gather so the realized layout never exceeds it.
+        ``graph_num_tokens_floor`` raises the layout's graph token count to the
+        caller's DP-aligned tier so every rank selects the same graph key.
+        Both default to the pre-DP behavior.
+        """
         if confidence.ndim != 2 or confidence.shape[1] != self.gamma:
             raise ValueError(
                 "DFLASH D-Cut confidence must have shape [bs, block_size - 1], "
@@ -948,6 +1014,8 @@ class DFlashDcutPlanner:
             block_size=self.block_size,
             graph_num_tokens=graph_num_tokens,
         )
+        if budget_cap is not None and not force_full:
+            keep_count = min(keep_count, budget_cap)
         self.last_candidate_index = candidate_index
         if keep_count >= full_keep_count:
             return self.full_plan(bs=bs)
@@ -957,6 +1025,10 @@ class DFlashDcutPlanner:
             budget=keep_count,
             cfg=self.schedule_cfg,
         ).to(device=self.device, dtype=torch.int32)
+        total_verify_tokens = bs + keep_count
+        graph_num_tokens = self._graph_num_tokens(total_verify_tokens)
+        if graph_num_tokens_floor is not None:
+            graph_num_tokens = max(graph_num_tokens, graph_num_tokens_floor)
         layout = RaggedVerifyLayout.from_verify_lens_device(
             verify_lens=verify_lens,
             graph_num_tokens=graph_num_tokens,

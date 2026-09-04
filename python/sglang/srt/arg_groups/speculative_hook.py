@@ -152,10 +152,20 @@ def _handle_dflash(server_args: ServerArgs) -> None:
             "DFLASH speculative decoding only supports CUDA and NPU devices."
         )
 
-    if resolved_view(server_args).enable_dp_attention:
-        raise ValueError(
-            "Currently DFLASH speculative decoding does not support dp attention."
-        )
+    view = resolved_view(server_args)
+    if view.enable_dp_attention:
+        if not view.enable_dp_lm_head:
+            raise ValueError(
+                "DFLASH with dp attention requires --enable-dp-lm-head: the "
+                "draft sampler borrows the target lm_head, so without dp "
+                "lm_head the sampler all-gathers per-DP-rank local batches "
+                "of mismatched shapes across the full TP group, which hangs."
+            )
+        if view.attn_cp_size != 1:
+            raise ValueError(
+                "DFLASH with dp attention does not support context parallel "
+                f"yet (attn_cp_size={view.attn_cp_size})."
+            )
 
     if server_args.speculative_draft_model_path is None:
         raise ValueError(

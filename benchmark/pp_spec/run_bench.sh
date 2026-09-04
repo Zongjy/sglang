@@ -15,15 +15,8 @@ RAGGED_VERIFY_MODE=static
 MAX_TOKENS=1024
 PROMPT_MAX_TOKENS=2000
 DFLASH_BLOCK_SIZE=16
-# Pin the target attention backend for every topology in this sweep.  The
-# DFLASH draft runner has its own backend selector and remains on FlashInfer
-# until a separate draft-backend comparison is requested.
 TARGET_ATTENTION_BACKEND=${TARGET_ATTENTION_BACKEND:-triton}
 DRAFT_ATTENTION_BACKEND=${DRAFT_ATTENTION_BACKEND:-flashinfer}
-
-# PP requires non-overlap; default to the same schedule for TP so topology
-# comparisons do not grant TP an extra overlap advantage. Set to 0 only for a
-# separate TP-only throughput run.
 DISABLE_OVERLAP_SCHEDULE=${DISABLE_OVERLAP_SCHEDULE:-1}
 STARTUP_TIMEOUT=600
 REQUEST_TIMEOUT_S=1800
@@ -126,11 +119,23 @@ run_config() {
 
   cuda_graph_bs=$((active_bs / batch_divisor))
   # cuda_graph_bs=$((cuda_graph_bs < 32 ? cuda_graph_bs : 32))
-  if ((dp_size > 1)); then
-    max_running_requests=$cuda_graph_bs
-  fi
+  # max_running_requests is the global admission cap. The runtime derives the
+  # per-DP worker capacity from this value, so keep it equal to the benchmark
+  # concurrency for every topology. Only the local graph/micro-batch size is
+  # divided by DP or PP above.
 
   mkdir -p "$output_dir"
+
+  # Stale-server guard: if anything already answers on the port, the new
+  # server would fail at startup (OOM/port conflict) while wait_for_server
+  # passes against the stale one — silently benchmarking the wrong engine
+  # (a leaked max_running=8 server once flat-lined a whole sweep at ~500 tok/s).
+  if curl -fsS --max-time 2 "$BASE_URL/model_info" >/dev/null 2>&1; then
+    echo "[$name][$load_point] port $PORT is already serving; refusing to start. Kill the stale server first." >&2
+    record_failure "$output_dir" "precheck" 1
+    return 0
+  fi
+
   server_args=(
     serve
     --model-path "$MODEL"
@@ -152,7 +157,6 @@ run_config() {
     --cuda-graph-max-bs-decode "$cuda_graph_bs"
     --mem-fraction-static "$MEM_FRACTION_STATIC"
     --page-size 1
-    --language-model-only
     --random-seed 1
     --disable-radix-cache
     --trust-remote-code
@@ -187,14 +191,21 @@ run_config() {
     setsid sglang "${server_args[@]}" >"$output_dir/server.log" 2>&1 &
   SERVER_PID=$!
   if wait_for_server "$output_dir/server.log"; then
-    :
+    # Identity check: make sure the answering server is the one we launched.
+    actual_max_running=$(curl -fsS --max-time 5 "$BASE_URL/get_server_info" 2>/dev/null \
+      | python3 -c "import json,sys; print(json.load(sys.stdin).get('max_running_requests') or '')" 2>/dev/null || true)
+    if [[ -z $actual_max_running || $actual_max_running != "$max_running_requests" ]]; then
+      echo "[$name][$load_point] server identity mismatch: expected max_running=$max_running_requests, got '${actual_max_running:-unknown}'." >&2
+      cleanup
+      record_failure "$output_dir" "server identity" 1
+      return 0
+    fi
   else
     status=$?
     cleanup
     record_failure "$output_dir" "server startup" "$status"
     return 0
   fi
-
   HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 \
   python "$SCRIPT_DIR/bench_spectre.py" \
     --url "$BASE_URL" \
@@ -241,47 +252,6 @@ summarize_run() {
 
 cd "$REPO_ROOT"
 
-# # ===== Qwen3.5-9B (32 layers; uniform 16,16 / auto 20,12) =====
-# MODEL=Qwen/Qwen3.5-9B
-# DRAFT_MODEL=z-lab/Qwen3.5-9B-DFlash
-# MEM_FRACTION_STATIC=0.75
-# OUTPUT_ROOT=$SCRIPT_DIR/results/Qwen_Qwen3.5-9B_$(date -u +%Y%m%d_%H%M%S)
-# mkdir -p "$OUTPUT_ROOT"
-# echo "Results: $OUTPUT_ROOT"
-
-# # run_config name <tp size> <pp_size> <dp_size> <load_point:并发:QPS:请求数> <active_bs:全局并发> <num_requests:总请求数> <point_tag:结果目录后缀c{C}_qps{Q}_n{N}>
-# run_config tp2 2 1 1 "" 8:2:32 8 32 c8_qps2_n32
-# run_config dp2 1 1 2 "" 8:2:32 8 32 c8_qps2_n32
-# run_config pp2_uniform 1 2 1 16,16 8:2:32 8 32 c8_qps2_n32
-# run_config pp2_auto 1 2 1 20,12 8:2:32 8 32 c8_qps2_n32
-
-# run_config tp2 2 1 1 "" 16:4:64 16 64 c16_qps4_n64
-# run_config dp2 1 1 2 "" 16:4:64 16 64 c16_qps4_n64
-# run_config pp2_uniform 1 2 1 16,16 16:4:64 16 64 c16_qps4_n64
-# run_config pp2_auto 1 2 1 20,12 16:4:64 16 64 c16_qps4_n64
-
-# run_config tp2 2 1 1 "" 32:8:128 32 128 c32_qps8_n128
-# run_config dp2 1 1 2 "" 32:8:128 32 128 c32_qps8_n128
-# run_config pp2_uniform 1 2 1 16,16 32:8:128 32 128 c32_qps8_n128
-# run_config pp2_auto 1 2 1 20,12 32:8:128 32 128 c32_qps8_n128
-
-# run_config tp2 2 1 1 "" 64:16:256 64 256 c64_qps16_n256
-# run_config dp2 1 1 2 "" 64:16:256 64 256 c64_qps16_n256
-# run_config pp2_uniform 1 2 1 16,16 64:16:256 64 256 c64_qps16_n256
-# run_config pp2_auto 1 2 1 20,12 64:16:256 64 256 c64_qps16_n256
-
-# run_config tp2 2 1 1 "" 96:24:384 96 384 c96_qps24_n384
-# run_config dp2 1 1 2 "" 96:24:384 96 384 c96_qps24_n384
-# run_config pp2_uniform 1 2 1 16,16 96:24:384 96 384 c96_qps24_n384
-# run_config pp2_auto 1 2 1 20,12 96:24:384 96 384 c96_qps24_n384
-
-# run_config tp2 2 1 1 "" 128:32:512 128 512 c128_qps32_n512
-# run_config dp2 1 1 2 "" 128:32:512 128 512 c128_qps32_n512
-# run_config pp2_uniform 1 2 1 16,16 128:32:512 128 512 c128_qps32_n512
-# run_config pp2_auto 1 2 1 20,12 128:32:512 128 512 c128_qps32_n512
-
-# summarize_run "$OUTPUT_ROOT"
-
 # ===== Qwen3.5-27B-FP8 (64 layers; uniform 32,32 / auto 38,26) =====
 MODEL=Qwen/Qwen3.5-27B-FP8
 DRAFT_MODEL=z-lab/qwen3.5-27b-dflash
@@ -291,50 +261,49 @@ mkdir -p "$OUTPUT_ROOT"
 echo "Results: $OUTPUT_ROOT"
 
 # run_config <name:结果子目录> <tp> <pp> <dp> <partition:PP分层,空=非PP> <load_point:并发:QPS:请求数> <active_bs:全局并发> <num_requests:总请求数> <point_tag:结果目录后缀c{C}_qps{Q}_n{N}>
-# run_config dp2 1 1 2 "" 8:2:32 8 32 c8_qps2_n32
 # run_config pp2_uniform 1 2 1 32,32 8:2:32 8 32 c8_qps2_n32
-# run_config tp2 2 1 1 "" 8:2:32 8 32 c8_qps2_n32 --speculative-dflash-dcut 0
-# run_config tp2_dcut_auto 2 1 1 "" 8:2:32 8 32 c8_qps2_n32 --speculative-dflash-dcut auto
-# run_config tp2_dpattn 2 1 2 "" 8:2:32 8 32 c8_qps2_n32 --speculative-dflash-dcut 0 --enable-dp-attention
+run_config tp2 2 1 1 "" 8:2:32 8 32 c8_qps2_n32 --speculative-dflash-dcut 0
+run_config tp2_dcut_auto 2 1 1 "" 8:2:32 8 32 c8_qps2_n32 --speculative-dflash-dcut auto
+run_config tp2dp_dcut 2 1 2 "" 8:2:32 8 32 c8_qps2_n32 --enable-dp-attention --enable-dp-lm-head --speculative-dflash-dcut auto
+run_config tp2dp 2 1 2 "" 8:2:32 8 32 c8_qps2_n32 --enable-dp-attention --enable-dp-lm-head --speculative-dflash-dcut 0
 run_config pp2_auto 1 2 1 38,26 8:2:32 8 32 c8_qps2_n32 --speculative-dflash-dcut 0
 run_config pp2_auto_dcut_auto 1 2 1 38,26 8:2:32 8 32 c8_qps2_n32 --speculative-dflash-dcut auto
 
-# run_config dp2 1 1 2 "" 16:4:64 16 64 c16_qps4_n64
 # run_config pp2_uniform 1 2 1 32,32 16:4:64 16 64 c16_qps4_n64
-# run_config tp2 2 1 1 "" 16:4:64 16 64 c16_qps4_n64 --speculative-dflash-dcut 0
-# run_config tp2_dcut_auto 2 1 1 "" 16:4:64 16 64 c16_qps4_n64 --speculative-dflash-dcut auto
-# run_config tp2_dpattn 2 1 2 "" 16:4:64 16 64 c16_qps4_n64 --speculative-dflash-dcut 0 --enable-dp-attention
+run_config tp2 2 1 1 "" 16:4:64 16 64 c16_qps4_n64 --speculative-dflash-dcut 0
+run_config tp2_dcut_auto 2 1 1 "" 16:4:64 16 64 c16_qps4_n64 --speculative-dflash-dcut auto
+run_config tp2dp_dcut 2 1 2 "" 16:4:64 16 64 c16_qps4_n64 --enable-dp-attention --enable-dp-lm-head --speculative-dflash-dcut auto
+run_config tp2dp 2 1 2 "" 16:4:64 16 64 c16_qps4_n64 --enable-dp-attention --enable-dp-lm-head --speculative-dflash-dcut 0
 run_config pp2_auto 1 2 1 38,26 16:4:64 16 64 c16_qps4_n64 --speculative-dflash-dcut 0
 run_config pp2_auto_dcut_auto 1 2 1 38,26 16:4:64 16 64 c16_qps4_n64 --speculative-dflash-dcut auto
 
-# run_config dp2 1 1 2 "" 32:8:128 32 128 c32_qps8_n128
 # run_config pp2_uniform 1 2 1 32,32 32:8:128 32 128 c32_qps8_n128
-# run_config tp2 2 1 1 "" 32:8:128 32 128 c32_qps8_n128 --speculative-dflash-dcut 0
-# run_config tp2_dcut_auto 2 1 1 "" 32:8:128 32 128 c32_qps8_n128 --speculative-dflash-dcut auto
-# run_config tp2_dpattn 2 1 2 "" 32:8:128 32 128 c32_qps8_n128 --speculative-dflash-dcut 0 --enable-dp-attention
+run_config tp2 2 1 1 "" 32:8:128 32 128 c32_qps8_n128 --speculative-dflash-dcut 0
+run_config tp2_dcut_auto 2 1 1 "" 32:8:128 32 128 c32_qps8_n128 --speculative-dflash-dcut auto
+run_config tp2dp_dcut 2 1 2 "" 32:8:128 32 128 c32_qps8_n128 --enable-dp-attention --enable-dp-lm-head --speculative-dflash-dcut auto
+run_config tp2dp 2 1 2 "" 32:8:128 32 128 c32_qps8_n128 --enable-dp-attention --enable-dp-lm-head --speculative-dflash-dcut 0
 run_config pp2_auto 1 2 1 38,26 32:8:128 32 128 c32_qps8_n128 --speculative-dflash-dcut 0
 run_config pp2_auto_dcut_auto 1 2 1 38,26 32:8:128 32 128 c32_qps8_n128 --speculative-dflash-dcut auto
 
-# run_config dp2 1 1 2 "" 64:16:256 64 256 c64_qps16_n256
 # run_config pp2_uniform 1 2 1 32,32 64:16:256 64 256 c64_qps16_n256
-# run_config tp2 2 1 1 "" 64:16:256 64 256 c64_qps16_n256 --speculative-dflash-dcut 0
-# run_config tp2_dcut_auto 2 1 1 "" 64:16:256 64 256 c64_qps16_n256 --speculative-dflash-dcut auto
-# run_config tp2_dpattn 2 1 2 "" 64:16:256 64 256 c64_qps16_n256 --speculative-dflash-dcut 0 --enable-dp-attention
+run_config tp2 2 1 1 "" 64:16:256 64 256 c64_qps16_n256 --speculative-dflash-dcut 0
+run_config tp2_dcut_auto 2 1 1 "" 64:16:256 64 256 c64_qps16_n256 --speculative-dflash-dcut auto
+run_config tp2dp_dcut 2 1 2 "" 64:16:256 64 256 c64_qps16_n256 --enable-dp-attention --enable-dp-lm-head --speculative-dflash-dcut auto
+run_config tp2dp 2 1 2 "" 64:16:256 64 256 c64_qps16_n256 --enable-dp-attention --enable-dp-lm-head --speculative-dflash-dcut 0
 run_config pp2_auto 1 2 1 38,26 64:16:256 64 256 c64_qps16_n256 --speculative-dflash-dcut 0
 run_config pp2_auto_dcut_auto 1 2 1 38,26 64:16:256 64 256 c64_qps16_n256 --speculative-dflash-dcut auto
 
-# run_config dp2 1 1 2 "" 96:24:384 96 384 c96_qps24_n384
 # run_config pp2_uniform 1 2 1 32,32 96:24:384 96 384 c96_qps24_n384
 # run_config tp2 2 1 1 "" 96:24:384 96 384 c96_qps24_n384 --speculative-dflash-dcut 0
 # run_config tp2_dcut_auto 2 1 1 "" 96:24:384 96 384 c96_qps24_n384 --speculative-dflash-dcut auto
 # run_config tp2_dpattn 2 1 2 "" 96:24:384 96 384 c96_qps24_n384 --speculative-dflash-dcut 0 --enable-dp-attention
 # run_config pp2_auto 1 2 1 38,26 96:24:384 96 384 c96_qps24_n384 --speculative-dflash-dcut 0
 
-# run_config dp2 1 1 2 "" 128:32:512 128 512 c128_qps32_n512
 # run_config pp2_uniform 1 2 1 32,32 128:32:512 128 512 c128_qps32_n512
-# run_config tp2 2 1 1 "" 128:32:512 128 512 c128_qps32_n512 --speculative-dflash-dcut 0
-# run_config tp2_dcut_auto 2 1 1 "" 128:32:512 128 512 c128_qps32_n512 --speculative-dflash-dcut auto
-# run_config tp2_dpattn 2 1 2 "" 128:32:512 128 512 c128_qps32_n512 --speculative-dflash-dcut 0 --enable-dp-attention
+run_config tp2 2 1 1 "" 128:32:512 128 512 c128_qps32_n512 --speculative-dflash-dcut 0
+run_config tp2_dcut_auto 2 1 1 "" 128:32:512 128 512 c128_qps32_n512 --speculative-dflash-dcut auto
+run_config tp2dp_dcut 2 1 2 "" 128:32:512 128 512 c128_qps32_n512 --enable-dp-attention --enable-dp-lm-head --speculative-dflash-dcut auto
+run_config tp2dp 2 1 2 "" 128:32:512 128 512 c128_qps32_n512 --enable-dp-attention --enable-dp-lm-head --speculative-dflash-dcut 0
 run_config pp2_auto 1 2 1 38,26 128:32:512 128 512 c128_qps32_n512 --speculative-dflash-dcut 0
 run_config pp2_auto_dcut_auto 1 2 1 38,26 128:32:512 128 512 c128_qps32_n512 --speculative-dflash-dcut auto
 
