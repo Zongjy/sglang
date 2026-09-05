@@ -110,6 +110,22 @@ class TestScoreDcutCandidates(CustomTestCase):
                 expected=torch.ones(3), costs=torch.ones(4)
             )
 
+    def test_switch_penalty_stabilizes_near_tie(self):
+        scores = score_dcut_candidates(
+            expected=torch.tensor([10.0, 10.05]),
+            costs=torch.tensor([10.0, 9.95]),
+            min_relative_save=0.0,
+            previous_index=0,
+            switch_penalty=0.02,
+        )
+        self.assertEqual(int(torch.argmax(scores).item()), 0)
+
+    def test_invalid_switch_index_raises(self):
+        with self.assertRaises(ValueError):
+            score_dcut_candidates(
+                expected=torch.ones(2), costs=torch.ones(2), previous_index=2
+            )
+
 
 class TestDcutRelayPlan(CustomTestCase):
     @staticmethod

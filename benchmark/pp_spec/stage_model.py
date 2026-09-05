@@ -58,7 +58,7 @@ class StageCostModel:
         baseline_partition: Sequence[int],
         layout: LayerLayout | None = None,
     ) -> StageCostModel:
-        """Build a strict single-bucket model from adaptive profiler output."""
+        """Build a stage model from one or more profiled buckets."""
 
         partition = tuple(int(value) for value in baseline_partition)
         if pp_size <= 0 or num_layers <= 0:
@@ -71,47 +71,45 @@ class StageCostModel:
             raise StageModelError(
                 "layout and offline profile have different layer counts"
             )
-        if len(profiles) != 1:
-            raise StageModelError(
-                f"offline stage model requires exactly one bucket, got {len(profiles)}"
-            )
+        if not profiles:
+            raise StageModelError("offline stage model needs at least one bucket")
+        estimates: dict[int, BucketEstimate] = {}
+        for raw_bucket, raw in profiles.items():
+            if not isinstance(raw, Mapping):
+                raise StageModelError("offline bucket profile must be a mapping")
+            bucket = _positive_integer(raw_bucket, "profile bucket")
+            missing = sorted(cls._REQUIRED_PROFILE_FIELDS - set(raw))
+            unknown = sorted(set(raw) - cls._REQUIRED_PROFILE_FIELDS)
+            if missing:
+                raise StageModelError(
+                    f"profile bucket {bucket} is missing required fields {missing}"
+                )
+            if unknown:
+                raise StageModelError(
+                    f"profile bucket {bucket} has unsupported fields {unknown}"
+                )
 
-        raw_bucket, raw = next(iter(profiles.items()))
-        if not isinstance(raw, Mapping):
-            raise StageModelError("offline bucket profile must be a mapping")
-        bucket = _positive_integer(raw_bucket, "profile bucket")
-        missing = sorted(cls._REQUIRED_PROFILE_FIELDS - set(raw))
-        unknown = sorted(set(raw) - cls._REQUIRED_PROFILE_FIELDS)
-        if missing:
-            raise StageModelError(
-                f"profile bucket {bucket} is missing required fields {missing}"
-            )
-        if unknown:
-            raise StageModelError(
-                f"profile bucket {bucket} has unsupported fields {unknown}"
-            )
+            fixed = _float_tuple(raw["fixed_ms"], "fixed_ms", pp_size)
+            if any(value < 0.0 for value in fixed):
+                raise StageModelError("fixed_ms values must be non-negative")
 
-        fixed = _float_tuple(raw["fixed_ms"], "fixed_ms", pp_size)
-        if any(value < 0.0 for value in fixed):
-            raise StageModelError("fixed_ms values must be non-negative")
-
-        layer_cost = _finite_float(raw["layer_cost_ms"], "layer_cost_ms")
-        gdn_cost = _finite_float(raw["gdn_cost_ms"], "gdn_cost_ms")
-        full_cost = _finite_float(raw["full_cost_ms"], "full_cost_ms")
-        if layer_cost <= 0.0 or gdn_cost <= 0.0 or full_cost <= 0.0:
-            raise StageModelError("all target-layer costs must be positive")
-        estimate = BucketEstimate(
-            bucket=bucket,
-            layer_cost_ms=layer_cost,
-            fixed_ms=fixed,
-            gdn_cost_ms=gdn_cost,
-            full_cost_ms=full_cost,
-        )
+            layer_cost = _finite_float(raw["layer_cost_ms"], "layer_cost_ms")
+            gdn_cost = _finite_float(raw["gdn_cost_ms"], "gdn_cost_ms")
+            full_cost = _finite_float(raw["full_cost_ms"], "full_cost_ms")
+            if layer_cost <= 0.0 or gdn_cost <= 0.0 or full_cost <= 0.0:
+                raise StageModelError("all target-layer costs must be positive")
+            estimates[bucket] = BucketEstimate(
+                bucket=bucket,
+                layer_cost_ms=layer_cost,
+                fixed_ms=fixed,
+                gdn_cost_ms=gdn_cost,
+                full_cost_ms=full_cost,
+            )
         return cls(
             num_layers=num_layers,
             pp_size=pp_size,
             baseline_partition=partition,
-            buckets={bucket: estimate},
+            buckets=estimates,
             layout=layout,
         )
 

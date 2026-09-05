@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
-"""Profile and analyze DFlash PP layer boundaries with SGLang RayEngine.
+"""Profile and analyze DFlash PP layer boundaries with SGLang Engine/RayEngine.
 
-The script intentionally does not launch remote nodes.  A Ray cluster owns
-placement and process lifecycle; SGLang's offline benchmark owns workload and
-Torch-profiler capture.  This file only builds a reproducible profile command
-and turns the resulting per-rank Chrome traces into a small PP boundary model.
+For multi-node runs, a Ray cluster owns placement and process lifecycle.  For a
+single-node run, the regular Engine launches PP workers directly.  SGLang's
+offline benchmark owns workload and Torch-profiler capture; this file builds a
+reproducible profile command and analyzes the resulting per-rank traces.
 
 Typical workflow::
 
@@ -167,7 +167,6 @@ def build_profile_command(args: argparse.Namespace, profile_dir: Path) -> list[s
         "sglang.benchmark.offline_throughput",
         "--backend",
         "engine",
-        "--use-ray",
         "--nnodes",
         str(args.nnodes),
         "--model-path",
@@ -217,6 +216,10 @@ def build_profile_command(args: argparse.Namespace, profile_dir: Path) -> list[s
         "--result-filename",
         str(profile_dir / "benchmark.jsonl"),
     ]
+    # Ray is required for multi-node placement.  On a single node the regular
+    # Engine launches the PP workers directly and avoids an extra actor layer.
+    if args.nnodes > 1:
+        command.append("--use-ray")
     if args.trust_remote_code:
         command.append("--trust-remote-code")
     extra = list(args.server_args or ())
@@ -246,7 +249,7 @@ def build_profile_command(args: argparse.Namespace, profile_dir: Path) -> list[s
 
 
 def run_profile(args: argparse.Namespace) -> Path:
-    if importlib.util.find_spec("ray") is None:
+    if args.nnodes > 1 and importlib.util.find_spec("ray") is None:
         raise TuningError(
             "Ray is required; install it with `pip install 'sglang[ray]'`"
         )
@@ -315,6 +318,69 @@ def _load_profile(profile_dir: Path) -> dict[str, Any]:
     return profile
 
 
+def _load_dcut_profiles(path: Path, pp_size: int) -> dict[float, Any]:
+    """Read a ratio -> cost map used by the joint PP/D-Cut optimizer."""
+    try:
+        raw = json.loads(path.read_text())
+    except (OSError, json.JSONDecodeError) as exc:
+        raise TuningError(f"cannot read D-Cut profile {path}: {exc}") from exc
+    if not isinstance(raw, Mapping):
+        raise TuningError("D-Cut profile must be a JSON object mapping ratio to cost")
+    profiles: dict[float, Any] = {}
+    for ratio, value in raw.items():
+        try:
+            key = float(ratio)
+        except (TypeError, ValueError) as exc:
+            raise TuningError(f"invalid D-Cut ratio {ratio!r}") from exc
+        if isinstance(value, list) and len(value) != pp_size:
+            raise TuningError(
+                f"D-Cut stage cost for ratio {key:g} needs {pp_size} values"
+            )
+        profiles[key] = value
+    return profiles
+
+
+def _load_dcut_profiles_by_bucket(
+    path: Path, buckets: Sequence[int], pp_size: int
+) -> dict[int, dict[float, Any]]:
+    """Load ratio costs either as one shared map or as bucket-keyed maps."""
+    try:
+        raw = json.loads(path.read_text())
+    except (OSError, json.JSONDecodeError) as exc:
+        raise TuningError(f"cannot read D-Cut profile {path}: {exc}") from exc
+    if not isinstance(raw, Mapping):
+        raise TuningError("D-Cut profile must be a JSON object")
+    nested = all(isinstance(value, Mapping) for value in raw.values())
+    if nested:
+        result: dict[int, dict[float, Any]] = {}
+        for bucket in buckets:
+            value = raw.get(str(bucket), raw.get(bucket))
+            if value is None:
+                raise TuningError(f"D-Cut profile is missing bucket {bucket}")
+            result[bucket] = _parse_dcut_profile_mapping(value, pp_size, bucket)
+        return result
+    shared = _parse_dcut_profile_mapping(raw, pp_size, None)
+    return {int(bucket): shared for bucket in buckets}
+
+
+def _parse_dcut_profile_mapping(
+    raw: Mapping[Any, Any], pp_size: int, bucket: int | None
+) -> dict[float, Any]:
+    profiles: dict[float, Any] = {}
+    for ratio, value in raw.items():
+        try:
+            key = float(ratio)
+        except (TypeError, ValueError) as exc:
+            label = f" for bucket {bucket}" if bucket is not None else ""
+            raise TuningError(f"invalid D-Cut ratio {ratio!r}{label}") from exc
+        if isinstance(value, list) and len(value) != pp_size:
+            raise TuningError(
+                f"D-Cut stage cost for ratio {key:g} needs {pp_size} values"
+            )
+        profiles[key] = value
+    return profiles
+
+
 def _typed_layer_costs(
     layout: Any,
     partition: Sequence[int],
@@ -373,6 +439,103 @@ def _target_observation(summary: Mapping[str, Any]) -> list[float]:
     return target
 
 
+def _run_multi_bucket_analysis(args: argparse.Namespace, profile_dirs: Sequence[Path]) -> Path:
+    """Analyze several execution buckets and select one robust partition."""
+    sys.path.insert(0, str(SCRIPT_DIR))
+    import partition_optimizer
+    import stage_model
+    import torch_trace_profile
+    from model_layout import LayerLayout
+
+    if args.dcut_profile is None:
+        raise TuningError("--dcut-profile is required when --profile-dir is repeated")
+    first_profile = _load_profile(profile_dirs[0])
+    pp_size = int(first_profile["pp_size"])
+    tp_size = int(first_profile["tp_size"])
+    baseline = tuple(int(value) for value in first_profile["baseline_partition"])
+    model_path = str(first_profile["model_path"])
+    try:
+        layout = LayerLayout.from_model_path(model_path, local_files_only=True)
+    except Exception as exc:
+        raise TuningError(f"cannot load model layer layout: {exc}") from exc
+
+    bucket_profiles: dict[int, dict[str, Any]] = {}
+    for profile_dir in profile_dirs:
+        profile = _load_profile(profile_dir)
+        if int(profile["pp_size"]) != pp_size or int(profile["tp_size"]) != tp_size:
+            raise TuningError("all profiles must use the same PP and TP sizes")
+        partition = tuple(int(value) for value in profile["baseline_partition"])
+        if partition != baseline:
+            raise TuningError("all profiles must use the same baseline partition")
+        bucket = int(profile["execution_bucket"])
+        if bucket in bucket_profiles:
+            raise TuningError(f"duplicate execution bucket {bucket}")
+        try:
+            summary = torch_trace_profile.summarize_trace_dir(
+                profile_dir,
+                pp_size=pp_size,
+                tp_size=tp_size,
+                trim_samples=args.trim_samples,
+            )
+        except torch_trace_profile.TraceProfileError as exc:
+            raise TuningError(str(exc)) from exc
+        bucket_profiles[bucket] = _bucket_profile(
+            summary, partition, layout, typed_costs=_typed_layer_costs(
+                layout, partition, _target_observation(summary)
+            )
+        )
+
+    try:
+        model = stage_model.StageCostModel.from_bucket_profiles(
+            bucket_profiles,
+            num_layers=sum(baseline),
+            pp_size=pp_size,
+            baseline_partition=baseline,
+            layout=layout,
+        )
+    except stage_model.StageModelError as exc:
+        raise TuningError(str(exc)) from exc
+    max_layers = parse_int_list(args.max_layers_per_rank, "--max-layers-per-rank")
+    stage_comm_ms = parse_float_list(args.stage_comm_ms, "--stage-comm-ms")
+    if stage_comm_ms is not None and len(stage_comm_ms) not in (pp_size - 1, pp_size):
+        raise TuningError("--stage-comm-ms needs PP or PP-1 values")
+    prefix_range = None
+    if args.boundary_radius is not None and not args.all_boundaries:
+        prefix_range = (
+            max(1, baseline[0] - args.boundary_radius),
+            baseline[0] + args.boundary_radius,
+        )
+    dcut = _load_dcut_profiles_by_bucket(
+        args.dcut_profile, tuple(bucket_profiles), pp_size
+    )
+    try:
+        result = partition_optimizer.optimize_partition_across_buckets(
+            model,
+            dcut,
+            min_layers=args.min_layers,
+            max_layers=max_layers,
+            k_best=args.k_best,
+            layout=layout,
+            prefix_l_range=prefix_range,
+            stage_comm_ms=stage_comm_ms,
+            all_boundaries=args.all_boundaries,
+        )
+    except (partition_optimizer.OptimizerError, stage_model.StageModelError) as exc:
+        raise TuningError(str(exc)) from exc
+    output_dir = (args.output_dir or (profile_dirs[0] / "analysis_multi")).resolve()
+    output_dir.mkdir(parents=True, exist_ok=True)
+    write_json(output_dir / "analysis.json", result.to_dict())
+    (output_dir / "analysis.txt").write_text(result.to_report() + "\n")
+    (output_dir / "recommended.args").write_text(
+        "--pp-layer-partition "
+        + ",".join(map(str, result.selected.partition))
+        + " --speculative-dflash-dcut auto\n"
+    )
+    print(result.to_report(), flush=True)
+    print(f"[analyze] artifacts written to {output_dir}", flush=True)
+    return output_dir
+
+
 def _bucket_profile(
     summary: Mapping[str, Any],
     partition: Sequence[int],
@@ -413,7 +576,13 @@ def run_analysis(args: argparse.Namespace) -> Path:
     import torch_trace_profile
     from model_layout import LayerLayout
 
-    profile_dir = args.profile_dir.resolve()
+    profile_dirs = args.profile_dir
+    if not isinstance(profile_dirs, list):
+        profile_dirs = [profile_dirs]
+    profile_dirs = [Path(path).resolve() for path in profile_dirs]
+    if len(profile_dirs) > 1:
+        return _run_multi_bucket_analysis(args, profile_dirs)
+    profile_dir = profile_dirs[0]
     if args.trim_samples < 0:
         raise TuningError("--trim-samples cannot be negative")
     profile = _load_profile(profile_dir)
@@ -426,12 +595,6 @@ def run_analysis(args: argparse.Namespace) -> Path:
     if len(partition) != pp_size or any(value <= 0 for value in partition):
         raise TuningError("baseline profile partition does not match pp_size")
     model_path = str(profile["model_path"])
-    if len(set(partition[:-1])) > 1:
-        raise TuningError(
-            "the thin optimizer currently searches (l,...,l,residual); the first "
-            "PP stages in the baseline partition must have the same layer count"
-        )
-
     try:
         layout = LayerLayout.from_model_path(model_path, local_files_only=True)
     except Exception as exc:
@@ -483,7 +646,7 @@ def run_analysis(args: argparse.Namespace) -> Path:
     ):
         raise TuningError("--stage-comm-ms needs PP or PP-1 values")
     prefix_range = None
-    if args.boundary_radius is not None:
+    if args.boundary_radius is not None and not args.all_boundaries:
         if args.boundary_radius < 0:
             raise TuningError("--boundary-radius cannot be negative")
         center = partition[0]
@@ -492,8 +655,7 @@ def run_analysis(args: argparse.Namespace) -> Path:
             center + args.boundary_radius,
         )
     try:
-        result = partition_optimizer.optimize(
-            model,
+        common_kwargs = dict(
             target_bs=bucket,
             min_layers=args.min_layers,
             max_layers=max_layers,
@@ -501,7 +663,18 @@ def run_analysis(args: argparse.Namespace) -> Path:
             layout=layout,
             prefix_l_range=prefix_range,
             stage_comm_ms=stage_comm_ms,
+            all_boundaries=args.all_boundaries,
         )
+        if args.dcut_profile is None:
+            result = partition_optimizer.optimize(model, **common_kwargs)
+        else:
+            dcut_profiles = _load_dcut_profiles(args.dcut_profile, pp_size)
+            # Runtime D-Cut is adaptive.  Pick a static PP layout that stays
+            # balanced across the complete ratio envelope instead of tuning
+            # the layout to one ratio that may not be selected next step.
+            result = partition_optimizer.optimize_partition_across_ratios(
+                model, dcut_profiles, **common_kwargs
+            )
     except (partition_optimizer.OptimizerError, stage_model.StageModelError) as exc:
         raise TuningError(str(exc)) from exc
     output_dir = (args.output_dir or (profile_dir / "analysis")).resolve()
@@ -510,9 +683,13 @@ def run_analysis(args: argparse.Namespace) -> Path:
     report = result.to_report()
     (output_dir / "analysis.txt").write_text(report + "\n")
     selected = result.selected.partition
-    (output_dir / "recommended.args").write_text(
-        "--pp-layer-partition " + ",".join(map(str, selected)) + "\n"
-    )
+    recommended = "--pp-layer-partition " + ",".join(map(str, selected))
+    if hasattr(result.selected, "dcut_ratio"):
+        if result.selected.dcut_ratio != 1.0:
+            recommended += f" --speculative-dflash-dcut {result.selected.dcut_ratio:g}"
+    elif args.dcut_profile is not None:
+        recommended += " --speculative-dflash-dcut auto"
+    (output_dir / "recommended.args").write_text(recommended + "\n")
     print(report, flush=True)
     print(f"[analyze] artifacts written to {output_dir}", flush=True)
     return output_dir
@@ -569,7 +746,13 @@ def build_parser() -> argparse.ArgumentParser:
     )
 
     analyze = subparsers.add_parser("analyze", help="analyze existing traces")
-    analyze.add_argument("--profile-dir", type=Path, required=True)
+    analyze.add_argument(
+        "--profile-dir",
+        type=Path,
+        action="append",
+        required=True,
+        help="profile directory; repeat for multiple execution buckets",
+    )
     analyze.add_argument("--output-dir", type=Path)
     analyze.add_argument(
         "--stage-comm-ms",
@@ -588,6 +771,19 @@ def build_parser() -> argparse.ArgumentParser:
     )
     analyze.add_argument("--max-layers-per-rank")
     analyze.add_argument("--k-best", type=int, default=20)
+    analyze.add_argument(
+        "--all-boundaries",
+        action="store_true",
+        help="enumerate all valid PP compositions instead of only prefix-uniform ones",
+    )
+    analyze.add_argument(
+        "--dcut-profile",
+        type=Path,
+        help=(
+            "JSON ratio -> measured bottleneck cost, or ratio -> per-stage costs; "
+            "enables joint PP partition and D-Cut selection"
+        ),
+    )
     return parser
 
 

@@ -54,6 +54,10 @@ _OFFLINE_PROFILE_MAX_BS = 128
 # sits between the measured PP=2 Qwen3.5-27B-FP8 plateaus (c=8: 5.7%, c=16:
 # 8.4%) and the first compute cliff (c=32 / 256 tokens: 41%).
 _MIN_COMPACT_RELATIVE_SAVE = 0.12
+# Small hysteresis prevents adjacent graph buckets from thrashing when
+# confidence changes by a few ulps between decode steps.
+_AUTO_SWITCH_PENALTY = 0.02
+
 
 def dflash_dcut_enabled(value: DFlashDcutValue) -> bool:
     return value == "auto" or (not isinstance(value, str) and float(value) != 0.0)
@@ -132,6 +136,8 @@ def score_dcut_candidates(
     costs: torch.Tensor,
     min_relative_save: float = _MIN_COMPACT_RELATIVE_SAVE,
     compact_overhead_ms: float = 0.0,
+    previous_index: Optional[int] = None,
+    switch_penalty: float = 0.0,
 ) -> torch.Tensor:
     """Device-side efficiency scores for the auto-mode ratio grid.
 
@@ -147,6 +153,12 @@ def score_dcut_candidates(
         )
     if expected.numel() == 0:
         raise ValueError("expected/costs must be non-empty.")
+    if previous_index is not None and not 0 <= int(previous_index) < expected.numel():
+        raise ValueError(
+            f"previous_index must be in [0, {expected.numel()}), got {previous_index}."
+        )
+    if not 0.0 <= float(switch_penalty) < 1.0:
+        raise ValueError(f"switch_penalty must be in [0, 1), got {switch_penalty}.")
     adj = costs.to(dtype=torch.float32)
     if compact_overhead_ms > 0.0 and adj.numel() > 1:
         adj = adj.clone()
@@ -158,6 +170,18 @@ def score_dcut_candidates(
     eligible = eligible.clone()
     eligible[-1] = True
     scores = expected.to(dtype=torch.float32) / adj
+    if previous_index is not None and switch_penalty > 0.0:
+        # Keep the last graph tier unless a new candidate wins by a meaningful
+        # margin.  This reduces graph-cache churn without introducing a host
+        # decision or changing the dense fallback.
+        scores = scores.clone()
+        switch_mask = torch.ones_like(scores, dtype=torch.bool)
+        switch_mask[int(previous_index)] = False
+        scores = torch.where(
+            switch_mask,
+            scores * (1.0 - float(switch_penalty)),
+            scores,
+        )
     return torch.where(
         eligible,
         scores,
@@ -425,7 +449,12 @@ class DFlashDcutPlanner:
                 cost_tensor
                 + fold_tensor * expected_commit_tokens / full_commit_tokens
             )
-        scores = score_dcut_candidates(expected=expected, costs=cost_tensor)
+        scores = score_dcut_candidates(
+            expected=expected,
+            costs=cost_tensor,
+            previous_index=self.last_candidate_index,
+            switch_penalty=_AUTO_SWITCH_PENALTY,
+        )
         self._auto_index_device.copy_(torch.argmax(scores).to(dtype=torch.int64))
 
     def _select_auto_candidate(self, *, confidence: torch.Tensor, bs: int) -> int:

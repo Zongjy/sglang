@@ -67,5 +67,43 @@ stage_r(partition)
 objective(partition) = max_r stage_r(partition)
 ```
 
+For D-Cut runs, the partition and cut ratio can be selected together.  First
+write the measured verify costs for the same execution bucket.  Values may be a
+single PP bottleneck cost or one value per PP stage; the full-width entry is
+required as the normalization point:
+
+```json
+{"1.0": [12.4, 15.8], "0.75": [10.1, 12.0], "0.5": [8.9, 9.2]}
+```
+
+Then pass the profile to analysis:
+
+```bash
+python benchmark/pp_spec/adaptive_pp_tuner.py analyze \
+  --profile-dir /shared/pp-profile-bs32 \
+  --dcut-profile /shared/dcut-costs.json \
+  --all-boundaries
+```
+
+The report evaluates every partition across the full ratio envelope and
+`recommended.args` contains `--speculative-dflash-dcut auto`, so the runtime can
+change the ratio per decode step.  For online feedback, use the same ratio table with
+`choose_dynamic_dcut_ratio(stage_ms, profiles)`; feeding it an EMA of the PP
+stage timings lets the ratio follow a moving bottleneck while preserving fixed
+communication and head costs through `layer_fraction`.
+
+Multiple execution buckets can be analyzed together by repeating
+`--profile-dir`.  The D-Cut JSON can then be keyed by bucket:
+
+```json
+{
+  "16": {"1.0": [12.4, 15.8], "0.5": [8.9, 9.2]},
+  "32": {"1.0": [18.1, 22.0], "0.5": [12.3, 13.4]}
+}
+```
+
+The tuner minimizes the worst bucket/ratio cycle and emits one static
+partition with runtime D-Cut set to `auto`.
+
 The optimizer enumerates `(l, ..., l, L - (P - 1) * l)` and returns the
 candidate with the smallest predicted objective.
