@@ -558,6 +558,11 @@ class DFlashWorkerV2(BaseSpecWorker):
                 model_runner=self.model_runner,
                 device=self.device,
                 tp_rank=self.ps.tp_rank,
+                draft_cost_profiler=(
+                    self._profile_dflash_draft_cost_ms
+                    if self._draft_worker is not None
+                    else None
+                ),
             )
             self._dcut_epilogue = DFlashDcutEpilogue(
                 max_bs=max(get_exec().graph.cuda_graph_config.decode.bs),
@@ -764,6 +769,85 @@ class DFlashWorkerV2(BaseSpecWorker):
         # non-last ranks that intentionally have no draft worker.
         if self._dcut_planner is not None:
             self._dcut_planner.profile_dcut_cost_table()
+
+    def _profile_dflash_draft_cost_ms(self, bs: int) -> float:
+        """Profile the ratio-independent DFlash draft step for one local bs.
+
+        D-Cut's target-side ratio table is built by ``DFlashDcutPlanner``.  The
+        planner does not own the draft runner, so the worker supplies this
+        callback and measures the same draft forward that serving uses.  The
+        cost is added to every ratio candidate; under PP it is gathered onto
+        the last stage only.
+        """
+        if self._draft_worker is None or bs <= 0:
+            return 0.0
+        if torch.device(self.device).type != "cuda":
+            return 0.0
+
+        block_size = int(self.block_size)
+        num_tokens = int(bs * block_size)
+        profile_seq_len = 2048
+        device = self.device
+        req_pool_indices = torch.arange(
+            1, bs + 1, dtype=torch.int64, device=device
+        )
+        prefix_lens = torch.full(
+            (bs,), profile_seq_len, dtype=torch.int64, device=device
+        )
+        seq_lens_cpu = torch.full(
+            (bs,), profile_seq_len + block_size, dtype=torch.int32, device="cpu"
+        )
+        block_ids = torch.zeros((num_tokens,), dtype=torch.int64, device=device)
+        positions = (
+            prefix_lens[:, None]
+            + torch.arange(block_size, dtype=torch.int64, device=device)[None, :]
+        ).reshape(-1)
+        out_cache_loc = torch.arange(
+            num_tokens, dtype=torch.int64, device=device
+        )
+
+        embed_module = self._pp_draft_embed
+        if embed_module is None:
+            embed_module = self.target_worker.model_runner.model.get_input_embeddings()
+
+        forward_batch = ForwardBatch(
+            forward_mode=ForwardMode.TARGET_VERIFY,
+            batch_size=bs,
+            input_ids=block_ids,
+            req_pool_indices=req_pool_indices,
+            seq_lens=prefix_lens,
+            out_cache_loc=out_cache_loc,
+            seq_lens_sum=int(prefix_lens.sum().item()),
+            seq_lens_cpu=seq_lens_cpu,
+            positions=positions,
+            input_embeds=None,
+            spec_algorithm=SpeculativeAlgorithm.DFLASH,
+            spec_info=self._draft_block_spec_info,
+            capture_hidden_mode=CaptureHiddenMode.NULL,
+        )
+        if self._draft_dp_context_enabled:
+            forward_batch.can_run_dp_cuda_graph = True
+
+        def run_once() -> None:
+            # DFlash uses target embeddings for [bonus, mask...] draft queries.
+            # Recompute them inside the timed region so this callback covers the
+            # complete ratio-independent draft preparation plus draft forward.
+            forward_batch.input_embeds = embed_module(block_ids)
+            with torch.inference_mode(), self._draft_context():
+                self.draft_model_runner.forward(forward_batch)
+
+        torch.get_device_module(device).synchronize()
+        for _ in range(3):
+            run_once()
+        torch.get_device_module(device).synchronize()
+        start = torch.cuda.Event(enable_timing=True)
+        end = torch.cuda.Event(enable_timing=True)
+        start.record()
+        for _ in range(5):
+            run_once()
+        end.record()
+        torch.cuda.synchronize()
+        return float(start.elapsed_time(end) / 5.0)
 
     def _maybe_build_draft_sampler(self):
         def _eager(reason):

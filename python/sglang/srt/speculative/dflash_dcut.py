@@ -4,7 +4,7 @@ import logging
 import math
 from contextlib import contextmanager
 from dataclasses import dataclass
-from typing import Iterator, Literal, Optional, Sequence, Union
+from typing import Callable, Iterator, Literal, Optional, Sequence, Union
 
 import torch
 
@@ -27,6 +27,7 @@ from sglang.srt.model_executor.forward_batch_info import (
     ForwardMode,
     PPProxyTensors,
 )
+from sglang.srt.runtime_context import get_parallel
 from sglang.srt.speculative.dflash_info import DFlashVerifyInput
 from sglang.srt.speculative.dspark_components.dspark_planner import (
     DSparkScheduleConfig,
@@ -47,16 +48,6 @@ _OFFLINE_PROFILE_WARMUPS = 3
 _OFFLINE_PROFILE_STEPS = 5
 _OFFLINE_PROFILE_SEQ_LEN = 2048
 _OFFLINE_PROFILE_MAX_BS = 128
-
-# Compact D-Cut must shrink the profiled verify cost by at least this fraction
-# of the full-width cost. Below that the verify kernel is still on the launch /
-# memory floor, so packing, top-k, and the host sync pay for themselves. 0.12
-# sits between the measured PP=2 Qwen3.5-27B-FP8 plateaus (c=8: 5.7%, c=16:
-# 8.4%) and the first compute cliff (c=32 / 256 tokens: 41%).
-_MIN_COMPACT_RELATIVE_SAVE = 0.12
-# Small hysteresis prevents adjacent graph buckets from thrashing when
-# confidence changes by a few ulps between decode steps.
-_AUTO_SWITCH_PENALTY = 0.02
 
 
 def dflash_dcut_enabled(value: DFlashDcutValue) -> bool:
@@ -81,71 +72,12 @@ def get_dflash_dcut_keep_count(*, bs: int, block_size: int, ratio: float) -> int
     )
 
 
-def dcut_cost_curve_is_flat(
-    costs: Sequence[float],
-    *,
-    min_relative_save: float = _MIN_COMPACT_RELATIVE_SAVE,
-) -> bool:
-    """True when no compact ratio is cheaper than full-width by enough.
-
-    ``costs`` is the auto-mode grid, last entry = ratio 1.0. A flat curve means
-    the batch is still overhead-dominated and should stay on the dense path.
-    """
-    if not costs:
-        raise ValueError("costs must be non-empty.")
-    if min_relative_save < 0.0:
-        raise ValueError(
-            f"min_relative_save must be non-negative, got {min_relative_save}."
-        )
-    full_cost = float(costs[-1])
-    if full_cost <= 0.0:
-        return True
-    return (full_cost - min(float(c) for c in costs)) / full_cost < min_relative_save
-
-
-def fill_dcut_keep_count_to_graph_bucket(
-    *,
-    bs: int,
-    keep_count: int,
-    block_size: int,
-    graph_num_tokens: int,
-) -> int:
-    """Raise keep_count to the tokens already paid for by the CUDA graph bucket.
-
-    Cost is stepwise-constant between token-keyed graph tiers, so leftover
-    slots in the chosen bucket are free expected accept.
-    """
-    if bs < 0:
-        raise ValueError(f"bs must be non-negative, got {bs}.")
-    if block_size < 1:
-        raise ValueError(f"block_size must be positive, got {block_size}.")
-    if keep_count < 0:
-        raise ValueError(f"keep_count must be non-negative, got {keep_count}.")
-    if graph_num_tokens < 0:
-        raise ValueError(
-            f"graph_num_tokens must be non-negative, got {graph_num_tokens}."
-        )
-    max_keep = bs * (block_size - 1)
-    filled = min(graph_num_tokens - bs, max_keep)
-    return max(keep_count, min(max_keep, max(0, filled)))
-
-
 def score_dcut_candidates(
     *,
     expected: torch.Tensor,
     costs: torch.Tensor,
-    min_relative_save: float = _MIN_COMPACT_RELATIVE_SAVE,
-    compact_overhead_ms: float = 0.0,
-    previous_index: Optional[int] = None,
-    switch_penalty: float = 0.0,
 ) -> torch.Tensor:
-    """Device-side efficiency scores for the auto-mode ratio grid.
-
-    Compact candidates that do not beat full-width by ``min_relative_save``
-    are given ``-inf`` so ``argmax`` falls through to the dense ratio. A
-    compact-only overhead (topk + pack + scatter, not in the verify profile)
-    is added to every non-final candidate.
-    """
+    """Paper D-Cut selector utility: expected advance divided by cost."""
     if expected.shape != costs.shape:
         raise ValueError(
             f"expected and costs must share a shape, got {tuple(expected.shape)} "
@@ -153,39 +85,26 @@ def score_dcut_candidates(
         )
     if expected.numel() == 0:
         raise ValueError("expected/costs must be non-empty.")
-    if previous_index is not None and not 0 <= int(previous_index) < expected.numel():
-        raise ValueError(
-            f"previous_index must be in [0, {expected.numel()}), got {previous_index}."
-        )
-    if not 0.0 <= float(switch_penalty) < 1.0:
-        raise ValueError(f"switch_penalty must be in [0, 1), got {switch_penalty}.")
-    adj = costs.to(dtype=torch.float32)
-    if compact_overhead_ms > 0.0 and adj.numel() > 1:
-        adj = adj.clone()
-        adj[:-1] = adj[:-1] + float(compact_overhead_ms)
-    adj = adj.clamp_min(torch.finfo(torch.float32).eps)
-    full_cost = adj[-1]
-    save = (full_cost - adj) / full_cost
-    eligible = save >= float(min_relative_save)
-    eligible = eligible.clone()
-    eligible[-1] = True
-    scores = expected.to(dtype=torch.float32) / adj
-    if previous_index is not None and switch_penalty > 0.0:
-        # Keep the last graph tier unless a new candidate wins by a meaningful
-        # margin.  This reduces graph-cache churn without introducing a host
-        # decision or changing the dense fallback.
-        scores = scores.clone()
-        switch_mask = torch.ones_like(scores, dtype=torch.bool)
-        switch_mask[int(previous_index)] = False
-        scores = torch.where(
-            switch_mask,
-            scores * (1.0 - float(switch_penalty)),
-            scores,
-        )
-    return torch.where(
-        eligible,
-        scores,
-        torch.full_like(scores, torch.finfo(torch.float32).min),
+    return expected.to(dtype=torch.float32) / costs.to(dtype=torch.float32).clamp_min(
+        torch.finfo(torch.float32).eps
+    )
+
+
+def pp_pipeline_cycle_cost(
+    stage_costs: torch.Tensor, microbatch_count: int
+) -> torch.Tensor:
+    """Forward-only PP makespan for one candidate ratio.
+
+    A pipeline with ``M`` in-flight microbatches pays one fill/drain sum of
+    stage service times and ``M-1`` steady-state cycles at the bottleneck.
+    ``stage_costs`` is [PP, candidates].
+    """
+    if stage_costs.ndim != 2 or stage_costs.shape[0] == 0:
+        raise ValueError("stage_costs must have shape [pp_size, candidates].")
+    if microbatch_count < 1:
+        raise ValueError(f"microbatch_count must be positive, got {microbatch_count}.")
+    return stage_costs.sum(dim=0) + (int(microbatch_count) - 1) * stage_costs.amax(
+        dim=0
     )
 
 
@@ -224,21 +143,11 @@ class DFlashDcutPlanner:
     """Cross-request D-Cut selector using an offline-only cost table.
 
     Fixed-ratio mode is entirely device-side after the host-known keep count.
-    Auto mode builds a hardware-specific cost table at startup by running dummy
-    target-verify forwards for a small grid of (batch_size, ratio) points. Under
-    pipeline parallelism, each stage profiles its local partition and the table
-    records the slowest stage's cost. The table is used for all subsequent real
-    steps; if it is missing for a batch size we fall back to the 0.75 ratio
-    candidate.
-    When the cost curve is still on the launch/memory floor (no compact ratio
-    saves ``_MIN_COMPACT_RELATIVE_SAVE`` of full-width cost) the planner stays
-    on the dense full-width path: no top-k, no pack, no candidate-index
-    host-sync. Otherwise auto selection stays on GPU until a single scalar
-    ``.item()`` materializes the graph bucket.
-    The mandatory anchors are handled by the keep-count formula, but (matching
-    the public implementation) are not added to the selector numerator; this
-    avoids over-favoring very shallow cuts when raw DFlash softmax confidence
-    is under-calibrated.
+    Auto mode builds a hardware-specific cost table at startup.  The selector
+    follows the paper objective: expected committed tokens (including one
+    mandatory anchor per request) divided by the profiled speculative-step
+    cost.  Under PP, the stage cost vectors are converted to a forward
+    microbatch pipeline makespan before selection.
     """
 
     def __init__(
@@ -249,6 +158,7 @@ class DFlashDcutPlanner:
         model_runner,
         device: torch.device,
         tp_rank: int,
+        draft_cost_profiler: Optional[Callable[[int], float]] = None,
     ) -> None:
         self.value = value
         self.block_size = int(block_size)
@@ -256,8 +166,13 @@ class DFlashDcutPlanner:
         self.model_runner = model_runner
         self.device = device
         self.tp_rank = int(tp_rank)
+        self._draft_cost_profiler = draft_cost_profiler
         self.tp_group = get_tp_group()
         self.pp_group = get_pp_group()
+        self.pp_microbatch_count = 1
+        if self.pp_group.world_size > 1:
+            async_depth = int(getattr(get_parallel(), "pp_async_batch_depth", 0) or 0)
+            self.pp_microbatch_count = max(1, self.pp_group.world_size + async_depth)
         self._dp_attention = is_dp_attention_enabled()
         # Under DP attention each rank owns an independent local batch, so the
         # auto-candidate decision is coordinated only within the attention-TP
@@ -278,15 +193,25 @@ class DFlashDcutPlanner:
         self.schedule_cfg.validate()
         self.last_candidate_index: Optional[int] = None
         self._costs_by_bs: dict[int, list[Optional[float]]] = {}
-        self._fold_costs_by_bs: dict[int, list[Optional[float]]] = {}
+        self._overhead_costs_by_bs: dict[int, list[Optional[float]]] = {}
+        # Keep the per-PP-rank measurements as well as the reduced bottleneck
+        # curve.  Runtime selection can then evaluate a candidate after the
+        # bottleneck moves, instead of assuming that the stage which was slow
+        # at full width remains slow after D-Cut.
+        self._stage_costs_by_bs: dict[int, tuple[tuple[float, ...], ...]] = {}
+        self._stage_fold_costs_by_bs: dict[int, tuple[tuple[float, ...], ...]] = {}
+        self._stage_overhead_costs_by_bs: dict[
+            int, tuple[tuple[float, ...], ...]
+        ] = {}
+        self._stage_draft_costs_by_bs: dict[int, tuple[tuple[float, ...], ...]] = {}
+        self._last_local_profile_cost: Optional[tuple[float, float]] = None
+        self._last_local_profile_overhead_ms = 0.0
         self._auto_index_device = torch.zeros((), dtype=torch.int64, device=device)
         self._offline_profiled = False
         self._common_capture_num_tokens: Optional[tuple[int, ...]] = None
         self._offline_keep_counts: dict[int, tuple[int, ...]] = {}
         self._warned_missing_profile_bs: set[int] = set()
         self._cost_tensors_by_bs: dict[int, torch.Tensor] = {}
-        self._fold_tensors_by_bs: dict[int, torch.Tensor] = {}
-        self._dense_by_bs: dict[int, bool] = {}
 
     @property
     def is_auto(self) -> bool:
@@ -365,11 +290,76 @@ class DFlashDcutPlanner:
     def _profile_costs_for_bs(self, bs: int) -> Optional[list[float]]:
         return self._profile_metric_for_bs(self._costs_by_bs, bs, match_graph_tier=True)
 
-    def _profile_fold_costs_for_bs(self, bs: int) -> Optional[list[float]]:
-        # Fold is an eager grid over requests/layers/heads, not a token-keyed
-        # CUDA graph. Reuse the nearest profiled batch uniformly across ratios.
-        return self._profile_metric_for_bs(
-            self._fold_costs_by_bs, bs, match_graph_tier=False
+    def _profile_stage_metric_for_bs(
+        self,
+        table: dict[int, tuple[tuple[float, ...], ...]],
+        bs: int,
+        *,
+        match_graph_tier: bool,
+    ) -> Optional[tuple[tuple[float, ...], ...]]:
+        """Resolve a stage-by-candidate table using the same bucket rules.
+
+        The first dimension is PP rank and the second is the candidate index.
+        All ranks build the same table during startup, so nearest-batch reuse is
+        deterministic and preserves the existing relay contract.
+        """
+        exact = table.get(bs)
+        if exact is not None:
+            return exact
+        if not table:
+            return None
+
+        resolved: list[list[float]] = []
+        requested_keeps = self.candidate_keep_counts(bs)
+        for candidate_index, keep_count in enumerate(requested_keeps):
+            choices = []
+            target_tier = self._graph_num_tokens(bs + keep_count)
+            for profile_bs, stage_costs in table.items():
+                if match_graph_tier:
+                    profile_keeps = self._offline_keep_counts.get(
+                        profile_bs, self.candidate_keep_counts(profile_bs)
+                    )
+                    profile_tier = self._graph_num_tokens(
+                        profile_bs + profile_keeps[candidate_index]
+                    )
+                    if profile_tier != target_tier:
+                        continue
+                choices.append((abs(profile_bs - bs), profile_bs, stage_costs))
+            if not choices:
+                return None
+            _, _, nearest = min(choices, key=lambda item: (item[0], item[1]))
+            if not resolved:
+                resolved = [[] for _ in nearest]
+            for rank, values in enumerate(nearest):
+                resolved[rank].append(float(values[candidate_index]))
+        return tuple(tuple(values) for values in resolved)
+
+    def _profile_stage_costs_for_bs(
+        self, bs: int
+    ) -> Optional[tuple[tuple[float, ...], ...]]:
+        return self._profile_stage_metric_for_bs(
+            self._stage_costs_by_bs, bs, match_graph_tier=True
+        )
+
+    def _profile_stage_fold_costs_for_bs(
+        self, bs: int
+    ) -> Optional[tuple[tuple[float, ...], ...]]:
+        return self._profile_stage_metric_for_bs(
+            self._stage_fold_costs_by_bs, bs, match_graph_tier=False
+        )
+
+    def _profile_stage_overhead_costs_for_bs(
+        self, bs: int
+    ) -> Optional[tuple[tuple[float, ...], ...]]:
+        return self._profile_stage_metric_for_bs(
+            self._stage_overhead_costs_by_bs, bs, match_graph_tier=False
+        )
+
+    def _profile_stage_draft_costs_for_bs(
+        self, bs: int
+    ) -> Optional[tuple[tuple[float, ...], ...]]:
+        return self._profile_stage_metric_for_bs(
+            self._stage_draft_costs_by_bs, bs, match_graph_tier=False
         )
 
     def _cached_device_costs(self, bs: int, costs: list[float]) -> torch.Tensor:
@@ -379,30 +369,6 @@ class DFlashDcutPlanner:
         tensor = torch.tensor(costs, dtype=torch.float32, device=self.device)
         self._cost_tensors_by_bs[bs] = tensor
         return tensor
-
-    def _cached_device_fold_costs(
-        self, bs: int, fold_costs: list[float]
-    ) -> torch.Tensor:
-        cached = self._fold_tensors_by_bs.get(bs)
-        if cached is not None:
-            return cached
-        tensor = torch.tensor(fold_costs, dtype=torch.float32, device=self.device)
-        self._fold_tensors_by_bs[bs] = tensor
-        return tensor
-
-    def _should_use_dense(self, bs: int) -> bool:
-        cached = self._dense_by_bs.get(bs)
-        if cached is not None:
-            return cached
-        costs = self._profile_costs_for_bs(bs)
-        # A missing profile is not evidence that compact D-Cut is unhelpful.
-        # Keep the historical ratio-0.75 fallback in that case; otherwise a
-        # non-capture batch such as bs=11 would be forced to full-width and its
-        # 176-token block would round up to the 192-token graph bucket without
-        # doing any cut at all.
-        dense = costs is not None and dcut_cost_curve_is_flat(costs)
-        self._dense_by_bs[bs] = dense
-        return dense
 
     def _write_auto_index_local(self, *, confidence: torch.Tensor, bs: int) -> None:
         """Write the auto-mode candidate index to ``_auto_index_device``.
@@ -426,35 +392,64 @@ class DFlashDcutPlanner:
         sorted_survival = torch.sort(survival, descending=True).values
         prefix_scores = torch.cumsum(sorted_survival, dim=0)
         keep_counts = self.candidate_keep_counts(bs)
-        expected_tokens = []
-        for keep_count in keep_counts:
-            draft_score = (
-                prefix_scores[keep_count - 1]
+        expected = torch.stack(
+            tuple(
+                prefix_scores[keep_count - 1] + float(bs)
                 if keep_count > 0
-                else prefix_scores.new_zeros(())
+                else prefix_scores.new_zeros(()) + float(bs)
+                for keep_count in keep_counts
             )
-            expected_tokens.append(draft_score)
-        expected = torch.stack(expected_tokens)
-        cost_tensor = self._cached_device_costs(bs, costs)
-        fold_costs = self._profile_fold_costs_for_bs(bs)
-        if fold_costs is not None:
-            full_commit_tokens = torch.tensor(
-                [bs + keep for keep in keep_counts],
-                dtype=torch.float32,
-                device=self.device,
-            )
-            expected_commit_tokens = expected + float(bs)
-            fold_tensor = self._cached_device_fold_costs(bs, fold_costs)
-            cost_tensor = (
-                cost_tensor
-                + fold_tensor * expected_commit_tokens / full_commit_tokens
-            )
-        scores = score_dcut_candidates(
-            expected=expected,
-            costs=cost_tensor,
-            previous_index=self.last_candidate_index,
-            switch_penalty=_AUTO_SWITCH_PENALTY,
         )
+
+        stage_costs = self._profile_stage_costs_for_bs(bs)
+        stage_fold_costs = self._profile_stage_fold_costs_for_bs(bs)
+        stage_overhead_costs = self._profile_stage_overhead_costs_for_bs(bs)
+        stage_draft_costs = self._profile_stage_draft_costs_for_bs(bs)
+        overhead_costs = self._profile_metric_for_bs(
+            self._overhead_costs_by_bs, bs, match_graph_tier=False
+        )
+        if stage_costs is not None:
+            stage_rows = []
+            for rank, values in enumerate(stage_costs):
+                stage_tensor = torch.tensor(
+                    values, dtype=torch.float32, device=self.device
+                )
+                if stage_fold_costs is not None and rank < len(stage_fold_costs):
+                    fold_tensor = torch.tensor(
+                        stage_fold_costs[rank],
+                        dtype=torch.float32,
+                        device=self.device,
+                    )
+                    stage_tensor = stage_tensor + fold_tensor
+                if stage_overhead_costs is not None and rank < len(
+                    stage_overhead_costs
+                ):
+                    stage_tensor = stage_tensor + torch.tensor(
+                        stage_overhead_costs[rank],
+                        dtype=torch.float32,
+                        device=self.device,
+                    )
+                if stage_draft_costs is not None and rank < len(stage_draft_costs):
+                    stage_tensor = stage_tensor + torch.tensor(
+                        stage_draft_costs[rank],
+                        dtype=torch.float32,
+                        device=self.device,
+                    )
+                elif (
+                    stage_overhead_costs is None
+                    and stage_draft_costs is None
+                    and overhead_costs is not None
+                ):
+                    stage_tensor = stage_tensor + torch.tensor(
+                        overhead_costs, dtype=torch.float32, device=self.device
+                    )
+                stage_rows.append(stage_tensor)
+            cost_tensor = pp_pipeline_cycle_cost(
+                torch.stack(stage_rows, dim=0), self.pp_microbatch_count
+            )
+        else:
+            cost_tensor = self._cached_device_costs(bs, costs)
+        scores = score_dcut_candidates(expected=expected, costs=cost_tensor)
         self._auto_index_device.copy_(torch.argmax(scores).to(dtype=torch.int64))
 
     def _select_auto_candidate(self, *, confidence: torch.Tensor, bs: int) -> int:
@@ -463,7 +458,7 @@ class DFlashDcutPlanner:
             self._write_auto_index_local(confidence=confidence, bs=bs)
         group.broadcast(self._auto_index_device, src=0)
         # CUDA graph replay keys off a host bucket. This is the only hot-path
-        # scalar sync on the compact path; the dense path never reaches here.
+        # scalar sync required by the ratio selector.
         return int(self._auto_index_device.item())
 
     def _graph_num_tokens(self, total_verify_tokens: int) -> int:
@@ -688,6 +683,38 @@ class DFlashDcutPlanner:
             )
         return float(cost.item())
 
+    def _gather_profile_stage_costs(
+        self, local_costs: Sequence[float]
+    ) -> tuple[tuple[float, ...], ...]:
+        """Gather one candidate cost vector in PP order.
+
+        TP ranks first reduce to the slowest shard of their local PP stage;
+        the resulting vector is then gathered across the PP process group.
+        Every rank executes this during startup profiling, so no hot-path
+        collective is needed when the last PP rank selects the next plan.
+        """
+        values = torch.tensor(
+            tuple(float(value) for value in local_costs),
+            dtype=torch.float32,
+            device=self.device,
+        )
+        if self.tp_group.world_size > 1:
+            torch.distributed.all_reduce(
+                values,
+                op=torch.distributed.ReduceOp.MAX,
+                group=self.tp_group.device_group,
+            )
+        if self.pp_group.world_size <= 1:
+            return (tuple(float(value) for value in values.tolist()),)
+
+        gathered = [torch.empty_like(values) for _ in range(self.pp_group.world_size)]
+        torch.distributed.all_gather(
+            gathered, values, group=self.pp_group.device_group
+        )
+        return tuple(
+            tuple(float(value) for value in stage.tolist()) for stage in gathered
+        )
+
     def _raise_if_parallel_profile_failed(self, error: Optional[Exception]) -> None:
         if self.tp_group.world_size == 1 and self.pp_group.world_size == 1:
             if error is not None:
@@ -818,6 +845,58 @@ class DFlashDcutPlanner:
             **dp_fields,
         )
 
+    def _profile_compact_overhead_ms(self, *, bs: int, keep_count: int) -> float:
+        """Measure planner/layout work that is absent from model.forward().
+
+        The target verify profile captures the expensive model kernels, but it
+        does not include top-k scheduling or ragged indptr construction.  Those
+        operations are material at small PP batches, where the verify kernel is
+        already close to its launch floor.  Measure them with the same CUDA
+        event protocol and fold the result into the candidate cost table.
+        """
+        if (
+            torch.device(self.device).type != "cuda"
+            or keep_count <= 0
+            or keep_count >= bs * self.gamma
+        ):
+            return 0.0
+        try:
+            confidence = torch.ones(
+                (bs, self.gamma), dtype=torch.float32, device=self.device
+            )
+            graph_num_tokens = self._graph_num_tokens(bs + keep_count)
+
+            for _ in range(2):
+                verify_lens = ScheduleVerifyLensTopk.execute(
+                    confidence=confidence,
+                    budget=keep_count,
+                    cfg=self.schedule_cfg,
+                )
+                RaggedVerifyLayout.from_verify_lens_device(
+                    verify_lens=verify_lens,
+                    graph_num_tokens=graph_num_tokens,
+                )
+            torch.get_device_module(self.device).synchronize()
+            start = torch.cuda.Event(enable_timing=True)
+            end = torch.cuda.Event(enable_timing=True)
+            start.record()
+            for _ in range(_OFFLINE_PROFILE_STEPS):
+                verify_lens = ScheduleVerifyLensTopk.execute(
+                    confidence=confidence,
+                    budget=keep_count,
+                    cfg=self.schedule_cfg,
+                )
+                RaggedVerifyLayout.from_verify_lens_device(
+                    verify_lens=verify_lens,
+                    graph_num_tokens=graph_num_tokens,
+                )
+            end.record()
+            torch.cuda.synchronize()
+            return start.elapsed_time(end) / _OFFLINE_PROFILE_STEPS
+        except Exception as exc:  # pragma: no cover - CUDA/backend dependent
+            logger.debug("DFLASH D-Cut compact overhead profile skipped: %s", exc)
+            return 0.0
+
     def _profile_dcut_cost_ms(self, *, bs: int, keep_count: int) -> tuple[float, float]:
         """Average target-verify and full-prefix ReplaySSM fold latency."""
         verify_cost_ms = 0.0
@@ -876,6 +955,13 @@ class DFlashDcutPlanner:
                 fold_cost_ms = (
                     fold_start.elapsed_time(fold_end) / _OFFLINE_PROFILE_STEPS
                 )
+        # Save the local stage measurement before reducing it for the legacy
+        # bottleneck table.  The startup profile gathers these local values
+        # across PP ranks and keeps both representations.
+        self._last_local_profile_cost = (verify_cost_ms, fold_cost_ms)
+        self._last_local_profile_overhead_ms = self._profile_compact_overhead_ms(
+            bs=bs, keep_count=keep_count
+        )
         return self._max_parallel_cost_ms(verify_cost_ms), self._max_parallel_cost_ms(
             fold_cost_ms
         )
@@ -946,37 +1032,77 @@ class DFlashDcutPlanner:
             for bs in profile_bs_list:
                 keep_counts = self.candidate_keep_counts(bs)
                 self._offline_keep_counts[bs] = keep_counts
+                local_draft_cost = (
+                    float(self._draft_cost_profiler(bs))
+                    if self._draft_cost_profiler is not None
+                    else 0.0
+                )
+                draft_cost = self._max_parallel_cost_ms(local_draft_cost)
                 entries: list[tuple[int, float, float]] = []
+                local_verify_costs: list[float] = []
+                local_fold_costs: list[float] = []
+                local_overhead_costs: list[float] = []
+                overhead_costs: list[float] = []
                 for keep_count in keep_counts:
                     verify_cost, fold_cost = self._profile_dcut_cost_ms(
                         bs=bs, keep_count=keep_count
                     )
                     entries.append((keep_count, verify_cost, fold_cost))
+                    if self._last_local_profile_cost is None:
+                        raise RuntimeError(
+                            "DFLASH D-Cut profiling did not produce a local cost"
+                        )
+                    local_verify, local_fold = self._last_local_profile_cost
+                    local_verify_costs.append(local_verify)
+                    local_fold_costs.append(local_fold)
+                    local_overhead_costs.append(self._last_local_profile_overhead_ms)
+                    overhead_costs.append(
+                        self._max_parallel_cost_ms(
+                            self._last_local_profile_overhead_ms
+                        )
+                    )
                 costs_by_bs[bs] = entries
-                self._costs_by_bs[bs] = [verify for _, verify, _ in entries]
-                self._fold_costs_by_bs[bs] = [fold for _, _, fold in entries]
-                verify_costs = self._costs_by_bs[bs]
-                self._dense_by_bs[bs] = dcut_cost_curve_is_flat(verify_costs)
-                self._cost_tensors_by_bs[bs] = torch.tensor(
-                    verify_costs, dtype=torch.float32, device=self.device
+                self._overhead_costs_by_bs[bs] = overhead_costs
+                self._stage_costs_by_bs[bs] = self._gather_profile_stage_costs(
+                    local_verify_costs
                 )
-                self._fold_tensors_by_bs[bs] = torch.tensor(
-                    self._fold_costs_by_bs[bs],
-                    dtype=torch.float32,
-                    device=self.device,
+                self._stage_fold_costs_by_bs[bs] = self._gather_profile_stage_costs(
+                    local_fold_costs
+                )
+                self._stage_overhead_costs_by_bs[bs] = (
+                    self._gather_profile_stage_costs(local_overhead_costs)
+                )
+                local_draft_vector = [
+                    local_draft_cost if self.pp_group.is_last_rank else 0.0
+                ] * len(keep_counts)
+                # The draft model is colocated with the last PP stage.  Keep
+                # this vector separate so PP cycle modeling can add it to the
+                # correct stage instead of spreading it over all stages.
+                self._stage_draft_costs_by_bs[bs] = self._gather_profile_stage_costs(
+                    local_draft_vector
+                )
+                total_costs = [
+                    draft_cost + verify + fold + overhead
+                    for (_, verify, fold), overhead in zip(entries, overhead_costs)
+                ]
+                self._costs_by_bs[bs] = total_costs
+                self._cost_tensors_by_bs[bs] = torch.tensor(
+                    total_costs, dtype=torch.float32, device=self.device
                 )
 
             self._offline_profiled = True
             if self.tp_rank == 0 and costs_by_bs:
-                dense_bs = sorted(bs for bs, dense in self._dense_by_bs.items() if dense)
                 logger.info(
-                    "DFLASH D-Cut offline cost table ready: block_size=%d dense_bs=%s %s",
+                    "DFLASH D-Cut offline cost table ready: block_size=%d %s",
                     self.block_size,
-                    dense_bs,
                     {
                         bs: [
-                            (keep, round(verify, 4), round(fold, 4))
-                            for keep, verify, fold in costs_by_bs[bs]
+                            (ratio, round(verify + fold + overhead, 4))
+                            for ratio, (_keep, verify, fold), overhead in zip(
+                                _AUTO_RATIOS,
+                                costs_by_bs[bs],
+                                self._overhead_costs_by_bs[bs],
+                            )
                         ]
                         for bs in sorted(costs_by_bs)
                     },
@@ -1020,7 +1146,7 @@ class DFlashDcutPlanner:
             )
         bs = int(confidence.shape[0])
         full_keep_count = bs * self.gamma
-        if force_full or (self.is_auto and self._should_use_dense(bs)):
+        if force_full:
             plan = self.full_plan(bs=bs)
             self.last_candidate_index = plan.candidate_index
             return plan
@@ -1037,12 +1163,6 @@ class DFlashDcutPlanner:
                 ratio=float(self.value),
             )
         graph_num_tokens = self._graph_num_tokens(bs + keep_count)
-        keep_count = fill_dcut_keep_count_to_graph_bucket(
-            bs=bs,
-            keep_count=keep_count,
-            block_size=self.block_size,
-            graph_num_tokens=graph_num_tokens,
-        )
         if budget_cap is not None and not force_full:
             keep_count = min(keep_count, budget_cap)
         self.last_candidate_index = candidate_index
