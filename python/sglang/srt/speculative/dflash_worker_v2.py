@@ -1,6 +1,7 @@
 import contextlib
 import logging
 import math
+import time
 from dataclasses import dataclass, replace
 from typing import List, Optional
 
@@ -578,6 +579,12 @@ class DFlashWorkerV2(BaseSpecWorker):
                     server_args.speculative_dflash_dcut,
                     self.block_size,
                 )
+
+    def set_dflash_pipeline_transfer_models(
+        self, models: tuple[tuple[float, float], ...]
+    ) -> None:
+        if self._dcut_planner is not None:
+            self._dcut_planner.set_pipeline_transfer_models(models)
 
     def _init_draft_side(
         self,
@@ -2474,6 +2481,7 @@ class DFlashWorkerV2(BaseSpecWorker):
                 graph_num_tokens_floor=(
                     dp_step.graph_num_tokens_floor if dp_step is not None else None
                 ),
+                pipeline_mb_id=getattr(batch, "pp_mb_id", None),
             )
 
         exact_plan = (
@@ -2503,6 +2511,7 @@ class DFlashWorkerV2(BaseSpecWorker):
             graph_num_tokens_floor=(
                 dp_step.graph_num_tokens_floor if dp_step is not None else None
             ),
+            pipeline_mb_id=getattr(batch, "pp_mb_id", None),
         )
 
     def _gather_dcut_dp_step_meta(
@@ -2830,6 +2839,7 @@ class DFlashWorkerV2(BaseSpecWorker):
 
         bs = len(batch.seq_lens)
         device = self.device
+        dcut_step_t0 = time.perf_counter()
 
         # --- 1) Draft a fixed block with the draft model (non-PP / last PP
         # rank), or rebuild it from the raw relayed through the PP ring.
@@ -2958,6 +2968,16 @@ class DFlashWorkerV2(BaseSpecWorker):
             assert (
                 pp_proxy_out is not None
             ), "non-last PP rank must relay proxy hidden downstream"
+            if (
+                self._dcut_planner is not None
+                and dcut_plan is not None
+                and dcut_plan.candidate_index is not None
+            ):
+                self._dcut_planner.observe_runtime_stage_cost(
+                    bs=bs,
+                    candidate_index=dcut_plan.candidate_index,
+                    cost_ms=(time.perf_counter() - dcut_step_t0) * 1000.0,
+                )
             return GenerationBatchResult(
                 pp_hidden_states_proxy_tensors=pp_proxy_out,
                 next_token_ids=torch.empty((0,), dtype=torch.int64, device=device),
@@ -3238,10 +3258,15 @@ class DFlashWorkerV2(BaseSpecWorker):
                     raise RuntimeError(
                         "DFLASH D-Cut next-block proposal did not produce confidence."
                     )
-                next_dcut_plan = self._dcut_planner.plan(
-                    confidence=next_dcut_confidence,
-                    force_full=not dflash_dcut_batch_is_compactable(batch),
-                )
+                if self._dcut_planner.should_hold_full(bs):
+                    next_dcut_plan = self._dcut_planner.full_plan(bs=bs)
+                    self._dcut_planner.consume_full_hold()
+                else:
+                    next_dcut_plan = self._dcut_planner.plan(
+                        confidence=next_dcut_confidence,
+                        force_full=not dflash_dcut_batch_is_compactable(batch),
+                        pipeline_mb_id=getattr(batch, "pp_mb_id", None),
+                    )
             pp_raw_out = DFlashPPVerifyInputRaw(
                 bonus_tokens=bonus.to(device=device, dtype=torch.int64),
                 draft_tokens=next_draft_tokens[:, 1:]
@@ -3277,6 +3302,17 @@ class DFlashWorkerV2(BaseSpecWorker):
                     else None
                 ),
                 accept_index=None,
+            )
+
+        if (
+            self._dcut_planner is not None
+            and dcut_plan is not None
+            and dcut_plan.candidate_index is not None
+        ):
+            self._dcut_planner.observe_runtime_stage_cost(
+                bs=bs,
+                candidate_index=dcut_plan.candidate_index,
+                cost_ms=(time.perf_counter() - dcut_step_t0) * 1000.0,
             )
 
         return GenerationBatchResult(

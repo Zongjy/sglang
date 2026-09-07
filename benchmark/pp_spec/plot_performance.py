@@ -36,8 +36,8 @@ SERIES_STYLE = {
     "tp": dict(color="tab:green", linestyle="-", marker="s"),
     "tp_dcut": dict(color="tab:green", linestyle="--", marker="s"),
 
-    "tp_dpattn": dict(color="tab:purple", linestyle="-", marker="^"),
-    "tp_dpattn_dcut": dict(color="tab:purple", linestyle="--", marker="^"),
+    "dp": dict(color="tab:purple", linestyle="-", marker="^"),
+    "dp_dcut": dict(color="tab:purple", linestyle="--", marker="^"),
 
     "pp_asym": dict(color="tab:orange", linestyle="-", marker="o"),
     "pp_asym_dcut": dict(color="tab:orange", linestyle="--", marker="o"),

@@ -5108,6 +5108,24 @@ def run_scheduler_process(
         # Scheduler.__init__) and before any event loop starts serving;
         # failures are swallowed inside and never block startup.
         maybe_run_pp_comm_benchmark(scheduler)
+        comm_result = getattr(scheduler, "pp_comm_benchmark_result", None)
+        draft_worker = getattr(scheduler, "draft_worker", None)
+        if comm_result is not None and draft_worker is not None:
+            hops = comm_result.get("hops", {})
+            hop_models = [
+                hops.get(f"{hop}->{hop + 1}")
+                for hop in range(max(0, scheduler.ps.pp_size - 1))
+            ]
+            setter = getattr(draft_worker, "set_dflash_pipeline_transfer_models", None)
+            if setter is not None and all(model is not None for model in hop_models):
+                models = tuple(
+                    (
+                        float(model["alpha_ms"]),
+                        float(model["beta_ms_per_token"]),
+                    )
+                    for model in hop_models
+                )
+                setter(models)
 
         # Run the event loop (blocks until a ShutdownReq sets gracefully_exit)
         scheduler.run_event_loop()
@@ -5128,7 +5146,6 @@ def run_scheduler_process(
             # FPM has a background ZMQ publisher thread that needs explicit
             # teardown to flush queued metrics and close the socket cleanly.
             scheduler.metrics_reporter._shutdown_fpm()
-            scheduler.metrics_reporter._shutdown_ppm()
             # Graceful path only: on the exception path the GPU may be wedged
             # and the synchronize() in destroy() could itself hang.
             if scheduler.gracefully_exit:

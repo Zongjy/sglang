@@ -11,6 +11,7 @@ from sglang.srt.speculative.dflash_dcut import (
     DFlashDcutPlanner,
     get_dflash_dcut_keep_count,
     pp_pipeline_cycle_cost,
+    pp_pipeline_flowshop_makespan,
     score_dcut_candidates,
 )
 from sglang.srt.speculative.ragged_verify import RaggedVerifyLayout
@@ -26,6 +27,21 @@ class TestPipelineCycleCost(CustomTestCase):
         torch.testing.assert_close(
             pp_pipeline_cycle_cost(stage_costs, microbatch_count=2),
             torch.tensor([50.0, 65.0]),
+        )
+
+    def test_flowshop_makespan_accounts_for_job_order_and_transfer(self):
+        self.assertEqual(
+            pp_pipeline_flowshop_makespan(
+                jobs=((10.0, 20.0), (15.0, 10.0)),
+            ),
+            40.0,
+        )
+        self.assertEqual(
+            pp_pipeline_flowshop_makespan(
+                jobs=((10.0, 20.0), (15.0, 10.0)),
+                transfer_costs=(5.0,),
+            ),
+            45.0,
         )
 
 
@@ -48,6 +64,52 @@ class TestScoreDcutCandidates(CustomTestCase):
             score_dcut_candidates(
                 expected=torch.ones(3), costs=torch.ones(4)
             )
+
+
+class TestDcutProfileResolution(CustomTestCase):
+    @staticmethod
+    def _planner() -> DFlashDcutPlanner:
+        planner = object.__new__(DFlashDcutPlanner)
+        planner.value = "auto"
+        planner.block_size = 4
+        planner.gamma = 3
+        planner._offline_keep_counts = {}
+        planner._graph_num_tokens = lambda total: total
+        return planner
+
+    def test_sparse_graph_table_reuses_nearest_candidate(self):
+        planner = self._planner()
+        planner._costs_by_bs = {2: [10.0, 20.0, 30.0, 40.0]}
+
+        costs = planner._profile_costs_for_bs(5)
+
+        self.assertEqual(costs, [10.0, 20.0, 30.0, 40.0])
+
+    def test_sparse_pp_stage_table_reuses_nearest_candidate(self):
+        planner = self._planner()
+        planner._stage_costs_by_bs = {
+            2: ((1.0, 2.0, 3.0, 4.0), (5.0, 6.0, 7.0, 8.0))
+        }
+
+        stage_costs = planner._profile_stage_costs_for_bs(5)
+
+        self.assertEqual(
+            stage_costs,
+            ((1.0, 2.0, 3.0, 4.0), (5.0, 6.0, 7.0, 8.0)),
+        )
+
+    def test_runtime_cost_ema_only_raises_profiled_cost(self):
+        planner = self._planner()
+        planner._runtime_stage_cost_ema = {}
+
+        planner.observe_runtime_stage_cost(
+            bs=4, candidate_index=1, cost_ms=10.0
+        )
+        planner.observe_runtime_stage_cost(
+            bs=4, candidate_index=1, cost_ms=20.0, smoothing=0.5
+        )
+
+        self.assertEqual(planner._runtime_cost_for_candidate(4, 1), 15.0)
 
 
 class TestDcutRelayPlan(CustomTestCase):

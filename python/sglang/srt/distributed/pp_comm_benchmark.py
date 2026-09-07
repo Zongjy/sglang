@@ -141,6 +141,15 @@ def _run_pp_comm_benchmark(scheduler) -> Dict:
             )
         pp_group.barrier()
 
+    # The sender owns the measurement for a hop, but the D-Cut planner runs on
+    # the last PP rank. Replicate the fitted edge models to every rank before
+    # returning so the planner can use candidate-dependent transfer costs.
+    gathered = pp_group.all_gather_object(result)
+    merged_hops = {}
+    for peer_result in gathered:
+        merged_hops.update(peer_result.get("hops", {}))
+    result["hops"] = merged_hops
+
     if ps.attn_tp_rank == 0 and ps.pp_rank == 0:
         logger.info(
             f"[pp_comm_benchmark] done: pp_size={pp_size}, "

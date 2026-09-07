@@ -433,9 +433,6 @@ class Envs:
     SGLANG_TRACE_ASYNC_FLUSH_THRESHOLD = EnvInt(100)
     SGLANG_ENABLE_METRICS_DEVICE_TIMER = EnvBool(False)
     SGLANG_ENABLE_METRICS_DP_ATTENTION = EnvBool(False)
-    # Per-iteration per-PP-rank stage timing over ZMQ (pp_stage_metrics).
-    # Consumed by the PP partition tuner/advisor; publishes on every PP rank.
-    SGLANG_ENABLE_PP_STAGE_METRICS = EnvBool(False)
     # Startup-time ping-pong micro-benchmark of the pp_group transport cost.
     # Fits t_hop(num_tokens) = alpha + beta * num_tokens per adjacent PP rank
     # pair; consumed by the PP partition tuner's cost model.

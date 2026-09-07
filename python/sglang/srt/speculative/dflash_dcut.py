@@ -108,6 +108,73 @@ def pp_pipeline_cycle_cost(
     )
 
 
+def pp_pipeline_flowshop_makespan(
+    jobs: Sequence[Sequence[float]],
+    transfer_costs: Optional[Sequence[float]] = None,
+    job_transfer_costs: Optional[Sequence[Sequence[float]]] = None,
+) -> float:
+    """Simulate ordered PP microbatches through a flow-shop pipeline.
+
+    ``jobs`` contains one per-microbatch stage-service vector.  A job can enter
+    stage ``i`` only after both stage ``i`` is free and the previous stage has
+    finished its work plus the adjacent transfer.  This models the marginal
+    effect of changing one microbatch while preserving the other in-flight
+    jobs.
+    """
+    if not jobs:
+        return 0.0
+    stage_count = len(jobs[0])
+    if stage_count == 0:
+        raise ValueError("PP flow-shop jobs must contain at least one stage.")
+    if any(len(job) != stage_count for job in jobs):
+        raise ValueError("PP flow-shop jobs must have equal stage dimensions.")
+    job_transfers = None
+    if job_transfer_costs is not None:
+        if len(job_transfer_costs) != len(jobs):
+            raise ValueError(
+                "job_transfer_costs must contain one vector per PP microbatch."
+            )
+        job_transfers = tuple(
+            tuple(float(value) for value in values) for values in job_transfer_costs
+        )
+        if any(len(values) != stage_count - 1 for values in job_transfers):
+            raise ValueError(
+                "each job transfer vector must contain one value per stage edge."
+            )
+        transfers = (0.0,) * max(stage_count - 1, 0)
+    elif transfer_costs is None:
+        transfers = (0.0,) * max(stage_count - 1, 0)
+    else:
+        transfers = tuple(float(value) for value in transfer_costs)
+        if len(transfers) != stage_count - 1:
+            raise ValueError(
+                "PP flow-shop transfer_costs must contain one value per stage edge."
+            )
+    stage_available = [0.0] * stage_count
+    for job_index, job in enumerate(jobs):
+        previous_finish = 0.0
+        transfers_for_job = (
+            job_transfers[job_index] if job_transfers is not None else transfers
+        )
+        for stage, service in enumerate(job):
+            start = max(
+                stage_available[stage],
+                previous_finish
+                + (transfers_for_job[stage - 1] if stage else 0.0),
+            )
+            finish = start + max(0.0, float(service))
+            stage_available[stage] = finish
+            previous_finish = finish
+    return stage_available[-1]
+
+
+@dataclass(frozen=True)
+class _DcutPipelineSlot:
+    stage_costs: tuple[float, ...]
+    expected_tokens: float
+    transfer_costs: tuple[float, ...]
+
+
 def dflash_dcut_batch_is_compactable(batch) -> bool:
     """Whether pruning can use the top1-only fast path without changing output."""
     if batch.has_grammar or batch.return_logprob:
@@ -159,6 +226,8 @@ class DFlashDcutPlanner:
         device: torch.device,
         tp_rank: int,
         draft_cost_profiler: Optional[Callable[[int], float]] = None,
+        pipeline_transfer_costs: Optional[Sequence[float]] = None,
+        pipeline_transfer_models: Optional[Sequence[tuple[float, float]]] = None,
     ) -> None:
         self.value = value
         self.block_size = int(block_size)
@@ -173,6 +242,24 @@ class DFlashDcutPlanner:
         if self.pp_group.world_size > 1:
             async_depth = int(getattr(get_parallel(), "pp_async_batch_depth", 0) or 0)
             self.pp_microbatch_count = max(1, self.pp_group.world_size + async_depth)
+        transfer_costs = tuple(float(value) for value in (pipeline_transfer_costs or ()))
+        if transfer_costs and len(transfer_costs) != self.pp_group.world_size - 1:
+            raise ValueError(
+                "pipeline_transfer_costs must contain one value per PP stage edge."
+            )
+        self._pipeline_transfer_costs = transfer_costs or (
+            (0.0,) * max(self.pp_group.world_size - 1, 0)
+        )
+        self._pipeline_transfer_models = tuple(
+            (float(alpha), float(beta))
+            for alpha, beta in (pipeline_transfer_models or ())
+        )
+        if self._pipeline_transfer_models and len(
+            self._pipeline_transfer_models
+        ) != self.pp_group.world_size - 1:
+            raise ValueError(
+                "pipeline_transfer_models must contain one pair per PP edge."
+            )
         self._dp_attention = is_dp_attention_enabled()
         # Under DP attention each rank owns an independent local batch, so the
         # auto-candidate decision is coordinated only within the attention-TP
@@ -212,6 +299,73 @@ class DFlashDcutPlanner:
         self._offline_keep_counts: dict[int, tuple[int, ...]] = {}
         self._warned_missing_profile_bs: set[int] = set()
         self._cost_tensors_by_bs: dict[int, torch.Tensor] = {}
+        self._pp_pipeline_slots: dict[int, _DcutPipelineSlot] = {}
+        self._pp_pipeline_slot_seen: dict[int, int] = {}
+        self._pp_pipeline_selection_step = 0
+        self._runtime_stage_cost_ema: dict[tuple[int, int], float] = {}
+        self._full_hold_bs: Optional[int] = None
+        self._full_hold_remaining = 0
+
+    def should_hold_full(self, bs: int) -> bool:
+        return (
+            self.pp_group.world_size > 1
+            and self._full_hold_bs == int(bs)
+            and self._full_hold_remaining > 0
+        )
+
+    def consume_full_hold(self) -> None:
+        if self._full_hold_remaining > 0:
+            self._full_hold_remaining -= 1
+
+    def observe_runtime_stage_cost(
+        self,
+        *,
+        bs: int,
+        candidate_index: int,
+        cost_ms: float,
+        smoothing: float = 0.2,
+    ) -> None:
+        """Feed a selected candidate's measured stage wall time back into cost.
+
+        The measurement includes compact-path work that startup model.forward
+        profiling cannot see. Runtime observations only raise the offline cost
+        through ``max`` during selection, so one asynchronous or noisy sample
+        cannot make a candidate look unrealistically cheap.
+        """
+        if not self.is_auto or bs <= 0 or cost_ms <= 0.0:
+            return
+        if not 0 <= int(candidate_index) < len(_AUTO_RATIOS):
+            return
+        key = (int(bs), int(candidate_index))
+        previous = self._runtime_stage_cost_ema.get(key)
+        if previous is None:
+            self._runtime_stage_cost_ema[key] = float(cost_ms)
+        else:
+            alpha = min(max(float(smoothing), 0.0), 1.0)
+            self._runtime_stage_cost_ema[key] = (
+                (1.0 - alpha) * previous + alpha * float(cost_ms)
+            )
+
+    def _runtime_cost_for_candidate(self, bs: int, candidate_index: int) -> Optional[float]:
+        choices = [
+            (abs(profile_bs - bs), cost)
+            for (profile_bs, profile_candidate), cost in self._runtime_stage_cost_ema.items()
+            if profile_candidate == candidate_index
+        ]
+        if not choices:
+            return None
+        return float(min(choices, key=lambda item: item[0])[1])
+
+    def set_pipeline_transfer_models(
+        self, models: Sequence[tuple[float, float]]
+    ) -> None:
+        """Install measured ``(alpha_ms, beta_ms_per_token)`` PP edge models."""
+        models = tuple((float(alpha), float(beta)) for alpha, beta in models)
+        if len(models) != self.pp_group.world_size - 1:
+            raise ValueError(
+                "pipeline transfer model count must equal pp_size - 1."
+            )
+        self._pipeline_transfer_models = models
 
     @property
     def is_auto(self) -> bool:
@@ -267,8 +421,8 @@ class DFlashDcutPlanner:
         resolved = []
         for candidate_index, keep_count in enumerate(requested_keeps):
             same_tier = []
+            target_tier = self._graph_num_tokens(bs + keep_count)
             if match_graph_tier:
-                target_tier = self._graph_num_tokens(bs + keep_count)
                 for profile_bs, costs in complete.items():
                     profile_keeps = self._offline_keep_counts.get(
                         profile_bs, self.candidate_keep_counts(profile_bs)
@@ -278,12 +432,34 @@ class DFlashDcutPlanner:
                     )
                     if profile_tier == target_tier:
                         same_tier.append((profile_bs, costs))
-                if not same_tier:
-                    return None
             choices = same_tier or list(complete.items())
-            _, nearest_costs = min(
-                choices, key=lambda item: (abs(item[0] - bs), item[0])
-            )
+            if match_graph_tier and not same_tier:
+                # Runtime batches need not line up with the small set of
+                # captured request-count buckets.  Reuse the profile whose
+                # candidate has the nearest packed-token bucket instead of
+                # treating a sparse table as a missing table and forcing the
+                # hard-coded ratio fallback.
+                choices = sorted(
+                    choices,
+                    key=lambda item: (
+                        abs(
+                            self._graph_num_tokens(
+                                item[0]
+                                + self._offline_keep_counts.get(
+                                    item[0], self.candidate_keep_counts(item[0])
+                                )[candidate_index]
+                            )
+                            - target_tier
+                        ),
+                        abs(item[0] - bs),
+                        item[0],
+                    ),
+                )
+                _, nearest_costs = choices[0]
+            else:
+                _, nearest_costs = min(
+                    choices, key=lambda item: (abs(item[0] - bs), item[0])
+                )
             resolved.append(float(nearest_costs[candidate_index]))
         return resolved
 
@@ -326,8 +502,29 @@ class DFlashDcutPlanner:
                         continue
                 choices.append((abs(profile_bs - bs), profile_bs, stage_costs))
             if not choices:
-                return None
-            _, _, nearest = min(choices, key=lambda item: (item[0], item[1]))
+                # A runtime batch may fall between captured graph buckets. Use
+                # the closest candidate token bucket rather than abandoning
+                # the whole PP stage table and falling back to ratio 0.75.
+                for profile_bs, stage_costs in table.items():
+                    profile_keeps = self._offline_keep_counts.get(
+                        profile_bs, self.candidate_keep_counts(profile_bs)
+                    )
+                    profile_tier = self._graph_num_tokens(
+                        profile_bs + profile_keeps[candidate_index]
+                    )
+                    choices.append(
+                        (
+                            abs(profile_tier - target_tier),
+                            abs(profile_bs - bs),
+                            profile_bs,
+                            stage_costs,
+                        )
+                    )
+                _, _, _, nearest = min(
+                    choices, key=lambda item: (item[0], item[1], item[2])
+                )
+            else:
+                _, _, nearest = min(choices, key=lambda item: (item[0], item[1]))
             if not resolved:
                 resolved = [[] for _ in nearest]
             for rank, values in enumerate(nearest):
@@ -370,7 +567,102 @@ class DFlashDcutPlanner:
         self._cost_tensors_by_bs[bs] = tensor
         return tensor
 
-    def _write_auto_index_local(self, *, confidence: torch.Tensor, bs: int) -> None:
+    def _select_pipeline_candidate(
+        self,
+        *,
+        expected: torch.Tensor,
+        candidate_stage_costs: Sequence[Sequence[float]],
+        candidate_transfer_costs: Sequence[Sequence[float]],
+        bs: int,
+        pipeline_mb_id: int,
+    ) -> int:
+        """Choose a ratio after inserting it into the in-flight PP schedule."""
+        stage_count = self.pp_group.world_size
+        if stage_count <= 1:
+            raise ValueError("pipeline candidate selection requires PP > 1.")
+        if len(candidate_stage_costs) != len(_AUTO_RATIOS):
+            raise ValueError("candidate_stage_costs must cover every auto ratio.")
+        if len(candidate_transfer_costs) != len(_AUTO_RATIOS):
+            raise ValueError("candidate_transfer_costs must cover every auto ratio.")
+
+        self._pp_pipeline_selection_step += 1
+        selection_step = self._pp_pipeline_selection_step
+        stale_before = selection_step - self.pp_microbatch_count
+        for slot_id, seen_step in tuple(self._pp_pipeline_slot_seen.items()):
+            if seen_step < stale_before:
+                self._pp_pipeline_slot_seen.pop(slot_id, None)
+                self._pp_pipeline_slots.pop(slot_id, None)
+
+        # Unknown slots are conservatively modeled with the candidate under
+        # consideration. Once every slot has been observed this becomes a
+        # direct per-microbatch flow-shop simulation.
+        slot_ids = list(range(self.pp_microbatch_count))
+        if pipeline_mb_id not in slot_ids:
+            slot_ids.append(int(pipeline_mb_id))
+            slot_ids.sort()
+        scores = []
+        for candidate_index, current_costs in enumerate(candidate_stage_costs):
+            jobs = []
+            job_transfer_costs = []
+            total_expected = 0.0
+            current_expected = float(expected[candidate_index].item())
+            for slot_id in slot_ids:
+                if slot_id == pipeline_mb_id:
+                    slot = _DcutPipelineSlot(
+                        stage_costs=tuple(float(value) for value in current_costs),
+                        expected_tokens=current_expected,
+                        transfer_costs=tuple(
+                            float(value)
+                            for value in candidate_transfer_costs[candidate_index]
+                        ),
+                    )
+                else:
+                    slot = self._pp_pipeline_slots.get(slot_id)
+                    if slot is None:
+                        slot = _DcutPipelineSlot(
+                            stage_costs=tuple(
+                                float(value) for value in current_costs
+                            ),
+                            expected_tokens=current_expected,
+                            transfer_costs=tuple(
+                                float(value)
+                                for value in candidate_transfer_costs[candidate_index]
+                            ),
+                        )
+                jobs.append(slot.stage_costs)
+                job_transfer_costs.append(slot.transfer_costs)
+                total_expected += slot.expected_tokens
+            makespan = pp_pipeline_flowshop_makespan(
+                jobs,
+                transfer_costs=self._pipeline_transfer_costs,
+                job_transfer_costs=job_transfer_costs,
+            )
+            scores.append(total_expected / max(makespan, 1e-6))
+
+        selected = int(torch.tensor(scores).argmax().item())
+        self._pp_pipeline_slots[int(pipeline_mb_id)] = _DcutPipelineSlot(
+            stage_costs=tuple(float(value) for value in candidate_stage_costs[selected]),
+            expected_tokens=float(expected[selected].item()),
+            transfer_costs=tuple(
+                float(value) for value in candidate_transfer_costs[selected]
+            ),
+        )
+        self._pp_pipeline_slot_seen[int(pipeline_mb_id)] = selection_step
+        if selected == len(_AUTO_RATIOS) - 1 and self._runtime_stage_cost_ema:
+            self._full_hold_bs = int(bs)
+            self._full_hold_remaining = 32
+        elif self._full_hold_bs == int(bs):
+            self._full_hold_bs = None
+            self._full_hold_remaining = 0
+        return selected
+
+    def _write_auto_index_local(
+        self,
+        *,
+        confidence: torch.Tensor,
+        bs: int,
+        pipeline_mb_id: Optional[int] = None,
+    ) -> None:
         """Write the auto-mode candidate index to ``_auto_index_device``.
 
         Stays on device: the caller broadcasts, then materializes the scalar
@@ -408,6 +700,15 @@ class DFlashDcutPlanner:
         overhead_costs = self._profile_metric_for_bs(
             self._overhead_costs_by_bs, bs, match_graph_tier=False
         )
+        candidate_transfer_costs = tuple(
+            tuple(
+                alpha + beta * self._graph_num_tokens(bs + keep_count)
+                for alpha, beta in self._pipeline_transfer_models
+            )
+            if self._pipeline_transfer_models
+            else self._pipeline_transfer_costs
+            for keep_count in keep_counts
+        )
         if stage_costs is not None:
             stage_rows = []
             for rank, values in enumerate(stage_costs):
@@ -443,19 +744,66 @@ class DFlashDcutPlanner:
                     stage_tensor = stage_tensor + torch.tensor(
                         overhead_costs, dtype=torch.float32, device=self.device
                     )
+                for candidate_index in range(len(_AUTO_RATIOS)):
+                    observed = self._runtime_cost_for_candidate(
+                        bs, candidate_index
+                    )
+                    if observed is not None:
+                        stage_tensor[candidate_index] = torch.maximum(
+                            stage_tensor[candidate_index],
+                            stage_tensor.new_tensor(observed),
+                        )
                 stage_rows.append(stage_tensor)
+            # The tensor rows above are [stage, candidate]. Convert them into
+            # per-candidate vectors for the stateful PP simulation.
+            candidate_stage_costs = tuple(
+                tuple(
+                    float(stage_rows[stage][candidate_index].item())
+                    for stage in range(len(stage_rows))
+                )
+                for candidate_index in range(len(_AUTO_RATIOS))
+            )
+            if pipeline_mb_id is not None and self.pp_group.world_size > 1:
+                selected = self._select_pipeline_candidate(
+                    expected=expected,
+                    candidate_stage_costs=candidate_stage_costs,
+                    candidate_transfer_costs=candidate_transfer_costs,
+                    bs=bs,
+                    pipeline_mb_id=int(pipeline_mb_id),
+                )
+                self._auto_index_device.fill_(selected)
+                return
             cost_tensor = pp_pipeline_cycle_cost(
                 torch.stack(stage_rows, dim=0), self.pp_microbatch_count
             )
         else:
             cost_tensor = self._cached_device_costs(bs, costs)
+            runtime_costs = cost_tensor.clone()
+            for candidate_index in range(len(_AUTO_RATIOS)):
+                observed = self._runtime_cost_for_candidate(bs, candidate_index)
+                if observed is not None:
+                    runtime_costs[candidate_index] = torch.maximum(
+                        runtime_costs[candidate_index],
+                        runtime_costs.new_tensor(observed),
+                    )
+            cost_tensor = runtime_costs
         scores = score_dcut_candidates(expected=expected, costs=cost_tensor)
         self._auto_index_device.copy_(torch.argmax(scores).to(dtype=torch.int64))
 
-    def _select_auto_candidate(self, *, confidence: torch.Tensor, bs: int) -> int:
+    def _select_auto_candidate(
+        self,
+        *,
+        confidence: torch.Tensor,
+        bs: int,
+        pipeline_mb_id: Optional[int] = None,
+    ) -> int:
         group = self._select_group
         if group.rank_in_group == 0:
-            self._write_auto_index_local(confidence=confidence, bs=bs)
+            self._write_auto_index_local(
+                confidence=confidence,
+                bs=bs,
+                pipeline_mb_id=pipeline_mb_id,
+            )
         group.broadcast(self._auto_index_device, src=0)
         # CUDA graph replay keys off a host bucket. This is the only hot-path
         # scalar sync required by the ratio selector.
@@ -1129,6 +1477,7 @@ class DFlashDcutPlanner:
         force_full: bool = False,
         budget_cap: Optional[int] = None,
         graph_num_tokens_floor: Optional[int] = None,
+        pipeline_mb_id: Optional[int] = None,
     ) -> DFlashDcutPlan:
         """Plan one decode step's D-Cut layout.
 
@@ -1153,7 +1502,11 @@ class DFlashDcutPlanner:
 
         candidate_index: Optional[int]
         if self.is_auto:
-            candidate_index = self._select_auto_candidate(confidence=confidence, bs=bs)
+            candidate_index = self._select_auto_candidate(
+                confidence=confidence,
+                bs=bs,
+                pipeline_mb_id=pipeline_mb_id,
+            )
             keep_count = self.candidate_keep_counts(bs)[candidate_index]
         else:
             candidate_index = None
