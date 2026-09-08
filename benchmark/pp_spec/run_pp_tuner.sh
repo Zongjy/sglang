@@ -4,74 +4,85 @@ set -euo pipefail
 SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 REPO_ROOT=$(cd -- "$SCRIPT_DIR/../.." && pwd)
 
+if [[ -z ${PYTHON:-} ]]; then
+  if [[ -x "$REPO_ROOT/.venv/bin/python" ]]; then
+    PYTHON="$REPO_ROOT/.venv/bin/python"
+  else
+    PYTHON=python
+  fi
+fi
 MODEL=${MODEL:-Qwen/Qwen3.5-9B}
 DRAFT_MODEL=${DRAFT_MODEL:-z-lab/Qwen3.5-9B-DFlash}
 PP_SIZE=${PP_SIZE:-2}
 TP_SIZE=${TP_SIZE:-1}
 NNODES=${NNODES:-1}
-BATCH_SIZE=${BATCH_SIZE:-32}
-INPUT_TOKENS=${INPUT_TOKENS:-4000}
+BATCH_SIZES=${BATCH_SIZES:-${BATCH_SIZE:-"32 64 128"}}
+INPUT_TOKENS=${INPUT_TOKENS:-2000}
 OUTPUT_TOKENS=${OUTPUT_TOKENS:-256}
-PROFILE_STEPS=${PROFILE_STEPS:-32}
+PROFILE_STEPS=${PROFILE_STEPS:-128}
 BLOCK_SIZE=${BLOCK_SIZE:-16}
+MEM_FRACTION_STATIC=${MEM_FRACTION_STATIC:-0.7}
 PAGE_SIZE=${PAGE_SIZE:-1}
-MEM_FRACTION_STATIC=${MEM_FRACTION_STATIC:-0.75}
 MAMBA_SSM_DTYPE=${MAMBA_SSM_DTYPE:-float32}
 MAMBA_FULL_MEMORY_RATIO=${MAMBA_FULL_MEMORY_RATIO:-0.9}
 ENABLE_REPLAY_SSM=${ENABLE_REPLAY_SSM:-1}
-OUTPUT_DIR=${OUTPUT_DIR:-$SCRIPT_DIR/results/${MODEL//\//_}_profile_$(date -u +%Y%m%d_%H%M%S)}
-
-ATTENTION_BACKEND=${ATTENTION_BACKEND:-flashinfer}
-DRAFT_ATTENTION_BACKEND=${DRAFT_ATTENTION_BACKEND:-flashinfer}
+OFFLINE=${OFFLINE:-0}
 DTYPE=${DTYPE:-bfloat16}
+ATTENTION_BACKEND=${ATTENTION_BACKEND:-triton}
+DRAFT_ATTENTION_BACKEND=${DRAFT_ATTENTION_BACKEND:-flashinfer}
+MIN_LAYERS=${MIN_LAYERS:-8}
+K_BEST=${K_BEST:-30}
+DRY_RUN=${DRY_RUN:-0}
 
-if [[ $ENABLE_REPLAY_SSM != 0 && $ENABLE_REPLAY_SSM != 1 ]]; then
-  echo "ENABLE_REPLAY_SSM must be 0 or 1" >&2
+MODEL_TAG=${MODEL//\//_}
+RESULTS_DIR=${RESULTS_DIR:-${OUTPUT_DIR:-$SCRIPT_DIR/results/${MODEL_TAG}_multibatch_$(date -u +%Y%m%d_%H%M%S)}}
+
+read -r -a batch_sizes <<< "$BATCH_SIZES"
+if [[ ${#batch_sizes[@]} -eq 0 ]]; then
+  echo "BATCH_SIZES must contain at least one batch size" >&2
   exit 2
 fi
 
-profile_args=(
-  profile
-  --output-dir "$OUTPUT_DIR"
+args=(
+  --results-dir "$RESULTS_DIR"
+  --batch-sizes "${batch_sizes[@]}"
   --model-path "$MODEL"
   --draft-model-path "$DRAFT_MODEL"
-  --pp-size "$PP_SIZE"
   --tp-size "$TP_SIZE"
+  --pp-size "$PP_SIZE"
   --nnodes "$NNODES"
-  --batch-size "$BATCH_SIZE"
   --input-tokens "$INPUT_TOKENS"
   --output-tokens "$OUTPUT_TOKENS"
   --profile-steps "$PROFILE_STEPS"
   --block-size "$BLOCK_SIZE"
-  --page-size "$PAGE_SIZE"
   --mem-fraction-static "$MEM_FRACTION_STATIC"
+  --page-size "$PAGE_SIZE"
   --mamba-ssm-dtype "$MAMBA_SSM_DTYPE"
   --mamba-full-memory-ratio "$MAMBA_FULL_MEMORY_RATIO"
-)
-
-if [[ -n ${EXECUTION_BUCKET:-} ]]; then
-  profile_args+=(--execution-bucket "$EXECUTION_BUCKET")
-fi
-if [[ -n ${MAX_RUNNING_REQUESTS:-} ]]; then
-  profile_args+=(--max-running-requests "$MAX_RUNNING_REQUESTS")
-fi
-if [[ ${OFFLINE:-0} == 1 ]]; then
-  profile_args+=(--offline)
-fi
-
-echo "RayEngine PP profile output: $OUTPUT_DIR"
-cd "$REPO_ROOT"
-server_args=(
   --dtype "$DTYPE"
   --attention-backend "$ATTENTION_BACKEND"
-  --speculative-draft-attention-backend "$DRAFT_ATTENTION_BACKEND"
-  --disable-radix-cache
+  --draft-attention-backend "$DRAFT_ATTENTION_BACKEND"
+  --min-layers "$MIN_LAYERS"
+  --k-best "$K_BEST"
 )
-if [[ $ENABLE_REPLAY_SSM == 1 ]]; then
-  server_args+=(--linear-attn-backend triton --enable-linear-replayssm-spec)
+
+if [[ -n ${BASELINE_PARTITION:-} ]]; then
+  args+=(--baseline-partition "$BASELINE_PARTITION")
 fi
-exec python "$SCRIPT_DIR/adaptive_pp_tuner.py" \
-  "${profile_args[@]}" \
-  "$@" \
-  --server-args \
-  "${server_args[@]}"
+if [[ ${DRY_RUN} == 1 ]]; then
+  args+=(--dry-run)
+fi
+if [[ ${ENABLE_REPLAY_SSM} != 1 && ${ENABLE_REPLAY_SSM} != 0 ]]; then
+  echo "ENABLE_REPLAY_SSM must be 0 or 1" >&2
+  exit 2
+fi
+if [[ ${ENABLE_REPLAY_SSM} == 0 ]]; then
+  args+=(--disable-replay-ssm)
+fi
+if [[ ${OFFLINE} == 1 ]]; then
+  args+=(--offline)
+fi
+
+echo "PP multibatch tuner output: $RESULTS_DIR"
+cd "$REPO_ROOT"
+exec "$PYTHON" "$SCRIPT_DIR/run_multibatch_profile.py" "${args[@]}" "$@"

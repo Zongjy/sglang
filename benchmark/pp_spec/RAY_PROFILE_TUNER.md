@@ -1,5 +1,21 @@
 # RayEngine PP Boundary Tuner
 
+The default entry point is the multi-batch wrapper. It profiles the same PP
+baseline at several execution buckets and D-Cut ratios, then emits one
+partition that minimizes the worst measured bucket/ratio combination:
+
+```bash
+source .venv/bin/activate
+MODEL=Qwen/Qwen3.5-27B-FP8 \
+DRAFT_MODEL=z-lab/Qwen3.5-27B-DFlash \
+BATCH_SIZES="32 64 128" \
+OUTPUT_DIR=/shared/pp-multibatch \
+bash benchmark/pp_spec/run_pp_tuner.sh
+```
+
+Set `DRY_RUN=1` to print all profile and analysis commands without launching
+workloads.
+
 The tuner has one workflow:
 
 ```text

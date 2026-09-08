@@ -265,6 +265,14 @@ def run_profile(args: argparse.Namespace) -> Path:
     if execution_bucket <= 0:
         raise TuningError("--execution-bucket must be positive")
     env = os.environ.copy()
+    # The invoking environment may have an editable SGLang install from a
+    # different checkout. Prefer this repository when launching the benchmark
+    # subprocess so the tuner and workload use the same source tree.
+    repo_python = str(REPO_ROOT / "python")
+    python_path = env.get("PYTHONPATH")
+    env["PYTHONPATH"] = os.pathsep.join(
+        item for item in (repo_python, str(REPO_ROOT), python_path) if item
+    )
     env["SGLANG_TORCH_PROFILER_DIR"] = str(profile_dir)
     env["SGLANG_PROFILE_WITH_STACK"] = "false"
     env["SGLANG_PROFILE_RECORD_SHAPES"] = "false"

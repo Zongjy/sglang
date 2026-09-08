@@ -35,6 +35,7 @@ class RankTraceProfile:
     intrinsic_samples_ms: list[float]
     target_samples_ms: list[float]
     pp_p2p_windows: int
+    pp_p2p_events: int = 0
 
     @property
     def intrinsic_median_ms(self) -> float:
@@ -302,6 +303,7 @@ def parse_rank_trace(path: Path, trim_samples: int = 1) -> RankTraceProfile:
         intrinsic_samples_ms=intrinsic_samples,
         target_samples_ms=target_samples,
         pp_p2p_windows=pp_p2p_windows,
+        pp_p2p_events=len(pp_p2p),
     )
 
 
@@ -336,17 +338,17 @@ def summarize_trace_dir(
             f"trace ranks do not match PP{pp_size}xTP{tp_size}: "
             f"missing={sorted(expected - actual)}, extra={sorted(actual - expected)}"
         )
-    if pp_size > 1 and any(
-        profile.pp_p2p_windows != len(profile.intrinsic_samples_ms)
-        for profile in profiles
-    ):
+    # Pipeline stages can enqueue a boundary transfer just before the local
+    # run_batch interval starts. Require metadata somewhere in the trace, but
+    # do not require every verify window to overlap a Send/Recv event.
+    if pp_size > 1 and any(profile.pp_p2p_events == 0 for profile in profiles):
         missing = sorted(
             (profile.pp_rank, profile.tp_rank)
             for profile in profiles
-            if profile.pp_p2p_windows != len(profile.intrinsic_samples_ms)
+            if profile.pp_p2p_events == 0
         )
         raise TraceProfileError(
-            f"Kineto PP Send/Recv metadata is missing from verify windows on ranks {missing}"
+            f"Kineto PP Send/Recv metadata is missing from traces on ranks {missing}"
         )
 
     selected = [
