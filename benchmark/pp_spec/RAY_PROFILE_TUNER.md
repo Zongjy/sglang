@@ -121,5 +121,24 @@ Multiple execution buckets can be analyzed together by repeating
 The tuner minimizes the worst bucket/ratio cycle and emits one static
 partition with runtime D-Cut set to `auto`.
 
+## Per-cell selection and the runtime cost table
+
+`--partition-selection per-cell` replaces the minimax aggregation with a
+per-(bucket, ratio) view: every cell reports its own optimal partition, and
+the recommended partition is simply the one that wins the most cells (ties
+break lexicographically).  The analysis directory then also contains
+`dcut_runtime_cost_table.json` — the selected partition's predicted per-stage
+cost at every (bucket, ratio) cell, in the schema consumed by the runtime:
+
+```bash
+sglang serve ... --speculative-dflash-dcut auto \
+  --speculative-dflash-dcut-cost-table /path/to/dcut_runtime_cost_table.json
+```
+
+Loading a table skips the runtime startup profiling pass.  Every PP/TP rank
+must load the identical file; the planner aborts on a content or partition
+mismatch, and the runtime EMA still corrects table entries upward from
+observed step times.  `run_multibatch_profile.py` runs this whole flow.
+
 The optimizer enumerates `(l, ..., l, L - (P - 1) * l)` and returns the
 candidate with the smallest predicted objective.

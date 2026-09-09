@@ -1122,6 +1122,12 @@ class Envs:
     SGLANG_ENABLE_OVERLAP_PLAN_STREAM = EnvBool(False)
     # A/B: keep the DFLASH draft greedy head eager (not folded in-graph).
     SGLANG_DFLASH_EAGER_DRAFT_SAMPLER = EnvBool(False)
+    # D-Cut auto: pin a batch size to full-width verify when the profiled
+    # best-case step savings (cost(1.0) - min(cost(ratio))) fall below this
+    # threshold.  Covers the selector's own per-step overhead (confidence
+    # math, top-k schedule, host syncs) plus the profile-vs-runtime gap at
+    # launch-bound small batches.  <= 0 disables the pinning.
+    SGLANG_DFLASH_DCUT_PIN_FULL_MIN_SAVINGS_MS = EnvFloat(5.0)
     SGLANG_RAGGED_VERIFY_MODE = EnvStr("static")
     SGLANG_TEST_RAGGED_VERIFY_FORCE_UNIFORM_CAPTURE = EnvBool(False)
     # Skip draft_extend while adaptive spec is at steps=0 (drafting disabled).

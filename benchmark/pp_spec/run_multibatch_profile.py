@@ -139,6 +139,10 @@ def run(args: argparse.Namespace) -> None:
     command.extend([
         "--dcut-profile", str(costs_path), "--all-boundaries",
         "--min-layers", str(args.min_layers), "--k-best", str(args.k_best),
+        # Report the optimal partition per (bucket, ratio) cell and recommend
+        # the partition that wins the most cells; also emits the runtime D-Cut
+        # cost table for the selected partition.
+        "--partition-selection", "per-cell",
         "--output-dir", str(root / f"{model_tag}_analysis_multi"),
     ])
     print(shlex.join(command), flush=True)

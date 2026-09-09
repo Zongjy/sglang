@@ -311,6 +311,7 @@ def run_profile(args: argparse.Namespace) -> Path:
             "pp_size": args.pp_size,
             "baseline_partition": list(partition),
             "execution_bucket": execution_bucket,
+            "block_size": args.block_size,
         },
     )
     print(f"[profile] traces written under {profile_dir}", flush=True)
@@ -517,28 +518,61 @@ def _run_multi_bucket_analysis(args: argparse.Namespace, profile_dirs: Sequence[
         args.dcut_profile, tuple(bucket_profiles), pp_size
     )
     try:
-        result = partition_optimizer.optimize_partition_across_buckets(
-            model,
-            dcut,
-            min_layers=args.min_layers,
-            max_layers=max_layers,
-            k_best=args.k_best,
-            layout=layout,
-            prefix_l_range=prefix_range,
-            stage_comm_ms=stage_comm_ms,
-            all_boundaries=args.all_boundaries,
-        )
+        if args.partition_selection == "per-cell":
+            result = partition_optimizer.optimize_per_cell_partitions(
+                model,
+                dcut,
+                min_layers=args.min_layers,
+                max_layers=max_layers,
+                layout=layout,
+                prefix_l_range=prefix_range,
+                stage_comm_ms=stage_comm_ms,
+                all_boundaries=args.all_boundaries,
+            )
+        else:
+            result = partition_optimizer.optimize_partition_across_buckets(
+                model,
+                dcut,
+                min_layers=args.min_layers,
+                max_layers=max_layers,
+                k_best=args.k_best,
+                layout=layout,
+                prefix_l_range=prefix_range,
+                stage_comm_ms=stage_comm_ms,
+                all_boundaries=args.all_boundaries,
+            )
     except (partition_optimizer.OptimizerError, stage_model.StageModelError) as exc:
         raise TuningError(str(exc)) from exc
     output_dir = (args.output_dir or (profile_dirs[0] / "analysis_multi")).resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
     write_json(output_dir / "analysis.json", result.to_dict())
     (output_dir / "analysis.txt").write_text(result.to_report() + "\n")
-    (output_dir / "recommended.args").write_text(
-        "--pp-layer-partition "
-        + ",".join(map(str, result.selected.partition))
-        + " --speculative-dflash-dcut auto\n"
-    )
+    if args.partition_selection == "per-cell":
+        selected = result.selected
+        block_size = int(first_profile.get("block_size") or args.block_size)
+        cost_table = result.to_runtime_cost_table(block_size=block_size)
+        table_ratios = set(cost_table["ratios"])
+        required = {0.25, 0.5, 0.75, 1.0}
+        if table_ratios != required:
+            raise TuningError(
+                "runtime D-Cut cost table needs exactly the auto ratio grid "
+                f"{sorted(required)}, got {sorted(table_ratios)}; re-profile "
+                "with --speculative-dflash-dcut covering all four ratios"
+            )
+        table_path = output_dir / "dcut_runtime_cost_table.json"
+        write_json(table_path, cost_table)
+        (output_dir / "recommended.args").write_text(
+            "--pp-layer-partition "
+            + ",".join(map(str, selected))
+            + " --speculative-dflash-dcut auto"
+            + f" --speculative-dflash-dcut-cost-table {table_path}\n"
+        )
+    else:
+        (output_dir / "recommended.args").write_text(
+            "--pp-layer-partition "
+            + ",".join(map(str, result.selected.partition))
+            + " --speculative-dflash-dcut auto\n"
+        )
     print(result.to_report(), flush=True)
     print(f"[analyze] artifacts written to {output_dir}", flush=True)
     return output_dir
@@ -790,6 +824,27 @@ def build_parser() -> argparse.ArgumentParser:
         help=(
             "JSON ratio -> measured bottleneck cost, or ratio -> per-stage costs; "
             "enables joint PP partition and D-Cut selection"
+        ),
+    )
+    analyze.add_argument(
+        "--partition-selection",
+        choices=("robust", "per-cell"),
+        default="robust",
+        help=(
+            "robust: one partition minimizing the worst bucket/ratio cycle "
+            "(default). per-cell: report the optimal partition per "
+            "(bucket, ratio) cell and recommend the one that wins the most "
+            "cells; also emits dcut_runtime_cost_table.json for the runtime "
+            "--speculative-dflash-dcut-cost-table option."
+        ),
+    )
+    analyze.add_argument(
+        "--block-size",
+        type=int,
+        default=16,
+        help=(
+            "DFLASH block size recorded in the runtime cost table; the value "
+            "stored in profile.json takes precedence when present"
         ),
     )
     return parser

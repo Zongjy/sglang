@@ -775,7 +775,24 @@ class DFlashWorkerV2(BaseSpecWorker):
         # PP auto profiling is collective across every target stage, including
         # non-last ranks that intentionally have no draft worker.
         if self._dcut_planner is not None:
-            self._dcut_planner.profile_dcut_cost_table()
+            cost_table = self.server_args.speculative_dflash_dcut_cost_table
+            if cost_table:
+                partition_arg = self.server_args.pp_layer_partition
+                expected_partition = (
+                    tuple(
+                        int(value.strip())
+                        for value in str(partition_arg).split(",")
+                        if value.strip()
+                    )
+                    if partition_arg is not None
+                    else None
+                )
+                self._dcut_planner.load_dcut_cost_table(
+                    cost_table,
+                    expected_partition=expected_partition,
+                )
+            else:
+                self._dcut_planner.profile_dcut_cost_table()
 
     def _profile_dflash_draft_cost_ms(self, bs: int) -> float:
         """Profile the ratio-independent DFlash draft step for one local bs.
@@ -2305,11 +2322,15 @@ class DFlashWorkerV2(BaseSpecWorker):
             draft_next = self._draft_sampler.out[:num_proposed].view(
                 bs, int(self.block_size) - 1
             )
+            # Confidence is consumed in the same step by the D-Cut selector;
+            # skip it when this batch size is pinned to full width.  The
+            # fused sampler still computes it in-graph (capture-time shape),
+            # but nothing reads it and it is not relayed over PP.
             self._last_draft_confidence = (
                 self._draft_sampler.confidence_out[:num_proposed].view(
                     bs, int(self.block_size) - 1
                 )
-                if self._dcut_enabled
+                if self._dcut_enabled and not self._dcut_pinned_full(bs)
                 else None
             )
         else:
@@ -2318,7 +2339,7 @@ class DFlashWorkerV2(BaseSpecWorker):
                 raise RuntimeError("DFLASH draft model returned no hidden states.")
             draft_hidden = draft_hidden.view(bs, int(self.block_size), -1)
             proposal_hidden = draft_hidden[:, 1:, :].reshape(-1, draft_hidden.shape[-1])
-            if self._dcut_enabled:
+            if self._dcut_enabled and not self._dcut_pinned_full(bs):
                 draft_next_flat, confidence_flat = (
                     self._greedy_sample_with_confidence_from_vocab_parallel_head(
                         hidden_states=proposal_hidden,
@@ -2453,6 +2474,10 @@ class DFlashWorkerV2(BaseSpecWorker):
 
         return block_ids, positions_2d, verify_out_cache_loc_2d, draft_tokens
 
+    def _dcut_pinned_full(self, bs: int) -> bool:
+        planner = self._dcut_planner
+        return planner is not None and planner.is_full_pinned(bs)
+
     def _resolve_dcut_plan(
         self,
         *,
@@ -2468,6 +2493,11 @@ class DFlashWorkerV2(BaseSpecWorker):
         force_full = not dflash_dcut_batch_is_compactable(batch)
         if force_full:
             return planner.full_plan(bs=bs)
+        if planner.is_full_pinned(bs):
+            # Pinned sizes skip selection (and its host syncs) entirely.  The
+            # decision is bs-local and deterministic given the shared startup
+            # cost table, so every PP rank resolves the identical layout.
+            return planner.pinned_full_plan(bs=bs)
 
         if pp_raw is None:
             confidence = self._last_draft_confidence
@@ -2533,7 +2563,11 @@ class DFlashWorkerV2(BaseSpecWorker):
             return None
         if batch.forward_mode.is_decode():
             bs_local = len(batch.seq_lens)
-            if dflash_dcut_batch_is_compactable(batch):
+            if self._dcut_planner.is_full_pinned(bs_local):
+                # Pinned batches run the full-width plan; publish that width
+                # so the shared tier covers it instead of forking the key.
+                budget_local = bs_local * (int(self.block_size) - 1)
+            elif dflash_dcut_batch_is_compactable(batch):
                 budget_local = self._dcut_planner.current_keep_budget(bs_local)
             else:
                 # force_full batches keep the full block; publish that width
@@ -3253,20 +3287,26 @@ class DFlashWorkerV2(BaseSpecWorker):
             next_dcut_confidence = None
             next_dcut_plan = None
             if self._dcut_planner is not None:
-                next_dcut_confidence = self._last_draft_confidence
-                if next_dcut_confidence is None:
-                    raise RuntimeError(
-                        "DFLASH D-Cut next-block proposal did not produce confidence."
-                    )
-                if self._dcut_planner.should_hold_full(bs):
-                    next_dcut_plan = self._dcut_planner.full_plan(bs=bs)
-                    self._dcut_planner.consume_full_hold()
+                if self._dcut_planner.is_full_pinned(bs):
+                    # Skip selection and the confidence relay entirely: the
+                    # startup cost table says pruning cannot pay for the
+                    # selector at this batch size.
+                    next_dcut_plan = self._dcut_planner.pinned_full_plan(bs=bs)
                 else:
-                    next_dcut_plan = self._dcut_planner.plan(
-                        confidence=next_dcut_confidence,
-                        force_full=not dflash_dcut_batch_is_compactable(batch),
-                        pipeline_mb_id=getattr(batch, "pp_mb_id", None),
-                    )
+                    next_dcut_confidence = self._last_draft_confidence
+                    if next_dcut_confidence is None:
+                        raise RuntimeError(
+                            "DFLASH D-Cut next-block proposal did not produce confidence."
+                        )
+                    if self._dcut_planner.should_hold_full(bs):
+                        next_dcut_plan = self._dcut_planner.full_plan(bs=bs)
+                        self._dcut_planner.consume_full_hold()
+                    else:
+                        next_dcut_plan = self._dcut_planner.plan(
+                            confidence=next_dcut_confidence,
+                            force_full=not dflash_dcut_batch_is_compactable(batch),
+                            pipeline_mb_id=getattr(batch, "pp_mb_id", None),
+                        )
             pp_raw_out = DFlashPPVerifyInputRaw(
                 bonus_tokens=bonus.to(device=device, dtype=torch.int64),
                 draft_tokens=next_draft_tokens[:, 1:]

@@ -2136,6 +2136,14 @@ class ServerArgs:
         ),
         NS("spec"),
     ] = 0.0
+    speculative_dflash_dcut_cost_table: A[
+        Optional[str],
+        "DFLASH only. Path to a pre-profiled D-Cut cost table (JSON) built "
+        "offline by benchmark/pp_spec tooling. In auto mode, loading a table "
+        "skips the startup profiling pass. Every PP/TP rank must load the "
+        "identical file; the planner aborts on a content mismatch.",
+        NS("spec"),
+    ] = None
     speculative_dspark_block_size: A[
         Optional[int],
         "DSPARK only. Draft block size gamma (number of proposed draft tokens). The verify window is gamma + 1, so this sets --speculative-num-draft-tokens = gamma + 1. Omit to auto-infer gamma from the draft checkpoint block_size.",

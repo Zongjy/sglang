@@ -1,9 +1,12 @@
 from __future__ import annotations
 
+import hashlib
+import json
 import logging
 import math
 from contextlib import contextmanager
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Callable, Iterator, Literal, Optional, Sequence, Union
 
 import torch
@@ -15,6 +18,7 @@ from sglang.kernels.ops.speculative.dspark.dspark_verify_window import (
     scatter_compact_to_strided_into,
 )
 from sglang.srt.distributed import get_attn_tp_group, get_pp_group, get_tp_group
+from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import (
     DpPaddingMode,
     get_attention_dp_size,
@@ -302,9 +306,13 @@ class DFlashDcutPlanner:
         self._pp_pipeline_slots: dict[int, _DcutPipelineSlot] = {}
         self._pp_pipeline_slot_seen: dict[int, int] = {}
         self._pp_pipeline_selection_step = 0
+        self._flowshop_makespan_cache: dict[tuple, tuple[float, ...]] = {}
         self._runtime_stage_cost_ema: dict[tuple[int, int], float] = {}
         self._full_hold_bs: Optional[int] = None
         self._full_hold_remaining = 0
+        # Auto mode: batch sizes whose profiled best-case savings cannot pay
+        # for the selection itself are pinned to full-width verify.
+        self._pin_full_max_bs = 0
 
     def should_hold_full(self, bs: int) -> bool:
         return (
@@ -380,6 +388,69 @@ class DFlashDcutPlanner:
             get_dflash_dcut_keep_count(bs=bs, block_size=self.block_size, ratio=ratio)
             for ratio in _AUTO_RATIOS
         )
+
+    def is_full_pinned(self, bs: int) -> bool:
+        """Whether this batch size is pinned to full-width verify.
+
+        Only meaningful in auto mode; the pinned prefix is derived from the
+        startup cost table (``_compute_pin_full_max_bs``), which is built
+        from TP/PP-reduced costs, so every rank agrees on the decision.
+        """
+        return self.is_auto and 0 < int(bs) <= self._pin_full_max_bs
+
+    def pinned_full_plan(self, *, bs: int) -> DFlashDcutPlan:
+        """Full-width plan for a pinned batch size.
+
+        Records the full-width candidate so ``current_keep_budget`` keeps
+        publishing the full budget to the DP tier alignment.
+        """
+        plan = self.full_plan(bs=bs)
+        self.last_candidate_index = plan.candidate_index
+        return plan
+
+    def _compute_pin_full_max_bs(self) -> None:
+        """Pin small batches to full width when pruning cannot pay for itself.
+
+        Selection itself costs a roughly constant amount of work per step
+        (confidence math, the top-k schedule, a host sync for the CUDA-graph
+        bucket).  When the profiled best-case step savings at a batch size --
+        ``cost(ratio=1.0) - min(cost(ratio))`` -- fall below that overhead,
+        running the selector can only lose time, so those batch sizes are
+        pinned to the full-width plan and selection is skipped entirely.
+
+        ``_costs_by_bs`` is reduced across TP/PP during startup profiling, so
+        every rank derives the identical pinned prefix.
+        """
+        self._pin_full_max_bs = 0
+        if not self.is_auto:
+            return
+        threshold_ms = float(envs.SGLANG_DFLASH_DCUT_PIN_FULL_MIN_SAVINGS_MS.get())
+        if threshold_ms <= 0.0:
+            return
+        spreads: list[tuple[int, float]] = []
+        for bs in sorted(self._costs_by_bs):
+            costs = self._costs_by_bs[bs]
+            if not costs or any(cost is None for cost in costs):
+                continue
+            spread = float(costs[-1]) - min(float(cost) for cost in costs)
+            spreads.append((bs, round(spread, 3)))
+            if spread < threshold_ms:
+                self._pin_full_max_bs = bs
+            else:
+                break
+        if (
+            self._pin_full_max_bs > 0
+            and self.tp_rank == 0
+            and self.pp_group.rank_in_group == 0
+        ):
+            logger.info(
+                "DFLASH D-Cut auto: pinning bs<=%d to full-width verify "
+                "(per-step savings below the %.2f ms selector overhead); "
+                "profiled spreads (bs, ms): %s",
+                self._pin_full_max_bs,
+                threshold_ms,
+                spreads,
+            )
 
     def current_keep_budget(self, bs: int) -> int:
         """Keep-count upper bound for the next decode step at this bs.
@@ -570,7 +641,7 @@ class DFlashDcutPlanner:
     def _select_pipeline_candidate(
         self,
         *,
-        expected: torch.Tensor,
+        expected: Sequence[float],
         candidate_stage_costs: Sequence[Sequence[float]],
         candidate_transfer_costs: Sequence[Sequence[float]],
         bs: int,
@@ -600,49 +671,81 @@ class DFlashDcutPlanner:
         if pipeline_mb_id not in slot_ids:
             slot_ids.append(int(pipeline_mb_id))
             slot_ids.sort()
-        scores = []
-        for candidate_index, current_costs in enumerate(candidate_stage_costs):
-            jobs = []
-            job_transfer_costs = []
-            total_expected = 0.0
-            current_expected = float(expected[candidate_index].item())
-            for slot_id in slot_ids:
-                if slot_id == pipeline_mb_id:
-                    slot = _DcutPipelineSlot(
-                        stage_costs=tuple(float(value) for value in current_costs),
-                        expected_tokens=current_expected,
-                        transfer_costs=tuple(
-                            float(value)
-                            for value in candidate_transfer_costs[candidate_index]
-                        ),
-                    )
-                else:
+
+        # The makespan side of the score depends only on the candidate cost
+        # vectors and the other slots' state, not on this step's confidence;
+        # cache it so steady-state steps skip the repeated simulation.
+        cache_key = (
+            tuple(slot_ids),
+            int(pipeline_mb_id),
+            tuple(
+                tuple(float(value) for value in costs)
+                for costs in candidate_stage_costs
+            ),
+            tuple(
+                tuple(float(value) for value in costs)
+                for costs in candidate_transfer_costs
+            ),
+            tuple(
+                (slot_id, slot.stage_costs, slot.transfer_costs)
+                for slot_id, slot in sorted(self._pp_pipeline_slots.items())
+                if slot_id != pipeline_mb_id and slot_id in slot_ids
+            ),
+            self._pipeline_transfer_costs,
+        )
+        makespans = self._flowshop_makespan_cache.get(cache_key)
+        if makespans is None:
+            makespan_list = []
+            for candidate_index, current_costs in enumerate(candidate_stage_costs):
+                current_stage_costs = tuple(float(value) for value in current_costs)
+                current_transfer_costs = tuple(
+                    float(value) for value in candidate_transfer_costs[candidate_index]
+                )
+                jobs = []
+                job_transfer_costs = []
+                for slot_id in slot_ids:
+                    if slot_id == pipeline_mb_id:
+                        jobs.append(current_stage_costs)
+                        job_transfer_costs.append(current_transfer_costs)
+                        continue
                     slot = self._pp_pipeline_slots.get(slot_id)
                     if slot is None:
-                        slot = _DcutPipelineSlot(
-                            stage_costs=tuple(
-                                float(value) for value in current_costs
-                            ),
-                            expected_tokens=current_expected,
-                            transfer_costs=tuple(
-                                float(value)
-                                for value in candidate_transfer_costs[candidate_index]
-                            ),
-                        )
-                jobs.append(slot.stage_costs)
-                job_transfer_costs.append(slot.transfer_costs)
-                total_expected += slot.expected_tokens
-            makespan = pp_pipeline_flowshop_makespan(
-                jobs,
-                transfer_costs=self._pipeline_transfer_costs,
-                job_transfer_costs=job_transfer_costs,
-            )
-            scores.append(total_expected / max(makespan, 1e-6))
+                        jobs.append(current_stage_costs)
+                        job_transfer_costs.append(current_transfer_costs)
+                    else:
+                        jobs.append(slot.stage_costs)
+                        job_transfer_costs.append(slot.transfer_costs)
+                makespan_list.append(
+                    pp_pipeline_flowshop_makespan(
+                        jobs,
+                        transfer_costs=self._pipeline_transfer_costs,
+                        job_transfer_costs=job_transfer_costs,
+                    )
+                )
+            makespans = tuple(makespan_list)
+            if len(self._flowshop_makespan_cache) >= 256:
+                self._flowshop_makespan_cache.clear()
+            self._flowshop_makespan_cache[cache_key] = makespans
+
+        scores = []
+        for candidate_index in range(len(_AUTO_RATIOS)):
+            current_expected = float(expected[candidate_index])
+            total_expected = current_expected
+            for slot_id in slot_ids:
+                if slot_id == pipeline_mb_id:
+                    continue
+                slot = self._pp_pipeline_slots.get(slot_id)
+                total_expected += (
+                    slot.expected_tokens if slot is not None else current_expected
+                )
+            scores.append(total_expected / max(makespans[candidate_index], 1e-6))
 
         selected = int(torch.tensor(scores).argmax().item())
         self._pp_pipeline_slots[int(pipeline_mb_id)] = _DcutPipelineSlot(
-            stage_costs=tuple(float(value) for value in candidate_stage_costs[selected]),
-            expected_tokens=float(expected[selected].item()),
+            stage_costs=tuple(
+                float(value) for value in candidate_stage_costs[selected]
+            ),
+            expected_tokens=float(expected[selected]),
             transfer_costs=tuple(
                 float(value) for value in candidate_transfer_costs[selected]
             ),
@@ -656,17 +759,70 @@ class DFlashDcutPlanner:
             self._full_hold_remaining = 0
         return selected
 
+    def _stage_cost_rows_host(
+        self,
+        *,
+        bs: int,
+        stage_costs: Sequence[Sequence[float]],
+        stage_fold_costs: Optional[Sequence[Sequence[float]]],
+        stage_overhead_costs: Optional[Sequence[Sequence[float]]],
+        stage_draft_costs: Optional[Sequence[Sequence[float]]],
+        overhead_costs: Optional[Sequence[float]],
+    ) -> list[list[float]]:
+        """Assemble per-stage candidate cost rows as host floats.
+
+        Every input is host data from the startup profile; the previous
+        implementation round-tripped these through device tensors and read
+        each element back with ``.item()`` on every decode step.
+        """
+        rows: list[list[float]] = []
+        for rank, values in enumerate(stage_costs):
+            row = [float(value) for value in values]
+            if stage_fold_costs is not None and rank < len(stage_fold_costs):
+                row = [
+                    value + float(fold)
+                    for value, fold in zip(row, stage_fold_costs[rank])
+                ]
+            if stage_overhead_costs is not None and rank < len(stage_overhead_costs):
+                row = [
+                    value + float(overhead)
+                    for value, overhead in zip(row, stage_overhead_costs[rank])
+                ]
+            if stage_draft_costs is not None and rank < len(stage_draft_costs):
+                row = [
+                    value + float(draft)
+                    for value, draft in zip(row, stage_draft_costs[rank])
+                ]
+            elif (
+                stage_overhead_costs is None
+                and stage_draft_costs is None
+                and overhead_costs is not None
+            ):
+                row = [
+                    value + float(overhead)
+                    for value, overhead in zip(row, overhead_costs)
+                ]
+            for candidate_index in range(len(_AUTO_RATIOS)):
+                observed = self._runtime_cost_for_candidate(bs, candidate_index)
+                if observed is not None:
+                    row[candidate_index] = max(row[candidate_index], observed)
+            rows.append(row)
+        return rows
+
     def _write_auto_index_local(
         self,
         *,
         confidence: torch.Tensor,
         bs: int,
         pipeline_mb_id: Optional[int] = None,
-    ) -> None:
-        """Write the auto-mode candidate index to ``_auto_index_device``.
+    ) -> Optional[int]:
+        """Select the auto-mode candidate on this rank.
 
-        Stays on device: the caller broadcasts, then materializes the scalar
-        once for CUDA-graph bucket lookup.
+        Returns the selected index when it is resolved on the host (the PP
+        per-microbatch flow-shop path); the caller may then skip the group
+        broadcast and the device scalar readback when the select group is
+        trivial.  Otherwise the result is written to ``_auto_index_device``
+        and None is returned.
         """
         costs = self._profile_costs_for_bs(bs)
         if costs is None:
@@ -678,7 +834,7 @@ class DFlashDcutPlanner:
                 )
                 self._warned_missing_profile_bs.add(bs)
             self._auto_index_device.fill_(2)
-            return
+            return None
 
         survival = torch.cumprod(confidence.to(torch.float32), dim=1).flatten()
         sorted_survival = torch.sort(survival, descending=True).values
@@ -710,71 +866,42 @@ class DFlashDcutPlanner:
             for keep_count in keep_counts
         )
         if stage_costs is not None:
-            stage_rows = []
-            for rank, values in enumerate(stage_costs):
-                stage_tensor = torch.tensor(
-                    values, dtype=torch.float32, device=self.device
-                )
-                if stage_fold_costs is not None and rank < len(stage_fold_costs):
-                    fold_tensor = torch.tensor(
-                        stage_fold_costs[rank],
-                        dtype=torch.float32,
-                        device=self.device,
-                    )
-                    stage_tensor = stage_tensor + fold_tensor
-                if stage_overhead_costs is not None and rank < len(
-                    stage_overhead_costs
-                ):
-                    stage_tensor = stage_tensor + torch.tensor(
-                        stage_overhead_costs[rank],
-                        dtype=torch.float32,
-                        device=self.device,
-                    )
-                if stage_draft_costs is not None and rank < len(stage_draft_costs):
-                    stage_tensor = stage_tensor + torch.tensor(
-                        stage_draft_costs[rank],
-                        dtype=torch.float32,
-                        device=self.device,
-                    )
-                elif (
-                    stage_overhead_costs is None
-                    and stage_draft_costs is None
-                    and overhead_costs is not None
-                ):
-                    stage_tensor = stage_tensor + torch.tensor(
-                        overhead_costs, dtype=torch.float32, device=self.device
-                    )
-                for candidate_index in range(len(_AUTO_RATIOS)):
-                    observed = self._runtime_cost_for_candidate(
-                        bs, candidate_index
-                    )
-                    if observed is not None:
-                        stage_tensor[candidate_index] = torch.maximum(
-                            stage_tensor[candidate_index],
-                            stage_tensor.new_tensor(observed),
-                        )
-                stage_rows.append(stage_tensor)
-            # The tensor rows above are [stage, candidate]. Convert them into
-            # per-candidate vectors for the stateful PP simulation.
-            candidate_stage_costs = tuple(
-                tuple(
-                    float(stage_rows[stage][candidate_index].item())
-                    for stage in range(len(stage_rows))
-                )
-                for candidate_index in range(len(_AUTO_RATIOS))
+            stage_rows = self._stage_cost_rows_host(
+                bs=bs,
+                stage_costs=stage_costs,
+                stage_fold_costs=stage_fold_costs,
+                stage_overhead_costs=stage_overhead_costs,
+                stage_draft_costs=stage_draft_costs,
+                overhead_costs=overhead_costs,
             )
             if pipeline_mb_id is not None and self.pp_group.world_size > 1:
+                # Host-side flow-shop selection: one D2H readback for the four
+                # expected scores replaces the previous per-stage/per-candidate
+                # .item() calls (13 scalar syncs per selection).
                 selected = self._select_pipeline_candidate(
-                    expected=expected,
-                    candidate_stage_costs=candidate_stage_costs,
+                    expected=[float(value) for value in expected.tolist()],
+                    candidate_stage_costs=tuple(
+                        tuple(row[candidate_index] for row in stage_rows)
+                        for candidate_index in range(len(_AUTO_RATIOS))
+                    ),
                     candidate_transfer_costs=candidate_transfer_costs,
                     bs=bs,
                     pipeline_mb_id=int(pipeline_mb_id),
                 )
-                self._auto_index_device.fill_(selected)
-                return
+                if self._select_group.world_size > 1:
+                    self._auto_index_device.fill_(selected)
+                    return None
+                return selected
+            # The tensor rows above are [stage, candidate].
             cost_tensor = pp_pipeline_cycle_cost(
-                torch.stack(stage_rows, dim=0), self.pp_microbatch_count
+                torch.stack(
+                    [
+                        torch.tensor(row, dtype=torch.float32, device=self.device)
+                        for row in stage_rows
+                    ],
+                    dim=0,
+                ),
+                self.pp_microbatch_count,
             )
         else:
             cost_tensor = self._cached_device_costs(bs, costs)
@@ -789,6 +916,7 @@ class DFlashDcutPlanner:
             cost_tensor = runtime_costs
         scores = score_dcut_candidates(expected=expected, costs=cost_tensor)
         self._auto_index_device.copy_(torch.argmax(scores).to(dtype=torch.int64))
+        return None
 
     def _select_auto_candidate(
         self,
@@ -798,12 +926,17 @@ class DFlashDcutPlanner:
         pipeline_mb_id: Optional[int] = None,
     ) -> int:
         group = self._select_group
+        host_selected: Optional[int] = None
         if group.rank_in_group == 0:
-            self._write_auto_index_local(
+            host_selected = self._write_auto_index_local(
                 confidence=confidence,
                 bs=bs,
                 pipeline_mb_id=pipeline_mb_id,
             )
+        if host_selected is not None and group.world_size == 1:
+            # Host-resolved selection with a trivial select group: neither the
+            # broadcast nor the scalar readback is needed.
+            return host_selected
         group.broadcast(self._auto_index_device, src=0)
         # CUDA graph replay keys off a host bucket. This is the only hot-path
         # scalar sync required by the ratio selector.
@@ -1438,6 +1571,7 @@ class DFlashDcutPlanner:
                     total_costs, dtype=torch.float32, device=self.device
                 )
 
+            self._compute_pin_full_max_bs()
             self._offline_profiled = True
             if self.tp_rank == 0 and costs_by_bs:
                 logger.info(
@@ -1469,6 +1603,182 @@ class DFlashDcutPlanner:
                     "auto mode will fall back to ratio 0.75.",
                     e,
                 )
+
+    def load_dcut_cost_table(
+        self,
+        path: str,
+        *,
+        expected_partition: Optional[Sequence[int]] = None,
+    ) -> None:
+        """Load an offline-profiled D-Cut cost table instead of profiling.
+
+        The table (benchmark/pp_spec tooling) carries per-stage step costs per
+        (batch bucket, ratio).  Every PP/TP rank must load the identical file:
+        the per-rank layout decisions fork if the tables diverge, so the file
+        digest is compared across both groups before anything is accepted.
+
+        Schema (version 1)::
+
+            {
+              "version": 1,
+              "block_size": 16,
+              "pp_size": 2,
+              "pp_layer_partition": [20, 12],          # optional, validated
+              "ratios": [0.25, 0.5, 0.75, 1.0],        # column order below
+              "buckets": {
+                "<bs>": {
+                  "stage_costs_ms": [[per-ratio ...], ...],   # one row per stage
+                  "step_costs_ms": [per-ratio ...]            # optional
+                }
+              }
+            }
+
+        ``step_costs_ms`` defaults to the per-candidate bottleneck (max over
+        stages).  The stage rows map onto the auto candidate order
+        ``_AUTO_RATIOS``; the file's own ``ratios`` array may use any order.
+        """
+        if self._offline_profiled:
+            return
+        # The capture-grid init is collective; run it on this path too so every
+        # rank resolves the same token buckets for the loaded costs.
+        graph_ready = self._initialize_common_capture_grid()
+        if not self.is_auto:
+            self._offline_profiled = True
+            return
+
+        raw_bytes = Path(path).read_bytes()
+        digest = hashlib.md5(raw_bytes).hexdigest()
+        for group in (self.tp_group, self.pp_group):
+            if group.world_size > 1:
+                gathered: list[Optional[str]] = [None] * group.world_size
+                torch.distributed.all_gather_object(
+                    gathered, digest, group=group.cpu_group
+                )
+                if len(set(gathered)) != 1:
+                    raise RuntimeError(
+                        f"DFLASH D-Cut cost table differs across ranks for "
+                        f"{path!r}; every rank must load the identical file."
+                    )
+        try:
+            payload = json.loads(raw_bytes)
+        except json.JSONDecodeError as exc:
+            raise RuntimeError(
+                f"invalid D-Cut cost table {path!r}: {exc}"
+            ) from exc
+        self._parse_dcut_cost_table(
+            payload, source=path, expected_partition=expected_partition
+        )
+
+        self._offline_profiled = True
+        self._compute_pin_full_max_bs()
+        if self.tp_rank == 0 and self.pp_group.rank_in_group == 0:
+            logger.info(
+                "DFLASH D-Cut loaded offline cost table %s (md5=%s, %d buckets, "
+                "graph_grid_ready=%s).",
+                path,
+                digest[:8],
+                len(self._costs_by_bs),
+                graph_ready,
+            )
+
+    def _parse_dcut_cost_table(
+        self,
+        payload: object,
+        *,
+        source: str,
+        expected_partition: Optional[Sequence[int]],
+    ) -> None:
+        """Validate a cost-table payload and populate the profile tables."""
+
+        def _fail(reason: str) -> None:
+            raise RuntimeError(f"invalid D-Cut cost table {source!r}: {reason}")
+
+        if not isinstance(payload, dict):
+            _fail("top level must be a JSON object")
+        if payload.get("version") != 1:
+            _fail("unsupported or missing version (expected 1)")
+        if int(payload.get("block_size", -1)) != self.block_size:
+            _fail(
+                f"block_size mismatch: file={payload.get('block_size')}, "
+                f"runtime={self.block_size}"
+            )
+        if int(payload.get("pp_size", -1)) != self.pp_group.world_size:
+            _fail(
+                f"pp_size mismatch: file={payload.get('pp_size')}, "
+                f"runtime={self.pp_group.world_size}"
+            )
+        file_partition = payload.get("pp_layer_partition")
+        if file_partition is not None and expected_partition is not None:
+            if tuple(int(v) for v in file_partition) != tuple(
+                int(v) for v in expected_partition
+            ):
+                _fail(
+                    f"pp_layer_partition mismatch: file={list(file_partition)}, "
+                    f"runtime={list(expected_partition)}"
+                )
+        file_ratios = payload.get("ratios")
+        if not isinstance(file_ratios, list) or not file_ratios:
+            _fail("missing ratios array")
+        try:
+            column_of = {float(ratio): i for i, ratio in enumerate(file_ratios)}
+        except (TypeError, ValueError):
+            _fail("ratios must be numbers")
+        if set(column_of) != set(_AUTO_RATIOS):
+            _fail(
+                f"ratios must cover exactly {list(_AUTO_RATIOS)}, "
+                f"got {file_ratios}"
+            )
+
+        buckets = payload.get("buckets")
+        if not isinstance(buckets, dict) or not buckets:
+            _fail("missing buckets")
+        stage_count = self.pp_group.world_size
+        for raw_bs, entry in sorted(buckets.items(), key=lambda item: int(item[0])):
+            try:
+                bs = int(raw_bs)
+            except (TypeError, ValueError):
+                _fail(f"bucket key {raw_bs!r} is not an integer")
+            if bs <= 0:
+                _fail(f"bucket {bs} must be positive")
+            stage_costs = (
+                entry.get("stage_costs_ms") if isinstance(entry, dict) else None
+            )
+            if not isinstance(stage_costs, list) or len(stage_costs) != stage_count:
+                _fail(f"bucket {bs}: stage_costs_ms must have {stage_count} rows")
+            rows: list[tuple[float, ...]] = []
+            for stage, row in enumerate(stage_costs):
+                if not isinstance(row, list) or len(row) != len(file_ratios):
+                    _fail(
+                        f"bucket {bs} stage {stage}: expected "
+                        f"{len(file_ratios)} ratio columns"
+                    )
+                values = tuple(float(row[column_of[ratio]]) for ratio in _AUTO_RATIOS)
+                if any(not math.isfinite(value) or value <= 0.0 for value in values):
+                    _fail(f"bucket {bs} stage {stage}: costs must be positive")
+                rows.append(values)
+            self._stage_costs_by_bs[bs] = tuple(rows)
+            step_costs = (
+                entry.get("step_costs_ms") if isinstance(entry, dict) else None
+            )
+            if step_costs is None:
+                # Bottleneck-stage step cost, mirroring _max_parallel_cost_ms.
+                step = [
+                    max(row[candidate] for row in rows)
+                    for candidate in range(len(_AUTO_RATIOS))
+                ]
+            else:
+                if not isinstance(step_costs, list) or len(step_costs) != len(
+                    file_ratios
+                ):
+                    _fail(
+                        f"bucket {bs}: step_costs_ms must have "
+                        f"{len(file_ratios)} columns"
+                    )
+                step = [float(step_costs[column_of[ratio]]) for ratio in _AUTO_RATIOS]
+                if any(not math.isfinite(value) or value <= 0.0 for value in step):
+                    _fail(f"bucket {bs}: step_costs_ms must be positive")
+            self._costs_by_bs[bs] = step
+            self._offline_keep_counts[bs] = self.candidate_keep_counts(bs)
 
     def plan(
         self,

@@ -805,6 +805,202 @@ def optimize_partition_across_buckets(
     )
 
 
+@dataclass(frozen=True)
+class PerCellOptimum:
+    """The best partition for one (bucket, ratio) cell."""
+
+    bucket: int
+    ratio: float
+    partition: tuple[int, ...]
+    stage_ms: tuple[float, ...]
+    cycle_time_ms: float
+
+
+@dataclass
+class PerCellPartitionResult:
+    """Per-(bucket, ratio) optimal partitions plus one selected partition.
+
+    The selection is deliberately unweighted: the partition that is optimal in
+    the most cells wins; ties break toward the lexicographically smallest
+    partition.  ``runtime_stage_costs`` re-evaluates the selected partition at
+    every cell and is exportable as a runtime D-Cut cost table.
+    """
+
+    cells: tuple[PerCellOptimum, ...]
+    selected: tuple[int, ...]
+    cell_wins: tuple[tuple[tuple[int, ...], int], ...]
+    runtime_stage_costs: dict[int, dict[float, tuple[float, ...]]]
+    baseline_partition: tuple[int, ...]
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "selection_rule": "most cell wins, lexicographic tie-break",
+            "selected": list(self.selected),
+            "cell_wins": [
+                {"partition": list(partition), "wins": wins}
+                for partition, wins in self.cell_wins
+            ],
+            "cells": [
+                {
+                    "bucket": cell.bucket,
+                    "ratio": cell.ratio,
+                    "partition": list(cell.partition),
+                    "stage_ms": list(cell.stage_ms),
+                    "cycle_time_ms": cell.cycle_time_ms,
+                }
+                for cell in self.cells
+            ],
+            "baseline_partition": list(self.baseline_partition),
+            "runtime_dcut": "auto",
+        }
+
+    def to_report(self) -> str:
+        lines = [
+            f"selected = {','.join(map(str, self.selected))} "
+            f"(wins {self.cell_wins[0][1]}/{len(self.cells)} cells)",
+            "",
+            f"{'bucket':>6} {'ratio':>6} {'partition':<16} {'cycle_ms':>10}  stages (ms)",
+        ]
+        for cell in self.cells:
+            stages = " | ".join(f"{value:.2f}" for value in cell.stage_ms)
+            lines.append(
+                f"{cell.bucket:>6} {cell.ratio:>6g} "
+                f"{','.join(map(str, cell.partition)):<16} "
+                f"{cell.cycle_time_ms:>10.3f}  {stages}"
+            )
+        lines.append("")
+        lines.append(f"{'partition':<16} {'wins':>5}")
+        for partition, count in self.cell_wins:
+            lines.append(f"{','.join(map(str, partition)):<16} {count:>5}")
+        return "\n".join(lines)
+
+    def to_runtime_cost_table(self, *, block_size: int) -> dict[str, Any]:
+        """Export the selected partition's cell costs in the runtime schema.
+
+        Row order follows ``ratios``; the runtime loader re-sorts columns into
+        its own candidate order and validates the ratio set.
+        """
+        ratios = sorted({cell.ratio for cell in self.cells})
+        buckets: dict[str, Any] = {}
+        for bucket in sorted(self.runtime_stage_costs):
+            per_ratio = self.runtime_stage_costs[bucket]
+            stage_rows = list(zip(*(per_ratio[ratio] for ratio in ratios)))
+            buckets[str(bucket)] = {
+                "stage_costs_ms": [list(row) for row in stage_rows]
+            }
+        return {
+            "version": 1,
+            "block_size": int(block_size),
+            "pp_size": len(self.selected),
+            "pp_layer_partition": list(self.selected),
+            "ratios": ratios,
+            "unit": "ms",
+            "buckets": buckets,
+        }
+
+
+def optimize_per_cell_partitions(
+    model: StageCostModel,
+    dcut_profiles_by_bucket: dict[int, dict[float, float | Sequence[float]]],
+    min_layers: int = 1,
+    max_layers: Sequence[int] | None = None,
+    *,
+    layout: LayerLayout | None = None,
+    prefix_l_range: tuple[int, int] | None = None,
+    stage_comm_ms: Sequence[float] | None = None,
+    all_boundaries: bool = False,
+) -> PerCellPartitionResult:
+    """Pick the best partition independently for every (bucket, ratio) cell.
+
+    Unlike ``optimize_partition_across_buckets`` this does not aggregate cells
+    into a minimax/weighted objective: each cell gets its own optimum, and the
+    recommended partition is simply the one that wins the most cells (ties
+    break lexicographically).  Use this when the per-cell landscape is what
+    you want to inspect, e.g. before committing to a robust objective.
+    """
+    if not dcut_profiles_by_bucket:
+        raise OptimizerError("dcut_profiles_by_bucket must not be empty")
+    buckets = tuple(sorted(int(bucket) for bucket in dcut_profiles_by_bucket))
+    if set(buckets) != set(model.buckets):
+        raise OptimizerError(
+            "D-Cut profile buckets must exactly match the stage model buckets"
+        )
+    active_layout = layout or model.layout
+    if active_layout is not None and active_layout.num_layers != model.num_layers:
+        raise OptimizerError("layout and stage model have different layer counts")
+    partitions = (
+        _all_partitions(model.num_layers, model.pp_size, min_layers, max_layers)
+        if all_boundaries
+        else _family_partitions(
+            model.num_layers, model.pp_size, min_layers, max_layers, prefix_l_range
+        )
+    )
+    if not partitions:
+        raise OptimizerError("no valid partition satisfies the layer limits")
+    resolved_comm = _resolve_stage_comm(stage_comm_ms, model.pp_size)
+    normalized = {
+        bucket: _normalise_dcut_profiles(profiles, model.pp_size)
+        for bucket, profiles in dcut_profiles_by_bucket.items()
+    }
+
+    cells: list[PerCellOptimum] = []
+    wins: dict[tuple[int, ...], int] = {}
+    for bucket in buckets:
+        estimate = model.estimate_for_bs(bucket)
+        for ratio, scales in normalized[bucket]:
+            best = min(
+                (
+                    _candidate_from_model(
+                        model,
+                        estimate,
+                        partition,
+                        resolved_comm,
+                        active_layout,
+                        dcut_ratio=ratio,
+                        dcut_stage_scale=scales,
+                    )
+                    for partition in partitions
+                ),
+                key=lambda item: (item.cycle_time_ms, item.partition),
+            )
+            cells.append(
+                PerCellOptimum(
+                    bucket=bucket,
+                    ratio=ratio,
+                    partition=best.partition,
+                    stage_ms=best.stage_ms,
+                    cycle_time_ms=best.cycle_time_ms,
+                )
+            )
+            wins[best.partition] = wins.get(best.partition, 0) + 1
+
+    cell_wins = tuple(sorted(wins.items(), key=lambda item: (-item[1], item[0])))
+    selected = cell_wins[0][0]
+    runtime_stage_costs: dict[int, dict[float, tuple[float, ...]]] = {}
+    for bucket in buckets:
+        estimate = model.estimate_for_bs(bucket)
+        per_ratio: dict[float, tuple[float, ...]] = {}
+        for ratio, scales in normalized[bucket]:
+            item = _candidate_from_model(
+                model,
+                estimate,
+                selected,
+                resolved_comm,
+                active_layout,
+                dcut_ratio=ratio,
+                dcut_stage_scale=scales,
+            )
+            per_ratio[ratio] = item.stage_ms
+        runtime_stage_costs[bucket] = per_ratio
+    return PerCellPartitionResult(
+        cells=tuple(cells),
+        selected=selected,
+        cell_wins=cell_wins,
+        runtime_stage_costs=runtime_stage_costs,
+        baseline_partition=model.baseline_partition,
+    )
+
+
 def choose_dynamic_dcut_ratio(
     stage_ms: Sequence[float],
     dcut_profiles: dict[float, float | Sequence[float]],

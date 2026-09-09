@@ -11,8 +11,8 @@ if [[ -z ${PYTHON:-} ]]; then
     PYTHON=python
   fi
 fi
-MODEL=${MODEL:-Qwen/Qwen3.5-9B}
-DRAFT_MODEL=${DRAFT_MODEL:-z-lab/Qwen3.5-9B-DFlash}
+MODEL=${MODEL:-Qwen/Qwen3-8B}
+DRAFT_MODEL=${DRAFT_MODEL:-z-lab/Qwen3-8B-DFlash-b16}
 PP_SIZE=${PP_SIZE:-2}
 TP_SIZE=${TP_SIZE:-1}
 NNODES=${NNODES:-1}
