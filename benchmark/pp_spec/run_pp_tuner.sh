@@ -33,6 +33,10 @@ DRAFT_ATTENTION_BACKEND=${DRAFT_ATTENTION_BACKEND:-flashinfer}
 MIN_LAYERS=${MIN_LAYERS:-8}
 K_BEST=${K_BEST:-30}
 DRY_RUN=${DRY_RUN:-0}
+# Measure PP edge latency with the runtime's payload-shaped ping-pong
+# benchmark.  D-Cut consumes the resulting alpha/beta model in memory.
+export SGLANG_PP_COMM_BENCHMARK=${SGLANG_PP_COMM_BENCHMARK:-1}
+export SGLANG_PP_COMM_BENCHMARK_TOKENS=${SGLANG_PP_COMM_BENCHMARK_TOKENS:-64,256,1024,4096}
 
 MODEL_TAG=${MODEL//\//_}
 RESULTS_DIR=${RESULTS_DIR:-${OUTPUT_DIR:-$SCRIPT_DIR/results/${MODEL_TAG}_multibatch_$(date -u +%Y%m%d_%H%M%S)}}

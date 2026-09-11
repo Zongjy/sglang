@@ -108,18 +108,6 @@ def parse_int_list(value: str | None, option: str) -> tuple[int, ...] | None:
     return result
 
 
-def parse_float_list(value: str | None, option: str) -> tuple[float, ...] | None:
-    if value is None:
-        return None
-    try:
-        result = tuple(float(item.strip()) for item in value.split(","))
-    except ValueError as exc:
-        raise TuningError(f"{option} must contain comma-separated numbers") from exc
-    if not result or any(item < 0.0 for item in result):
-        raise TuningError(f"{option} must contain non-negative numbers")
-    return result
-
-
 def _contains_flag(arguments: Sequence[str], name: str) -> bool:
     return any(item == name or item.startswith(name + "=") for item in arguments)
 
@@ -505,9 +493,6 @@ def _run_multi_bucket_analysis(args: argparse.Namespace, profile_dirs: Sequence[
     except stage_model.StageModelError as exc:
         raise TuningError(str(exc)) from exc
     max_layers = parse_int_list(args.max_layers_per_rank, "--max-layers-per-rank")
-    stage_comm_ms = parse_float_list(args.stage_comm_ms, "--stage-comm-ms")
-    if stage_comm_ms is not None and len(stage_comm_ms) not in (pp_size - 1, pp_size):
-        raise TuningError("--stage-comm-ms needs PP or PP-1 values")
     prefix_range = None
     if args.boundary_radius is not None and not args.all_boundaries:
         prefix_range = (
@@ -526,7 +511,6 @@ def _run_multi_bucket_analysis(args: argparse.Namespace, profile_dirs: Sequence[
                 max_layers=max_layers,
                 layout=layout,
                 prefix_l_range=prefix_range,
-                stage_comm_ms=stage_comm_ms,
                 all_boundaries=args.all_boundaries,
             )
         else:
@@ -538,7 +522,6 @@ def _run_multi_bucket_analysis(args: argparse.Namespace, profile_dirs: Sequence[
                 k_best=args.k_best,
                 layout=layout,
                 prefix_l_range=prefix_range,
-                stage_comm_ms=stage_comm_ms,
                 all_boundaries=args.all_boundaries,
             )
     except (partition_optimizer.OptimizerError, stage_model.StageModelError) as exc:
@@ -681,12 +664,6 @@ def run_analysis(args: argparse.Namespace) -> Path:
         raise TuningError("--min-layers must be positive")
     if max_layers is not None and len(max_layers) != pp_size:
         raise TuningError("--max-layers-per-rank needs one value per PP rank")
-    stage_comm_ms = parse_float_list(args.stage_comm_ms, "--stage-comm-ms")
-    if stage_comm_ms is not None and len(stage_comm_ms) not in (
-        pp_size - 1,
-        pp_size,
-    ):
-        raise TuningError("--stage-comm-ms needs PP or PP-1 values")
     prefix_range = None
     if args.boundary_radius is not None and not args.all_boundaries:
         if args.boundary_radius < 0:
@@ -704,7 +681,6 @@ def run_analysis(args: argparse.Namespace) -> Path:
             k_best=args.k_best,
             layout=layout,
             prefix_l_range=prefix_range,
-            stage_comm_ms=stage_comm_ms,
             all_boundaries=args.all_boundaries,
         )
         if args.dcut_profile is None:
@@ -796,13 +772,6 @@ def build_parser() -> argparse.ArgumentParser:
         help="profile directory; repeat for multiple execution buckets",
     )
     analyze.add_argument("--output-dir", type=Path)
-    analyze.add_argument(
-        "--stage-comm-ms",
-        help=(
-            "optional explicit communication floor per PP rank (P values) or "
-            "per boundary (P-1 values), added after trace PP Send/Recv is excluded"
-        ),
-    )
     analyze.add_argument("--trim-samples", type=int, default=1)
     analyze.add_argument("--boundary-radius", type=int, default=8)
     analyze.add_argument(

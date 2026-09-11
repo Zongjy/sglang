@@ -8,6 +8,7 @@ The candidate family is intentionally small::
 Every candidate is evaluated at one profiled execution bucket. The selected
 partition is the candidate with the lowest predicted bottleneck stage time.
 ``optimize_joint`` extends this search to a measured D-Cut cost curve.
+PP edge transfer latency is supplied to the runtime planner separately.
 """
 
 from __future__ import annotations

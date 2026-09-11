@@ -78,10 +78,13 @@ The analytical stage model is:
 stage_r(partition)
   = typed_target_layer_cost(range_r)
   + baseline_role_fixed_cost_r
-  + optional_stage_comm_floor_r
 
 objective(partition) = max_r stage_r(partition)
 ```
+
+PP edge transfer latency is measured separately by the runtime
+`SGLANG_PP_COMM_BENCHMARK` and supplied to the D-Cut flow-shop selector as an
+edge cost. It is not folded into the per-stage trace cost.
 
 For D-Cut runs, the partition and cut ratio can be selected together.  First
 write the measured verify costs for the same execution bucket.  Values may be a

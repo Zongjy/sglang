@@ -374,6 +374,10 @@ class DFlashDcutPlanner:
                 "pipeline transfer model count must equal pp_size - 1."
             )
         self._pipeline_transfer_models = models
+        # The flow-shop cache key contains the transfer model, but clear old
+        # entries eagerly because the benchmark is installed during startup
+        # after the CUDA-graph/profile initialization path.
+        self._flowshop_makespan_cache.clear()
 
     @property
     def is_auto(self) -> bool:
@@ -1636,6 +1640,11 @@ class DFlashDcutPlanner:
         ``step_costs_ms`` defaults to the per-candidate bottleneck (max over
         stages).  The stage rows map onto the auto candidate order
         ``_AUTO_RATIOS``; the file's own ``ratios`` array may use any order.
+
+        PP edge transfer latency is kept separate from ``stage_costs_ms``.
+        When ``SGLANG_PP_COMM_BENCHMARK=1`` is enabled, the scheduler installs
+        an ``alpha + beta * graph_num_tokens`` model before serving and the
+        flow-shop selector adds it to the stage rows at runtime.
         """
         if self._offline_profiled:
             return

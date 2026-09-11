@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import shlex
 import subprocess
 import sys
@@ -88,6 +89,11 @@ def profile_arguments(
 
 
 def run(args: argparse.Namespace) -> None:
+    # PP communication is measured by the runtime payload-shaped benchmark and
+    # consumed by D-Cut at startup. Preserve an explicit ``=0`` for callers
+    # that only want compute profiling.
+    os.environ.setdefault("SGLANG_PP_COMM_BENCHMARK", "1")
+    os.environ.setdefault("SGLANG_PP_COMM_BENCHMARK_TOKENS", "64,256,1024,4096")
     root = args.results_dir.resolve()
     if root.exists() and any(root.iterdir()):
         raise ValueError(f"results directory must be absent or empty: {root}")
